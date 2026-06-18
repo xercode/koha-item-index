@@ -142,6 +142,11 @@ my $field_name_pattern   = '[\w\-]+';
 my $multi_field_pattern  = "(?:\\.$field_name_pattern)*";
 my $es_advanced_searches = [];
 
+# Facet fields that live on the nested items object (Bug 46309). When a search
+# field with one of these names is faceted, the aggregation is built over the
+# items nested object instead of the flat __facet field.
+our %ITEM_FACET_FIELDS = map { $_ => 1 } qw( homebranch holdingbranch itype location ccode );
+
 =head2 get_index_field_convert
 
     my @index_params = Koha::SearchEngine::Elasticsearch::QueryBuilder->get_index_field_convert();
@@ -254,7 +259,15 @@ sub build_query {
         my @facets = Koha::SearchEngine::Elasticsearch->get_facet_fields;
         for my $f (@facets) {
             my $name = $f->name;
-            $res->{aggregations}->{$name} = { terms => { field => "${name}__facet", size => $size } };
+            if ( $ITEM_FACET_FIELDS{$name} ) {
+
+                # Item facets (Bug 46309) aggregate over the nested items, and use
+                # reverse_nested so the bucket counts remain per-record, matching
+                # Koha's record-count facet semantics. See _convert_facets in Search.pm.
+                $res->{aggregations}->{$name} = $self->_build_item_facet_aggregation( $name, $size );
+            } else {
+                $res->{aggregations}->{$name} = { terms => { field => "${name}__facet", size => $size } };
+            }
         }
 
     }
@@ -311,6 +324,33 @@ sub _build_item_filter_query {
             path  => 'items',
             query => { bool => { filter => \@clauses } },
         }
+    };
+}
+
+=head2 _build_item_facet_aggregation
+
+    my $agg = $builder->_build_item_facet_aggregation($name, $size);
+
+Builds a C<nested> aggregation (path C<items>, Bug 46309) for an item-level
+facet field. The inner C<terms> aggregation runs on C<items.$name>, and a
+C<reverse_nested> sub-aggregation yields the number of distinct parent records
+for each bucket, so the facet counts stay per-record (Koha's facet semantics)
+rather than per-item. The C<nested>/C<reverse_nested> syntax is common to
+Elasticsearch 7 and 8.
+
+=cut
+
+sub _build_item_facet_aggregation {
+    my ( $self, $name, $size ) = @_;
+
+    return {
+        nested => { path => 'items' },
+        aggs   => {
+            $name => {
+                terms => { field => "items.$name", size => $size },
+                aggs  => { record_count => { reverse_nested => {} } },
+            },
+        },
     };
 }
 

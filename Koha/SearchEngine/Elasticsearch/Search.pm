@@ -534,6 +534,12 @@ sub _convert_facets {
     while ( my ( $type, $data ) = each %$es ) {
         next if !exists( $type_to_label{$type} );
 
+        # Item facets (Bug 46309) are nested aggregations: the buckets live one
+        # level down (under an inner agg named like the facet) and the per-record
+        # count comes from the reverse_nested sub-aggregation.
+        my $is_nested = ref( $data->{$type} ) eq 'HASH' && exists $data->{$type}{buckets};
+        my $buckets = $is_nested ? $data->{$type}{buckets} : $data->{buckets};
+
         # We restrict to the most popular $limit !results
         my $limit = C4::Context->preference('FacetMaxCount');
         my $facet = {
@@ -549,13 +555,13 @@ sub _convert_facets {
             %authorised_values = map { $_->{authorised_value} => $_->{lib} }
                 @{ C4::Koha::GetAuthorisedValues( $type_to_label{$type}{av_cat}, $opac ) };
         }
-        $limit = @{ $data->{buckets} } if ( $limit > @{ $data->{buckets} } );
-        foreach my $term ( @{ $data->{buckets} }[ 0 .. $limit - 1 ] ) {
+        $limit = @{$buckets} if ( $limit > @{$buckets} );
+        foreach my $term ( @{$buckets}[ 0 .. $limit - 1 ] ) {
             my $t = $term->{key};
             next
                 unless length($t)
                 ; # FIXME Currently we cannot search for an empty faceted field i.e. ln:"" to find records missing languages, though ES does count them correctly
-            my $c = $term->{doc_count};
+            my $c = $is_nested ? $term->{record_count}{doc_count} : $term->{doc_count};
             my $label;
             if ( exists( $special{$type} ) ) {
                 $label = $special{$type}->{$t} // $t;

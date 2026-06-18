@@ -17,7 +17,7 @@
 
 use Modern::Perl;
 
-use Test::More tests => 15;
+use Test::More tests => 16;
 use Test::NoWarnings;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
@@ -83,7 +83,7 @@ SKIP: {
 
     eval { $builder->get_elasticsearch_params; };
 
-    skip 'Elasticsearch configuration not available', 9
+    skip 'Elasticsearch configuration not available', 10
         if $@;
 
     Koha::SearchEngine::Elasticsearch::Indexer->new( { index => 'mydb' } )->drop_index;
@@ -172,5 +172,36 @@ SKIP: {
 
         $schema->storage->txn_rollback;
 
+    };
+
+    subtest "_convert_facets nested item facets (Bug 46309)" => sub {
+        plan tests => 4;
+
+        $schema->storage->txn_begin;
+
+        # homebranch is faceted and lives on the nested items object, so the
+        # aggregation is shaped as: items nested -> terms -> reverse_nested.
+        my $es_facets = {
+            homebranch => {
+                doc_count  => 7,
+                homebranch => {
+                    buckets => [
+                        { key => 'CPL', doc_count => 5, record_count => { doc_count => 3 } },
+                        { key => 'MPL', doc_count => 2, record_count => { doc_count => 2 } },
+                    ],
+                },
+            },
+        };
+
+        my $koha_facets = $searcher->_convert_facets($es_facets);
+        is( scalar @$koha_facets, 1, "One facet group is returned for the nested aggregation" );
+
+        my %count_by_value =
+            map { $_->{facet_link_value} => $_->{facet_count} } @{ $koha_facets->[0]->{facets} };
+        is( scalar keys %count_by_value, 2, "Both nested buckets are converted to facets" );
+        is( $count_by_value{CPL}, 3, "CPL count comes from reverse_nested (records), not the item doc_count" );
+        is( $count_by_value{MPL}, 2, "MPL count comes from reverse_nested (records)" );
+
+        $schema->storage->txn_rollback;
     };
 }
