@@ -274,6 +274,14 @@ sub get_elasticsearch_mappings {
             $mappings->{properties}{'subject-heading-thesaurus'} = _get_elasticsearch_field_config( 'search', 'text' );
         }
 
+        # Nested item object (Bug 46309). The `items` field is a `nested` object
+        # whose values are computed from the database at index time, so it is not
+        # represented in the search_field / search_marc_map tables. Inject its
+        # mapping directly from the dedicated 'item' section of field_config.yaml.
+        if ( $self->index eq $BIBLIOS_INDEX ) {
+            $mappings->{properties}{items} = clone( _get_elasticsearch_field_config( 'item', '' ) );
+        }
+
         # Disable date and numeric detection to prevent Elasticsearch from
         # auto-detecting field types in marc_data_array. Without this, a
         # subfield value that looks like a date (e.g. "2024-01-15") causes

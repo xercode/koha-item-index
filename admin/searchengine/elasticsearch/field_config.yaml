@@ -80,3 +80,73 @@ sort:
     type: icu_collation_keyword
     index: false
     numeric: false
+# Nested item object (Bug 46309).
+#
+# Item-level data is indexed as a single `nested` object so that library and
+# availability criteria are evaluated against the *same* item (e.g. "library X
+# AND available" must hold for one item, not be split across two).
+#
+# This block is the Elasticsearch mapping fragment for the `items` field: it is
+# cloned verbatim into the biblios index mapping by get_elasticsearch_mappings().
+# The values are built at index time from the database (see
+# marc_records_to_documents), NOT from MARC field mappings, so these subfields
+# are injected directly into the mapping and are intentionally NOT managed
+# through the search_field / search_marc_map tables nor the mappings.pl UI.
+#
+# Type choices follow the frozen F0 schema:
+#   - keyword            exact filtering + faceting on codes/identifiers
+#   - integer            numeric identifier (itemnumber), usable in inner_hits
+#   - boolean            derived/computed status flags
+#   - geo_point          library coordinates for geo_distance proximity search
+# All four subfield types are common to Elasticsearch 7 and 8.
+item:
+  type: nested
+  properties:
+    itemnumber:
+      type: integer
+    homebranch:
+      type: keyword
+    holdingbranch:
+      type: keyword
+    itype:
+      type: keyword
+    location:
+      type: keyword
+    permanent_location:
+      type: keyword
+    ccode:
+      type: keyword
+    callnumber:
+      type: keyword
+    cn_sort:
+      type: keyword
+    barcode:
+      type: keyword
+    enumchron:
+      type: keyword
+    restricted:
+      type: keyword
+    notforloan:
+      type: keyword
+    onloan:
+      type: keyword
+    damaged:
+      type: keyword
+    lost:
+      type: keyword
+    withdrawn:
+      type: keyword
+    intransit:
+      type: boolean
+    onhold:
+      type: boolean
+    onrequest:
+      type: boolean
+    hidden_in_opac_custom:
+      type: boolean
+    hidden_in_opac_by_preferences:
+      type: boolean
+    home_geolocation:
+      type: geo_point
+    holding_geolocation:
+      type: geo_point
