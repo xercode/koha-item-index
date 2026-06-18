@@ -18,7 +18,7 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 11;
+use Test::More tests => 12;
 use t::lib::Mocks;
 use JSON;
 
@@ -511,6 +511,26 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         $item_filters->[2],
         { field => 'home_geolocation', lat => 40.4168, lon => -3.7038, distance => '10km' },
         'a geo_distance item limit is parsed'
+    );
+};
+
+subtest '_build_item_facet_aggregation() tests (Bug 46309)' => sub {
+    plan tests => 1;
+
+    my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
+
+    is_deeply(
+        $qb->_build_item_facet_aggregation( 'homebranch', 30 ),
+        {
+            nested => { path => 'items' },
+            aggs   => {
+                homebranch => {
+                    terms => { field => 'items.homebranch', size => 30 },
+                    aggs  => { record_count => { reverse_nested => {} } },
+                },
+            },
+        },
+        'item facet is a nested aggregation with a reverse_nested record count'
     );
 };
 

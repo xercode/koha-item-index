@@ -18,7 +18,7 @@
 use Modern::Perl;
 use Encode;
 
-use Test::More tests => 9;
+use Test::More tests => 10;
 use Test::NoWarnings;
 use Test::Warn;
 use Test::Exception;
