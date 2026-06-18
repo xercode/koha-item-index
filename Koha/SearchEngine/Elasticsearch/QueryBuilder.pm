@@ -218,6 +218,14 @@ sub build_query {
 
     $res->{query}->{bool}->{should} = $options{field_match_boost_query} if $options{field_match_boost_query};
 
+    # Nested item filters (Bug 46309). All item-level criteria are wrapped in a
+    # single bool inside one nested query so they are evaluated against the
+    # *same* item (e.g. "library X AND available" must be satisfied by one item,
+    # not split across two).
+    if ( $options{item_filters} && @{ $options{item_filters} } ) {
+        push @{ $res->{query}->{bool}->{filter} }, $self->_build_item_filter_query( $options{item_filters} );
+    }
+
     if ( $options{sort} ) {
         foreach my $sort ( @{ $options{sort} } ) {
             my ( $f, $d ) = @$sort{qw/ field direction /};
@@ -253,6 +261,103 @@ sub build_query {
 
     $res = _rebuild_to_es_advanced_query($res) if @$es_advanced_searches;
     return $res;
+}
+
+=head2 _build_item_filter_query
+
+    my $nested = $builder->_build_item_filter_query(\@item_filters);
+
+Builds a single C<nested> query (path C<items>, Bug 46309) wrapping every
+item-level criterion in one C<bool> C<filter>, so that all the criteria are
+evaluated against the *same* item.
+
+Each entry of C<@item_filters> is a hashref describing one leaf condition:
+
+=over 4
+
+=item * a term filter: C<< { field => 'homebranch', value => 'CPL' } >> becomes
+C<< { term => { 'items.homebranch' => 'CPL' } } >>. The caller is responsible for
+passing a value the field accepts (e.g. C<JSON::true> / C<\1> for boolean
+subfields such as C<onrequest>).
+
+=item * a proximity filter (R11): C<< { field => 'home_geolocation', lat => ...,
+lon => ..., distance => '10km' } >> becomes a C<geo_distance> clause. The
+C<geo_distance> syntax is common to Elasticsearch 7 and 8.
+
+=back
+
+=cut
+
+sub _build_item_filter_query {
+    my ( $self, $item_filters ) = @_;
+
+    my @clauses;
+    for my $filter (@$item_filters) {
+        my $field = "items.$filter->{field}";
+        if ( defined $filter->{distance} ) {
+            push @clauses, {
+                geo_distance => {
+                    distance => $filter->{distance},
+                    $field   => { lat => $filter->{lat}, lon => $filter->{lon} },
+                }
+            };
+        } else {
+            push @clauses, { term => { $field => $filter->{value} } };
+        }
+    }
+
+    return {
+        nested => {
+            path  => 'items',
+            query => { bool => { filter => \@clauses } },
+        }
+    };
+}
+
+=head2 _extract_item_filters
+
+    my ( $item_filters, $remaining_limits ) = $builder->_extract_item_filters(\@limits);
+
+Partitions a list of limit strings (Bug 46309) into item-level filters, which
+must be turned into a nested query, and the remaining limits, which keep flowing
+through the regular query_string machinery. Recognised forms:
+
+=over 4
+
+=item * C<< items.<field>:<value> >> — a term filter. C<true>/C<false> values
+are coerced to JSON booleans (for the boolean subfields). Surrounding double
+quotes are stripped.
+
+=item * C<< items.<field>,geo_distance:<lat>,<lon>,<distance> >> — a proximity
+filter (R11), e.g. C<items.home_geolocation,geo_distance:40.4168,-3.7038,10km>.
+
+=back
+
+Anything else is returned untouched in the remaining-limits list.
+
+=cut
+
+sub _extract_item_filters {
+    my ( $self, $limits ) = @_;
+
+    my @item_filters;
+    my @remaining;
+
+    for my $limit ( @{ $limits // [] } ) {
+        if ( $limit =~ /^items\.(\w+),geo_distance:([^,]+),([^,]+),(.+)$/ ) {
+            push @item_filters, { field => $1, lat => $2 + 0, lon => $3 + 0, distance => $4 };
+        } elsif ( $limit =~ /^items\.(\w+):(.+)$/ ) {
+            my ( $field, $value ) = ( $1, $2 );
+            $value =~ s/^"(.*)"$/$1/;
+            if    ( $value eq 'true' )  { $value = JSON::true; }
+            elsif ( $value eq 'false' ) { $value = JSON::false; }
+            push @item_filters, { field => $field, value => $value };
+        } else {
+            push @remaining, $limit;
+        }
+    }
+
+    return ( \@item_filters, \@remaining );
 }
 
 =head2 build_query_compat
@@ -295,7 +400,18 @@ sub build_query_compat {
             C4::Context->preference('ElasticsearchBoostFieldMatch')
             ? $self->_build_field_match_boost_query( { operands => $operands, indexes => \@index_params } )
             : [];
-        $limits = $self->_fix_limit_special_cases($orig_limits);
+        # Pull item-level limits (Bug 46309) out of the limit list before they
+        # reach the query_string machinery: nested fields cannot be queried with
+        # query_string, so they are routed through a structured nested query.
+        my ( $item_filters, $remaining_limits ) = $self->_extract_item_filters($orig_limits);
+
+        # In the OPAC, hidelostitems is resolved here as a nested filter on
+        # items.lost rather than at index time (see Koha::Item->hidden_in_opac).
+        if ( $params->{is_opac} && C4::Context->preference('hidelostitems') ) {
+            push @$item_filters, { field => 'lost', value => '0' };
+        }
+
+        $limits = $self->_fix_limit_special_cases($remaining_limits);
         if ( $params->{suppress} ) { push @$limits, "suppress:false"; }
 
         # Merge the indexes in with the search terms and the operands so that
@@ -341,6 +457,7 @@ sub build_query_compat {
         $options{whole_record}            = $params->{whole_record};
         $options{skip_facets}             = $params->{skip_facets};
         $options{field_match_boost_query} = $field_match_boost_query if @$field_match_boost_query;
+        $options{item_filters}            = $item_filters            if @$item_filters;
         $query                            = $self->build_query( $query_str, %options );
     }
 

@@ -18,8 +18,9 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 9;
+use Test::More tests => 11;
 use t::lib::Mocks;
+use JSON;
 
 use_ok('Koha::SearchEngine::Elasticsearch::QueryBuilder');
 
@@ -416,6 +417,101 @@ subtest '_create_query_string' => sub {
     my $expect_geo = [];
     is( @queries, @$expect_geo, 'expected geo search structure => empty normal search string' );
 
+};
+
+subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
+    plan tests => 3;
+
+    my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
+
+    my $nested = $qb->_build_item_filter_query(
+        [
+            { field => 'homebranch', value => 'CPL' },
+            { field => 'onrequest',  value => JSON::true },
+        ]
+    );
+
+    is_deeply(
+        $nested,
+        {
+            nested => {
+                path  => 'items',
+                query => {
+                    bool => {
+                        filter => [
+                            { term => { 'items.homebranch' => 'CPL' } },
+                            { term => { 'items.onrequest'  => JSON::true } },
+                        ]
+                    }
+                }
+            }
+        },
+        'term filters are wrapped in a single bool inside one nested query (same-item coherence)'
+    );
+
+    my $geo = $qb->_build_item_filter_query(
+        [ { field => 'home_geolocation', lat => 40.4168, lon => -3.7038, distance => '10km' } ] );
+
+    is_deeply(
+        $geo,
+        {
+            nested => {
+                path  => 'items',
+                query => {
+                    bool => {
+                        filter => [
+                            {
+                                geo_distance => {
+                                    distance              => '10km',
+                                    'items.home_geolocation' => { lat => 40.4168, lon => -3.7038 },
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        'a geo_distance proximity filter is built inside the nested query'
+    );
+
+    my $combined = $qb->_build_item_filter_query(
+        [
+            { field => 'holdingbranch',    value => 'MPL' },
+            { field => 'home_geolocation', lat   => 1, lon => 2, distance => '5km' },
+        ]
+    );
+    is( scalar @{ $combined->{nested}{query}{bool}{filter} }, 2, 'term and geo filters share the same nested bool' );
+};
+
+subtest '_extract_item_filters() tests (Bug 46309)' => sub {
+    plan tests => 5;
+
+    my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
+
+    my ( $item_filters, $remaining ) = $qb->_extract_item_filters(
+        [
+            'items.homebranch:CPL',
+            'itype:BK',
+            'items.onrequest:true',
+            'items.home_geolocation,geo_distance:40.4168,-3.7038,10km',
+        ]
+    );
+
+    is_deeply( $remaining, ['itype:BK'], 'non-item limits are left untouched' );
+    is( scalar @$item_filters, 3, 'three item limits are extracted' );
+    is_deeply(
+        $item_filters->[0], { field => 'homebranch', value => 'CPL' },
+        'a term item limit is parsed'
+    );
+    is_deeply(
+        $item_filters->[1], { field => 'onrequest', value => JSON::true },
+        'a "true" value is coerced to a JSON boolean'
+    );
+    is_deeply(
+        $item_filters->[2],
+        { field => 'home_geolocation', lat => 40.4168, lon => -3.7038, distance => '10km' },
+        'a geo_distance item limit is parsed'
+    );
 };
 
 1;
