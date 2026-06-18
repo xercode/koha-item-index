@@ -1287,4 +1287,141 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
     );
 };
 
+subtest 'marc_records_to_documents should build the nested "items" field' => sub {
+    plan tests => 23;
+
+    t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+    t::lib::Mocks::mock_preference( 'hidelostitems',   0 );
+
+    my $se = Test::MockModule->new('Koha::SearchEngine::Elasticsearch');
+    $se->noop('_foreach_mapping');
+
+    my $see = Koha::SearchEngine::Elasticsearch::Search->new(
+        { index => $Koha::SearchEngine::Elasticsearch::BIBLIOS_INDEX } );
+
+    # sort_fields will call this and use the actual db values unless we call it first
+    $see->get_elasticsearch_mappings();
+
+    my $builder = t::lib::TestBuilder->new;
+    my $biblio  = $builder->build_sample_biblio;
+    my $record  = $biblio->metadata->record;
+
+    # A biblio without items gets an empty nested array
+    my $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}, [], 'a biblio without items gets an empty items array' );
+
+    # A single plain item, in a library without geolocation
+    my $library =
+        $builder->build_object( { class => 'Koha::Libraries', value => { geolocation => undef } } );
+    my $item = $builder->build_sample_item(
+        {
+            biblionumber  => $biblio->biblionumber,
+            homebranch    => $library->branchcode,
+            holdingbranch => $library->branchcode,
+            barcode       => 'NESTED-0001',
+        }
+    );
+
+    $docs = $see->marc_records_to_documents( [$record] );
+    my $doc = $docs->[0]->{items}->[0];
+    is( scalar @{ $docs->[0]->{items} }, 1,                 'one item produces one nested item document' );
+    is( $doc->{itemnumber},              $item->itemnumber, 'itemnumber is mapped' );
+    is( $doc->{homebranch},              $library->branchcode, 'homebranch is mapped' );
+    is( $doc->{barcode},                 'NESTED-0001',     'barcode is mapped' );
+    is_deeply( $doc->{intransit},             \0, 'intransit is false by default' );
+    is_deeply( $doc->{onhold},                \0, 'onhold is false by default' );
+    is_deeply( $doc->{onrequest},             \0, 'onrequest is false by default' );
+    is_deeply( $doc->{hidden_in_opac_custom}, \0, 'hidden_in_opac_custom placeholder is false' );
+    ok( !exists $doc->{home_geolocation}, 'home_geolocation is omitted when the library has no geolocation' );
+
+    # Library geolocation is indexed as the native "lat,lon" string
+    $library->geolocation('40.4168,-3.7038')->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is( $docs->[0]->{items}->[0]->{home_geolocation},    '40.4168,-3.7038', 'home_geolocation is set from the library' );
+    is( $docs->[0]->{items}->[0]->{holding_geolocation}, '40.4168,-3.7038', 'holding_geolocation is set from the library' );
+
+    # intransit: an active transfer (sent, not arrived, not cancelled)
+    my $transfer = $builder->build_object(
+        {
+            class => 'Koha::Item::Transfers',
+            value => {
+                itemnumber    => $item->itemnumber,
+                datesent      => '2024-01-01 00:00:00',
+                datearrived   => undef,
+                datecancelled => undef,
+            }
+        }
+    );
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{intransit}, \1, 'intransit is true with an active transfer' );
+
+    $transfer->datearrived('2024-01-02 00:00:00')->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{intransit}, \0, 'intransit is false once the transfer has arrived' );
+
+    # onhold + onrequest: a waiting hold
+    my $hold = $builder->build_object(
+        {
+            class => 'Koha::Holds',
+            value => {
+                biblionumber     => $biblio->biblionumber,
+                itemnumber       => $item->itemnumber,
+                found            => 'W',
+                cancellationdate => undef,
+                suspend          => 0,
+            }
+        }
+    );
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{onhold},    \1, 'onhold is true for a waiting hold' );
+    is_deeply( $docs->[0]->{items}->[0]->{onrequest}, \1, 'onrequest is true for a waiting hold' );
+
+    # onrequest only: a plain (not yet waiting/in transit) hold
+    $hold->set( { found => undef } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{onhold},    \0, 'onhold is false for a hold not waiting/in transit' );
+    is_deeply( $docs->[0]->{items}->[0]->{onrequest}, \1, 'onrequest is true for an active hold' );
+
+    # A suspended hold counts as neither
+    $hold->set( { suspend => 1 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{onrequest}, \0, 'onrequest is false for a suspended hold' );
+    $hold->set( { suspend => 0 } )->store;
+
+    # hidden_in_opac_by_preferences honours OpacHiddenItems
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', "withdrawn: [1]" );
+    $item->set( { withdrawn => 1 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{hidden_in_opac_by_preferences}, \1,
+        'hidden_in_opac_by_preferences is true when the item matches an OpacHiddenItems rule'
+    );
+
+    $item->set( { withdrawn => 0 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{hidden_in_opac_by_preferences}, \0,
+        'hidden_in_opac_by_preferences is false when the item matches no rule'
+    );
+
+    # hidelostitems must NOT influence the indexed value (it is resolved with a
+    # query-time filter on item.lost, not at index time)
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+    t::lib::Mocks::mock_preference( 'hidelostitems',   1 );
+    $item->set( { itemlost => 1 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{hidden_in_opac_by_preferences}, \0,
+        'hidden_in_opac_by_preferences ignores hidelostitems'
+    );
+    $item->set( { itemlost => 0 } )->store;
+    t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
+
+    # A batch with two items yields two nested documents
+    $builder->build_sample_item( { biblionumber => $biblio->biblionumber } );
+    $docs = $see->marc_records_to_documents( [$record] );
+    is( scalar @{ $docs->[0]->{items} }, 2, 'two items produce two nested item documents' );
+};
+
 $schema->storage->txn_rollback;

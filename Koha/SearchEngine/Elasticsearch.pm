@@ -33,6 +33,10 @@ use Koha::AuthorisedValueCategories;
 use C4::Heading;
 use C4::AuthoritiesMarc qw( GuessAuthTypeCode );
 use C4::Biblio;
+use Koha::Items;
+use Koha::Item::Transfers;
+use Koha::Holds;
+use Koha::Libraries;
 
 use Carp  qw( carp croak );
 use Clone qw( clone );
@@ -678,6 +682,21 @@ sub marc_records_to_documents {
         %auth_match_headings = map { $_->authtypecode => $_->auth_tag_to_report } @auth_types;
     }
 
+    # Build the nested item documents (Bug 46309) for the whole batch up front,
+    # so transit/hold status and library geolocation are resolved with grouped
+    # queries instead of one lookup per item inside the loop below.
+    my $item_documents = {};
+    if ( $self->index eq $BIBLIOS_INDEX ) {
+        my ( $tag, $code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
+        my @biblionumbers;
+        foreach my $record ( @{$records} ) {
+            my $field = $record->field($tag);
+            next unless $field;
+            push @biblionumbers, $field->is_control_field ? $field->data : $field->subfield($code);
+        }
+        $item_documents = $self->_get_item_documents( \@biblionumbers );
+    }
+
     foreach my $record ( @{$records} ) {
         my $record_document = {};
 
@@ -897,7 +916,8 @@ sub marc_records_to_documents {
                 map { $_ eq 'z' ? () : $_ } @{ $record_document->{'subject-heading-thesaurus'} };
         }
 
-        # Check if there is at least one available item
+        # Check if there is at least one available item, and attach the nested
+        # item documents (Bug 46309) built up front for this batch.
         if ( $self->index eq $BIBLIOS_INDEX ) {
             my ( $tag, $code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
             my $field = $record->field($tag);
@@ -912,6 +932,7 @@ sub marc_records_to_documents {
                 )->count;
 
                 $record_document->{available} = $avail_items ? \1 : \0;
+                $record_document->{items}     = $item_documents->{$biblionumber} // [];
             }
         }
 
@@ -927,6 +948,124 @@ sub marc_records_to_documents {
         push @record_documents, $record_document;
     }
     return \@record_documents;
+}
+
+=head2 _get_item_documents
+
+    my $items_by_biblio = $self->_get_item_documents(\@biblionumbers);
+
+Builds the C<items> nested objects (Bug 46309) for a batch of biblionumbers and
+returns a hashref mapping each biblionumber to an arrayref of item documents.
+
+Item-level state that does not live in the C<items> table (transit and hold
+status) and the libraries' geolocation are resolved with grouped queries over
+the whole batch, to avoid N+1 lookups inside the indexing loop.
+
+=cut
+
+sub _get_item_documents {
+    my ( $self, $biblionumbers ) = @_;
+
+    my %items_by_biblio;
+    return \%items_by_biblio unless @{$biblionumbers};
+
+    my @items       = Koha::Items->search( { biblionumber => { -in => $biblionumbers } } )->as_list;
+    my @itemnumbers = map { $_->itemnumber } @items;
+    return \%items_by_biblio unless @items;
+
+    # in_transit: a transfer that has been sent but neither arrived nor
+    # cancelled (mirrors Koha::Item::Transfer->in_transit).
+    my %intransit;
+    my $transfers = Koha::Item::Transfers->search(
+        {
+            itemnumber    => { -in => \@itemnumbers },
+            datesent      => { '!=' => undef },
+            datearrived   => undef,
+            datecancelled => undef,
+        }
+    );
+    $intransit{ $_->itemnumber } = 1 for $transfers->as_list;
+
+    # onrequest: any active (not cancelled, not suspended) hold on the item.
+    # onhold: such a hold that is also waiting ('W') or in transit ('T').
+    my ( %onhold, %onrequest );
+    my $holds = Koha::Holds->search(
+        {
+            itemnumber       => { -in => \@itemnumbers },
+            cancellationdate => undef,
+            suspend          => 0,
+        }
+    );
+    for my $hold ( $holds->as_list ) {
+        my $itemnumber = $hold->itemnumber;
+        $onrequest{$itemnumber} = 1;
+        my $found = $hold->found;
+        $onhold{$itemnumber} = 1 if defined $found && ( $found eq 'W' || $found eq 'T' );
+    }
+
+    # branches is a small table: load branchcode => geolocation once and resolve
+    # in memory rather than querying per item.
+    my %geolocation_by_branch =
+        map { $_->branchcode => $_->geolocation }
+        grep { defined $_->geolocation && $_->geolocation ne '' } Koha::Libraries->search->as_list;
+
+    # OpacHiddenItems rules, evaluated once for the whole batch.
+    my $hidden_rules = C4::Context->yaml_preference('OpacHiddenItems') // {};
+
+    for my $item (@items) {
+        my $itemnumber = $item->itemnumber;
+        my $document   = {
+            itemnumber                    => $itemnumber + 0,
+            homebranch                    => $item->homebranch,
+            holdingbranch                 => $item->holdingbranch,
+            itype                         => $item->itype,
+            location                      => $item->location,
+            permanent_location            => $item->permanent_location,
+            ccode                         => $item->ccode,
+            callnumber                    => $item->itemcallnumber,
+            cn_sort                       => $item->cn_sort,
+            barcode                       => $item->barcode,
+            enumchron                     => $item->enumchron,
+            restricted                    => $item->restricted,
+            notforloan                    => $item->notforloan,
+            onloan                        => $item->onloan,
+            damaged                       => $item->damaged,
+            lost                          => $item->itemlost,
+            withdrawn                     => $item->withdrawn,
+            intransit                     => $intransit{$itemnumber} ? \1 : \0,
+            onhold                        => $onhold{$itemnumber}    ? \1 : \0,
+            onrequest                     => $onrequest{$itemnumber} ? \1 : \0,
+            hidden_in_opac_custom         => $self->_item_hidden_in_opac_custom($item) ? \1 : \0,
+            hidden_in_opac_by_preferences =>
+                $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } ) ? \1 : \0,
+        };
+
+        # geo_point accepts the native "lat,lon" string. Omit the subfield when
+        # the library has no geolocation so ES does not reject an empty value.
+        my $home_geolocation    = $geolocation_by_branch{ $item->homebranch };
+        my $holding_geolocation = $geolocation_by_branch{ $item->holdingbranch };
+        $document->{home_geolocation}    = $home_geolocation    if defined $home_geolocation;
+        $document->{holding_geolocation} = $holding_geolocation if defined $holding_geolocation;
+
+        push @{ $items_by_biblio{ $item->biblionumber } }, $document;
+    }
+
+    return \%items_by_biblio;
+}
+
+=head2 _item_hidden_in_opac_custom
+
+    my $bool = $self->_item_hidden_in_opac_custom($item);
+
+Placeholder for custom OPAC item-hiding rules (Bug 46309). Wired end to end so
+the C<item.hidden_in_opac_custom> field exists in the index and can be populated
+later without recreating the schema. Currently hides no item (always returns 0).
+
+=cut
+
+sub _item_hidden_in_opac_custom {
+    my ( $self, $item ) = @_;
+    return 0;
 }
 
 =head2 _process_data_field_rules($rules, $field, $record_document, $altscript, $exclude_target_fields_regexp)

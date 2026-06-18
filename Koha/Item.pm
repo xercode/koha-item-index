@@ -1165,7 +1165,9 @@ Returns false otherwise.
 
 Takes HASHref that can have the following parameters:
     OPTIONAL PARAMETERS:
-    $rules : { <field> => [ value_1, ... ], ... }
+    $rules           : { <field> => [ value_1, ... ], ... }
+    $skip_lost_check : if true, ignore the I<hidelostitems> preference and only
+                       evaluate the I<OpacHiddenItems> rules
 
 Note: $rules inherits its structure from the parsed YAML from reading
 the I<OpacHiddenItems> system preference.
@@ -1178,7 +1180,8 @@ sub hidden_in_opac {
     my $rules = $params->{rules} // {};
 
     return 1
-        if C4::Context->preference('hidelostitems')
+        if !$params->{skip_lost_check}
+        and C4::Context->preference('hidelostitems')
         and $self->itemlost > 0;
 
     my $hidden_in_opac = 0;
