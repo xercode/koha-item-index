@@ -25,6 +25,8 @@ use C4::Log   qw( logaction );
 use Koha::Database;
 use Koha::DateUtils qw( dt_from_string );
 use Koha::Exceptions::Item::Transfer;
+use Koha::SearchEngine;
+use Koha::SearchEngine::Indexer;
 
 use base qw(Koha::Object);
 
@@ -181,9 +183,13 @@ sub receive {
 
 =head3 cancel
 
-  $transfer->cancel({ reason => $reason, [force => 1]});
+  $transfer->cancel({ reason => $reason, [force => 1], [skip_record_index => 1] });
 
 Cancel the transfer by setting the datecancelled time and recording the reason.
+
+An optional I<skip_record_index> parameter can be passed to avoid triggering the
+biblio reindex (Bug XXXXX), e.g. when the caller already handles indexing or is
+replacing the transfer straight away.
 
 =cut
 
@@ -196,8 +202,22 @@ sub cancel {
     # Throw exception if item is in transit already
     Koha::Exceptions::Item::Transfer::InTransit->throw() if ( !$params->{force} && $self->in_transit );
 
+    # Bug XXXXX: a cancelled transfer that was in transit flips the item's
+    # indexed intransit status to false. Unlike transit()/receive() (which
+    # reindex through ModDateLastSeen -> Koha::Item->store), cancel() does not
+    # touch the item, so reindex the biblio explicitly.
+    my $was_in_transit = $self->in_transit;
+
     # Update the cancelled date
     $self->set( { datecancelled => dt_from_string, cancellation_reason => $params->{reason} } )->store;
+
+    if (   $was_in_transit
+        && !$params->{skip_record_index}
+        && C4::Context->preference('SearchEngine') eq 'Elasticsearch' )
+    {
+        my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+        $indexer->index_records( $self->item->biblionumber, "specialUpdate", "biblioserver" );
+    }
 
     return $self;
 }

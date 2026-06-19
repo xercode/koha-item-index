@@ -39,6 +39,8 @@ use Koha::Plugins;
 use Koha::ILL::ISO18626::Request;
 
 use Koha::BackgroundJob::BatchUpdateBiblioHoldsQueue;
+use Koha::SearchEngine;
+use Koha::SearchEngine::Indexer;
 
 use Koha::Exceptions;
 use Koha::HoldGroups;
@@ -920,6 +922,7 @@ my $cancel_hold = $hold->cancel(
         [ charge_cancel_fee       => 1||0, ]
         [ cancellation_reason     => $cancellation_reason, ]
         [ skip_holds_queue        => 1||0 ]
+        [ skip_record_index       => 1||0 ]
         [ skip_hold_group_cleanup => 1||0 ]
     }
 );
@@ -950,7 +953,7 @@ sub cancel {
             $self->cancellationdate( dt_from_string->strftime('%Y-%m-%d %H:%M:%S') );
             $self->priority(0);
             $self->cancellation_reason( $params->{cancellation_reason} );
-            $self->store();
+            $self->store( { skip_record_index => $params->{skip_record_index} } );
 
             my $dbh = $self->_result->result_source->schema->storage->dbh;
             $dbh->do(
@@ -1084,6 +1087,17 @@ item that filled the hold.
 
 sub fill {
     my ( $self, $params ) = @_;
+
+    # Bug 46309: filling an item-level hold removes the active reserve, so the
+    # item stops being onhold/onrequest. fill() bypasses store() (it uses set()
+    # + delete), so reindex the biblio explicitly afterwards.
+    my $reindex_biblionumber =
+        (      !$params->{skip_record_index}
+            && $self->itemnumber
+            && C4::Context->preference('SearchEngine') eq 'Elasticsearch' )
+        ? $self->biblionumber
+        : undef;
+
     $self->_result->result_source->schema->txn_do(
         sub {
             my $patron = $self->patron;
@@ -1139,6 +1153,12 @@ sub fill {
                 if C4::Context->preference('RealTimeHoldsQueue');
         }
     );
+
+    if ($reindex_biblionumber) {
+        my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+        $indexer->index_records( $reindex_biblionumber, "specialUpdate", "biblioserver" );
+    }
+
     return $self;
 }
 
@@ -1320,6 +1340,10 @@ sub store {
 
     Koha::Exceptions::Hold::MissingPickupLocation->throw() unless $self->branchcode;
 
+    # Bug 46309: reindex the biblio only when this change actually flips the
+    # item-level onhold/onrequest search status (see _item_search_status_*).
+    my $reindex_item_status = 0;
+
     if ( !$self->in_storage ) {
         if ( !$self->expirationdate && $self->patron_expiration_date ) {
             $self->expirationdate( $self->patron_expiration_date );
@@ -1330,10 +1354,14 @@ sub store {
         {
             $self->_set_default_expirationdate;
         }
+
+        # A brand new active item-level hold makes its item onrequest/onhold.
+        $reindex_item_status = $self->_affects_item_search_status;
     } else {
 
         my %updated_columns = $self->_result->get_dirty_columns;
         return $self->SUPER::store unless %updated_columns;
+        $reindex_item_status = $self->_item_search_status_changed( \%updated_columns );
         if ( exists $updated_columns{reservedate} || $hold_reverted ) {
             if (
                 (
@@ -1355,6 +1383,101 @@ sub store {
     }
 
     $self = $self->SUPER::store;
+
+    $self->_reindex_biblio_for_item_status if $reindex_item_status && !$params->{skip_record_index};
+
+    return $self;
+}
+
+=head3 _affects_item_search_status
+
+    my $bool = $hold->_affects_item_search_status;
+
+Internal helper. Returns true when this hold, with its current values, makes its
+target item I<onrequest>/I<onhold> for the Elasticsearch nested item documents
+(Bug 46309): it must target a specific item and be active (not cancelled, not
+suspended). Returns false on non-Elasticsearch engines, where these derived
+statuses are not indexed.
+
+=cut
+
+sub _affects_item_search_status {
+    my ($self) = @_;
+
+    return 0 unless $self->_type eq 'Reserve';                                    # not old_reserves rows
+    return 0 unless C4::Context->preference('SearchEngine') eq 'Elasticsearch';
+    return $self->_item_search_status_signature->{onrequest};
+}
+
+=head3 _item_search_status_signature
+
+    my $sig = $hold->_item_search_status_signature;
+
+Internal helper. Returns a hashref { itemnumber, onhold, onrequest } describing
+this hold's contribution to its item's indexed status, following the same rules
+as the indexer (Bug 46309): I<onrequest> when it targets an item and is active
+(no cancellationdate, not suspended); I<onhold> when, in addition, C<found> is
+'W' or 'T'.
+
+=cut
+
+sub _item_search_status_signature {
+    my ($self) = @_;
+
+    my $onrequest = ( defined $self->itemnumber && !$self->cancellationdate && !$self->suspend ) ? 1 : 0;
+    my $found     = $self->found // '';
+    my $onhold    = ( $onrequest && ( $found eq 'W' || $found eq 'T' ) ) ? 1 : 0;
+
+    return { itemnumber => $self->itemnumber, onhold => $onhold, onrequest => $onrequest };
+}
+
+=head3 _item_search_status_changed
+
+    my $bool = $hold->_item_search_status_changed( \%updated_columns );
+
+Internal helper. Given the dirty columns of an update, returns true only when the
+change flips this hold's contribution to its item's indexed onhold/onrequest
+status (Bug 46309), so the biblio is reindexed only when strictly needed. A
+transition that leaves the derived status untouched (e.g. found 'W' -> 'T', or a
+priority/date change) returns false. Returns false on non-Elasticsearch engines.
+
+=cut
+
+sub _item_search_status_changed {
+    my ( $self, $updated_columns ) = @_;
+
+    return 0 unless $self->_type eq 'Reserve';                                    # not old_reserves rows
+    return 0 unless C4::Context->preference('SearchEngine') eq 'Elasticsearch';
+
+    my @relevant = qw( itemnumber found suspend cancellationdate );
+    return 0 unless grep { exists $updated_columns->{$_} } @relevant;
+
+    my $old = $self->get_from_storage;
+    return 1 unless $old;    # be safe: reindex if the previous state is unknown
+
+    my $old_sig = $old->_item_search_status_signature;
+    my $new_sig = $self->_item_search_status_signature;
+
+    return 1 if ( $old_sig->{itemnumber} // 0 ) != ( $new_sig->{itemnumber} // 0 );
+    return 1 if $old_sig->{onhold} != $new_sig->{onhold};
+    return 1 if $old_sig->{onrequest} != $new_sig->{onrequest};
+    return 0;
+}
+
+=head3 _reindex_biblio_for_item_status
+
+    $hold->_reindex_biblio_for_item_status;
+
+Internal helper. Enqueues a reindex of this hold's biblio so its nested item
+documents pick up the new onhold/onrequest status (Bug 46309).
+
+=cut
+
+sub _reindex_biblio_for_item_status {
+    my ($self) = @_;
+
+    my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+    $indexer->index_records( $self->biblionumber, "specialUpdate", "biblioserver" );
 }
 
 =head3 _set_default_expirationdate

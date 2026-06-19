@@ -402,10 +402,11 @@ sub ModItemTransfer {
             } else {
                 $transfer = $item->request_transfer(
                     {
-                        to            => $to_library,
-                        reason        => $trigger,
-                        ignore_limits => 1,
-                        replace       => $trigger
+                        to                => $to_library,
+                        reason            => $trigger,
+                        ignore_limits     => 1,
+                        replace           => $trigger,
+                        skip_record_index => $params->{skip_record_index},
                     }
                 );
             }

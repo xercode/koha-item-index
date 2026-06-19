@@ -28,6 +28,7 @@ use Koha::Desks;
 use Koha::StockRotationStages;
 use Koha::SMTP::Servers;
 use Koha::Library::Hours;
+use Koha::BackgroundJob::UpdateBiblioItemsGeolocation;
 
 use base qw(Koha::Object::Mixin::AdditionalFields Koha::Object);
 
@@ -52,17 +53,28 @@ sub store {
 
     my $flush = 0;
 
+    # Bug XXXXX: the library geolocation is denormalized into the nested item
+    # documents, so a real change must trigger a batch reindex of every biblio
+    # holding an item in this library.
+    my $geolocation_changed = 0;
+
     if ( !$self->in_storage ) {
         $flush = 1;
     } else {
         my $self_from_storage = $self->get_from_storage;
-        $flush = 1 if ( $self_from_storage->branchname ne $self->branchname );
+        $flush               = 1 if ( $self_from_storage->branchname ne $self->branchname );
+        $geolocation_changed = 1
+            if ( ( $self_from_storage->geolocation // '' ) ne ( $self->geolocation // '' ) );
     }
 
     $self = $self->SUPER::store;
 
     if ($flush) {
         $cache->clear_from_cache('libraries:name');
+    }
+
+    if ( $geolocation_changed && C4::Context->preference('SearchEngine') eq 'Elasticsearch' ) {
+        Koha::BackgroundJob::UpdateBiblioItemsGeolocation->new->enqueue( { branchcode => $self->branchcode } );
     }
 
     return $self;
