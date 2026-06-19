@@ -449,6 +449,7 @@ sub core_types_to_classes {
         batch_hold_cancel                   => 'Koha::BackgroundJob::BatchCancelHold',
         create_eholdings_from_biblios       => 'Koha::BackgroundJob::CreateEHoldingsFromBiblios',
         update_elastic_index                => 'Koha::BackgroundJob::UpdateElasticIndex',
+        update_biblio_items_geolocation     => 'Koha::BackgroundJob::UpdateBiblioItemsGeolocation',
         update_holds_queue_for_biblios      => 'Koha::BackgroundJob::BatchUpdateBiblioHoldsQueue',
         stage_marc_for_import               => 'Koha::BackgroundJob::StageMARCForImport',
         marc_import_commit_batch            => 'Koha::BackgroundJob::MARCImportCommitBatch',
