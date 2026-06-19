@@ -933,6 +933,11 @@ sub marc_records_to_documents {
 
                 $record_document->{available} = $avail_items ? \1 : \0;
                 $record_document->{items}     = $item_documents->{$biblionumber} // [];
+
+                # Record-level item count (Bug 46309). Structural (patron
+                # independent): lets a query tell "record with no items" apart
+                # from "record whose items are all filtered out".
+                $record_document->{items_count} = scalar @{ $record_document->{items} };
             }
         }
 
@@ -1035,6 +1040,7 @@ sub _get_item_documents {
             intransit                     => $intransit{$itemnumber} ? \1 : \0,
             onhold                        => $onhold{$itemnumber}    ? \1 : \0,
             onrequest                     => $onrequest{$itemnumber} ? \1 : \0,
+            available                     => ( !$item->onloan && !$item->itemlost ) ? \1 : \0,
             hidden_in_opac_custom         => $self->_item_hidden_in_opac_custom($item) ? \1 : \0,
             hidden_in_opac_by_preferences =>
                 $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } ) ? \1 : \0,
@@ -1057,14 +1063,34 @@ sub _get_item_documents {
 
     my $bool = $self->_item_hidden_in_opac_custom($item);
 
-Placeholder for custom OPAC item-hiding rules (Bug 46309). Wired end to end so
-the C<item.hidden_in_opac_custom> field exists in the index and can be populated
-later without recreating the schema. Currently hides no item (always returns 0).
+Custom OPAC item-hiding rules (Bug 46309). Feeds the C<item.hidden_in_opac_custom>
+field. Delegates to the C<item_hidden_in_opac> plugin hook, passing the item, and
+is B<restrictive>: it stops and hides the item as soon as the first plugin returns
+a true value, without calling the remaining plugins.
+
+Returns 0 (not hidden) when no plugin vetoes the item, when no plugin implements
+the hook, or when plugins are disabled. This hiding is unconditional (it is not
+lifted by C<OpacHiddenItemsExceptions>).
 
 =cut
 
 sub _item_hidden_in_opac_custom {
     my ( $self, $item ) = @_;
+
+    return 0 unless C4::Context->config('enable_plugins');
+
+    my @plugins = grep { $_->can('item_hidden_in_opac') }
+        Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
+
+    for my $plugin (@plugins) {
+        my $hidden = eval { $plugin->item_hidden_in_opac( { item => $item } ) };
+        if ($@) {
+            warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
+            next;
+        }
+        return 1 if $hidden;
+    }
+
     return 0;
 }
 

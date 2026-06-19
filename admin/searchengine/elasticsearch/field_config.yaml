@@ -142,6 +142,8 @@ item:
       type: boolean
     onrequest:
       type: boolean
+    available:
+      type: boolean
     hidden_in_opac_custom:
       type: boolean
     hidden_in_opac_by_preferences:

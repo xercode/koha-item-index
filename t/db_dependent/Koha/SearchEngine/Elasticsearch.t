@@ -1225,7 +1225,7 @@ subtest 'Koha::SearchEngine::Elasticsearch::marc_records_to_documents with Inclu
 };
 
 subtest 'marc_records_to_documents should set the "available" field' => sub {
-    plan tests => 8;
+    plan tests => 11;
 
     t::lib::Mocks::mock_preference( 'marcflavour', 'MARC21' );
     my $dbh = C4::Context->dbh;
@@ -1245,6 +1245,7 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
 
     my $docs = $see->marc_records_to_documents( [$marc_record_1] );
     is_deeply( $docs->[0]->{available}, \0, 'a biblio without items is not available' );
+    is( $docs->[0]->{items_count}, 0, 'items_count is 0 for a biblio without items' );
 
     my $item = $builder->build_sample_item(
         {
@@ -1254,6 +1255,7 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
 
     $docs = $see->marc_records_to_documents( [$marc_record_1] );
     is_deeply( $docs->[0]->{available}, \1, 'a biblio with one item that has no particular status is available' );
+    is( $docs->[0]->{items_count}, 1, 'items_count is 1 for a biblio with one item' );
 
     $item->notforloan(1)->store();
     $docs = $see->marc_records_to_documents( [$marc_record_1] );
@@ -1285,10 +1287,11 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
         $docs->[0]->{available}, \1,
         'a biblio with at least one item that has no particular status is available'
     );
+    is( $docs->[0]->{items_count}, 2, 'items_count is 2 for a biblio with two items' );
 };
 
 subtest 'marc_records_to_documents should build the nested "items" field' => sub {
-    plan tests => 23;
+    plan tests => 25;
 
     t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
     t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
@@ -1332,7 +1335,8 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     is_deeply( $doc->{intransit},             \0, 'intransit is false by default' );
     is_deeply( $doc->{onhold},                \0, 'onhold is false by default' );
     is_deeply( $doc->{onrequest},             \0, 'onrequest is false by default' );
-    is_deeply( $doc->{hidden_in_opac_custom}, \0, 'hidden_in_opac_custom placeholder is false' );
+    is_deeply( $doc->{available},             \1, 'available is true for a plain item (no loan, not lost)' );
+    is_deeply( $doc->{hidden_in_opac_custom}, \0, 'hidden_in_opac_custom is false with no plugins enabled' );
     ok( !exists $doc->{home_geolocation}, 'home_geolocation is omitted when the library has no geolocation' );
 
     # Library geolocation is indexed as the native "lat,lon" string
@@ -1414,6 +1418,10 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     is_deeply(
         $docs->[0]->{items}->[0]->{hidden_in_opac_by_preferences}, \0,
         'hidden_in_opac_by_preferences ignores hidelostitems'
+    );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{available}, \0,
+        'available is false for a lost item'
     );
     $item->set( { itemlost => 0 } )->store;
     t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
