@@ -226,12 +226,12 @@ sub build_query {
 
     $res->{query}->{bool}->{should} = $options{field_match_boost_query} if $options{field_match_boost_query};
 
-    # Nested item filters (Bug 46309). All item-level criteria are wrapped in a
-    # single bool inside one nested query so they are evaluated against the
-    # *same* item (e.g. "library X AND available" must be satisfied by one item,
-    # not split across two).
-    if ( $options{item_filters} && @{ $options{item_filters} } ) {
-        push @{ $res->{query}->{bool}->{filter} }, $self->_build_item_filter_query( $options{item_filters} );
+    # Item-level clauses (Bug 46309). build_query_compat assembles the final
+    # item-related clauses -- the same-item nested filter and, in the OPAC, the
+    # record-suppression logic of OpacHiddenItemsHidesRecord -- and passes them
+    # ready to be AND-ed into the query.
+    if ( $options{item_filter_clauses} && @{ $options{item_filter_clauses} } ) {
+        push @{ $res->{query}->{bool}->{filter} }, @{ $options{item_filter_clauses} };
     }
 
     if ( $options{sort} ) {
@@ -516,30 +516,66 @@ sub build_query_compat {
         # Pull item-level limits (Bug 46309) out of the limit list before they
         # reach the query_string machinery: nested fields cannot be queried with
         # query_string, so they are routed through a structured nested query.
-        my ( $item_filters, $remaining_limits ) = $self->_extract_item_filters($orig_limits);
+        # $user_item_filters are the ones the user chose (facets, onrequest...);
+        # @auto_item_filters are the ones the OPAC always enforces (hiding, lost).
+        my ( $user_item_filters, $remaining_limits ) = $self->_extract_item_filters($orig_limits);
 
-        # Describe the user-supplied item filters before any internal filter
-        # (lost, hidden_in_opac_*) is pushed below, so the breadcrumb only shows
-        # what the user actually chose.
-        @item_filter_descriptions = $self->_describe_item_filters($item_filters);
+        # Describe the user-supplied item filters (not the automatic ones) so the
+        # breadcrumb only shows what the user actually chose.
+        @item_filter_descriptions = $self->_describe_item_filters($user_item_filters);
+
+        my @auto_item_filters;
 
         # In the OPAC, hidelostitems is resolved here as a nested filter on
         # items.lost rather than at index time (see Koha::Item->hidden_in_opac).
         if ( $params->{is_opac} && C4::Context->preference('hidelostitems') ) {
-            push @$item_filters, { field => 'lost', value => '0' };
+            push @auto_item_filters, { field => 'lost', value => '0' };
         }
 
-        # In the OPAC, hidden items must never match a search (Bug 46309, D6):
-        # filter them out on the same nested channel as the facet filters, so a
-        # hidden item cannot satisfy a same-item facet either. Both subfields are
-        # boolean, hence the JSON::false value. Custom hiding is always hard;
-        # preferences-based hiding is lifted for patrons whose category is listed
-        # in OpacHiddenItemsExceptions (override_hidden_items).
+        # In the OPAC, hidden items must never match a search (Bug 46309, D6): a
+        # hidden item must not satisfy a same-item facet, so the hiding filters
+        # are combined with the user filters in the same nested bool below. Both
+        # subfields are boolean, hence the JSON::false value. Custom hiding is
+        # always hard; preferences-based hiding is lifted for patrons whose
+        # category is listed in OpacHiddenItemsExceptions (override_hidden_items).
         if ( $params->{is_opac} ) {
-            push @$item_filters, { field => 'hidden_in_opac_custom',         value => JSON::false };
-            push @$item_filters, { field => 'hidden_in_opac_by_preferences', value => JSON::false }
+            push @auto_item_filters, { field => 'hidden_in_opac_custom',         value => JSON::false };
+            push @auto_item_filters, { field => 'hidden_in_opac_by_preferences', value => JSON::false }
                 unless $params->{override_hidden_items};
         }
+
+        # Assemble the item clause(s) per the record-suppression rules (D7).
+        # Notation: U = user item filters, auto = the OPAC ones above,
+        # H = OpacHiddenItemsHidesRecord.
+        my @item_filter_clauses;
+        if (@$user_item_filters) {
+
+            # With U: one nested over (auto AND U) as a hard filter. Records with
+            # no matching/visible item -- including those with no items at all --
+            # drop out, which is the intended behaviour when the user filters.
+            push @item_filter_clauses,
+                $self->_build_item_filter_query( [ @auto_item_filters, @$user_item_filters ] );
+        } elsif ( $params->{is_opac}
+            && @auto_item_filters
+            && C4::Context->preference('OpacHiddenItemsHidesRecord') )
+        {
+            # Without U, in the OPAC, with H on: hide a record only when it has
+            # items and all of them are hidden. A record with no items still
+            # shows, so the nested(auto) clause is OR-ed with items_count:0.
+            push @item_filter_clauses, {
+                bool => {
+                    should => [
+                        $self->_build_item_filter_query( \@auto_item_filters ),
+                        { term => { items_count => 0 } },
+                    ],
+                    minimum_should_match => 1,
+                }
+            };
+        }
+
+        # Without U and with H off (or on the intranet) no suppression clause is
+        # added, so every record -- including hidden-only and item-less ones --
+        # is shown.
 
         $limits = $self->_fix_limit_special_cases($remaining_limits);
         if ( $params->{suppress} ) { push @$limits, "suppress:false"; }
@@ -587,7 +623,7 @@ sub build_query_compat {
         $options{whole_record}            = $params->{whole_record};
         $options{skip_facets}             = $params->{skip_facets};
         $options{field_match_boost_query} = $field_match_boost_query if @$field_match_boost_query;
-        $options{item_filters}            = $item_filters            if @$item_filters;
+        $options{item_filter_clauses}     = \@item_filter_clauses    if @item_filter_clauses;
         $query                            = $self->build_query( $query_str, %options );
     }
 

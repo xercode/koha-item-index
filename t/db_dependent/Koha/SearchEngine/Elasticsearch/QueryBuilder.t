@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 12;
+use Test::More tests => 13;
 
 use List::Util qw( all );
 
@@ -1413,52 +1413,61 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
     unlike( $avail_desc // '', qr/available/i, 'availability item filter is not described in limit_desc' );
 };
 
-subtest 'OPAC item hiding filters (Bug 46309, D6)' => sub {
-    plan tests => 6;
+# Collect the term clauses of the hard nested item filter, keyed by field. Used
+# when a user filter is present, in which case the auto hiding filters are
+# combined with it in a single nested bool (D6 same-item coherence).
+sub _nested_item_term_filters {
+    my ($query) = @_;
+    my %found;
+    for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
+        next unless ref $clause eq 'HASH' && $clause->{nested};
+        for my $leaf ( @{ $clause->{nested}{query}{bool}{filter} || [] } ) {
+            next unless $leaf->{term};
+            my ($field) = keys %{ $leaf->{term} };
+            $found{$field} = $leaf->{term}{$field};
+        }
+    }
+    return \%found;
+}
 
-    t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
+subtest 'OPAC item hiding filters (Bug 46309, D6)' => sub {
+    plan tests => 7;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems',              0 );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 0 );
 
     my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
 
-    # Collect the term clauses pushed onto the nested items filter, keyed by field.
-    my $item_term_filters = sub {
-        my ($query) = @_;
-        my %found;
-        for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
-            next unless ref $clause eq 'HASH' && $clause->{nested};
-            for my $leaf ( @{ $clause->{nested}{query}{bool}{filter} || [] } ) {
-                next unless $leaf->{term};
-                my ($field) = keys %{ $leaf->{term} };
-                $found{$field} = $leaf->{term}{$field};
-            }
-        }
-        return \%found;
-    };
+    # A user facet filter is present, so the hiding filters are combined with it
+    # in the same nested bool: a hidden item cannot satisfy the facet either.
+    my @user_limit = ('items.homebranch:CPL');
 
-    # Intranet (no is_opac): staff see everything, no hiding filters at all.
-    my ( undef, $query ) = $qb->build_query_compat( undef, ['*'] );
-    my $found = $item_term_filters->($query);
+    # Intranet (no is_opac): only the user filter, no hiding filters.
+    my ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, [@user_limit] );
+    my $found = _nested_item_term_filters($query);
+    is( "$found->{'items.homebranch'}", 'CPL', 'user facet filter applies on the intranet' );
     ok( !exists $found->{'items.hidden_in_opac_custom'},         'no custom-hiding filter outside the OPAC' );
     ok( !exists $found->{'items.hidden_in_opac_by_preferences'}, 'no preferences-hiding filter outside the OPAC' );
 
-    # OPAC, regular patron: both hiding filters present and false.
-    ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
-    $found = $item_term_filters->($query);
+    # OPAC, regular patron: user filter plus both hiding filters (false), same nested.
+    ( undef, $query ) =
+        $qb->build_query_compat( undef, ['*'], undef, [@user_limit], undef, 0, undef, { is_opac => 1 } );
+    $found = _nested_item_term_filters($query);
     ok(
         exists $found->{'items.hidden_in_opac_custom'} && !$found->{'items.hidden_in_opac_custom'},
-        'custom-hiding filter (false) added in the OPAC'
+        'custom-hiding filter (false) combined with the user filter in the OPAC'
     );
     ok(
         exists $found->{'items.hidden_in_opac_by_preferences'} && !$found->{'items.hidden_in_opac_by_preferences'},
-        'preferences-hiding filter (false) added in the OPAC'
+        'preferences-hiding filter (false) combined with the user filter in the OPAC'
     );
 
     # OPAC, patron whose category overrides: custom stays, preferences lifted.
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['*'], undef, undef, undef, 0, undef,
+        undef, ['*'], undef, [@user_limit], undef, 0, undef,
         { is_opac => 1, override_hidden_items => 1 }
     );
-    $found = $item_term_filters->($query);
+    $found = _nested_item_term_filters($query);
     ok(
         exists $found->{'items.hidden_in_opac_custom'} && !$found->{'items.hidden_in_opac_custom'},
         'custom-hiding filter still applied for an overriding category'
@@ -1467,6 +1476,59 @@ subtest 'OPAC item hiding filters (Bug 46309, D6)' => sub {
         !exists $found->{'items.hidden_in_opac_by_preferences'},
         'preferences-hiding filter lifted for an overriding category'
     );
+};
+
+subtest 'OPAC record suppression (Bug 46309, D7)' => sub {
+    plan tests => 8;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    my $filter_clauses = sub { return $_[0]->{query}{bool}{filter} || []; };
+
+    # The suppression clause is a bool.should: nested(auto) OR items_count:0.
+    my $suppression = sub {
+        my ($query) = @_;
+        for my $clause ( @{ $filter_clauses->($query) } ) {
+            return $clause if ref $clause eq 'HASH' && $clause->{bool} && $clause->{bool}{should};
+        }
+        return undef;
+    };
+    my $has_items_count_zero = sub {
+        my ($query) = @_;
+        my $sup = $suppression->($query) or return 0;
+        return scalar grep { $_->{term} && exists $_->{term}{items_count} } @{ $sup->{bool}{should} };
+    };
+    my $has_hard_nested = sub {
+        my ($query) = @_;
+        return scalar grep { ref $_ eq 'HASH' && $_->{nested} } @{ $filter_clauses->($query) };
+    };
+
+    # OPAC, no user filter, H on: nested(auto) OR items_count:0.
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 1 );
+    my ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
+    my $sup = $suppression->($query);
+    ok( $sup, 'a suppression bool.should clause is added (OPAC, no user filter, H on)' );
+    is( $sup->{bool}{minimum_should_match}, 1, 'minimum_should_match is 1' );
+    ok( $has_items_count_zero->($query), 'items_count:0 is one should clause, so item-less records still show' );
+    ok(
+        ( scalar grep { $_->{nested} } @{ $sup->{bool}{should} } ),
+        'the auto hiding filters are the other should clause (nested)'
+    );
+
+    # OPAC, no user filter, H off: no suppression and no hard nested filter.
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 0 );
+    ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
+    ok( !$suppression->($query),  'no suppression clause when H is off' );
+    ok( !$has_hard_nested->($query), 'no hard nested item filter without a user filter when H is off' );
+
+    # OPAC, user filter present, H on: hard nested filter, no items_count OR.
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 1 );
+    ( undef, $query ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.homebranch:CPL'], undef, 0, undef, { is_opac => 1 } );
+    ok( $has_hard_nested->($query),       'a hard nested item filter is used when the user filters' );
+    ok( !$has_items_count_zero->($query), 'no items_count:0 OR when the user filters (item-less records hidden)' );
 };
 
 $schema->storage->txn_rollback;
