@@ -504,6 +504,11 @@ my ( $error, $query, $simple_query, $query_cgi, $query_desc, $limit, $limit_cgi,
 
 my $suppress = C4::Context->is_opac_suppressed;
 
+# Patrons whose category is listed in OpacHiddenItemsExceptions can see items
+# hidden by the OpacHiddenItems preferences (Bug 46309, D6); the custom hiding is
+# never lifted. Used to decide which item-hiding filters build_query_compat adds.
+my $override_hidden_items = ( $patron && $patron->category->override_hidden_items ) ? 1 : 0;
+
 ## I. BUILD THE QUERY
 ( $error, $query, $simple_query, $query_cgi, $query_desc, $limit, $limit_cgi, $limit_desc, $query_type ) =
     $builder->build_query_compat(
@@ -517,6 +522,7 @@ my $suppress = C4::Context->is_opac_suppressed;
     {
         suppress                => $suppress,
         is_opac                 => 1,
+        override_hidden_items   => $override_hidden_items,
         weighted_fields         => $weight_search,
         weight_search_submitted => $cgi->param('weight_search_submitted') // undef
     }
@@ -640,6 +646,7 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
                 {
                     suppress                => $suppress,
                     is_opac                 => 1,
+                    override_hidden_items   => $override_hidden_items,
                     weighted_fields         => $weight_search,
                     weight_search_submitted => $cgi->param('weight_search_submitted')
                 }
