@@ -38,7 +38,7 @@
                             </li>
                         [% ELSE %]
                             <li>
-                                <a href="/cgi-bin/koha/catalogue/search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=available"
+                                <a href="/cgi-bin/koha/catalogue/search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.available:true"
                                     >Limit to records with available items</a
                                 >
                             </li>

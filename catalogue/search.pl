@@ -297,7 +297,11 @@ if ( $template_type eq 'advsearch' ) {
 
     my %limit_hash;
     foreach my $limit (@limits) {
-        if ( $limit eq 'available' ) {
+        if ( $limit eq 'available' || $limit eq 'items.available:true' ) {
+
+            # Bug 46309 (D3-C): the availability checkbox now emits the nested
+            # items.available:true limit; the flat "available" is still honoured
+            # for backward compatibility when reconstructing the advanced form.
             $template->param( limit_available => 1 );
         } else {
             my ( $index, $value ) = split( ':', $limit );
@@ -677,7 +681,10 @@ if ($hits) {
     $template->param( total => $hits );
     if ($limit_cgi) {
         my $limit_cgi_not_availablity = $limit_cgi;
-        $limit_cgi_not_availablity =~ s/&limit=available//g;
+
+        # Bug 46309 (D3-C): strip both the nested items.available:true limit and
+        # the legacy flat "available" form.
+        $limit_cgi_not_availablity =~ s/&limit=(?:items\.available%3Atrue|available)//g;
         $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
 
         # Bug 46309 (D2): limit_cgi stripped of any on-request limit so the
