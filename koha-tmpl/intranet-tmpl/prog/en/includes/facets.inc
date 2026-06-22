@@ -50,10 +50,47 @@
                 </li>
                 <!-- /#availability_facet -->
 
+                [%# Bug 46309 (D2): three-way item on-request filter (all / not on request / on request). %]
+                [% SET onrequest_base = "/cgi-bin/koha/catalogue/search.pl?" _ query_cgi _ limit_cgi_not_onrequest %]
+                <li id="onrequest_facet">
+                    On request
+                    <ul>
+                        [% IF onrequest_filter == 'notonrequest' || onrequest_filter == 'onrequest' %]
+                            <li>
+                                <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]">All</a>
+                            </li>
+                        [% ELSE %]
+                            <li>
+                                <strong>All</strong>
+                            </li>
+                        [% END %]
+                        [% IF onrequest_filter == 'notonrequest' %]
+                            <li>
+                                <strong>Not on request</strong>
+                            </li>
+                        [% ELSE %]
+                            <li>
+                                <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.onrequest:false">Not on request</a>
+                            </li>
+                        [% END %]
+                        [% IF onrequest_filter == 'onrequest' %]
+                            <li>
+                                <strong>On request</strong>
+                            </li>
+                        [% ELSE %]
+                            <li>
+                                <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.onrequest:true">On request</a>
+                            </li>
+                        [% END %]
+                    </ul>
+                </li>
+                <!-- /#onrequest_facet -->
+
                 [% FOREACH facets_loo IN facets_loop %]
                     [% IF facets_loo.facets.size > 0 %]
                         <li id="[% facets_loo.type_id | html %]">
                             [% SWITCH facets_loo.label %]
+
                             [% CASE 'Authors' %]
                                 <span id="facet-authors">Authors</span>
                             [% CASE 'Titles' %]

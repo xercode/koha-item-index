@@ -1396,7 +1396,7 @@ subtest "_build_field_match_boost_query() tests" => sub {
 };
 
 subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
-    plan tests => 6;
+    plan tests => 8;
 
     my $builder = t::lib::TestBuilder->new;
     my $library = $builder->build_object(
@@ -1443,6 +1443,16 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
     ( undef, undef, undef, undef, undef, undef, undef, my $avail_desc ) =
         $qb->build_query_compat( undef, ['*'], undef, ['items.available:true'] );
     unlike( $avail_desc // '', qr/available/i, 'availability item filter is not described in limit_desc' );
+
+    # D2: the on-request user filter persists in limit_cgi and is described
+    # readably in limit_desc.
+    ( undef, undef, undef, undef, undef, undef, my $onreq_cgi, my $onreq_desc ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.onrequest:false'] );
+    like(
+        $onreq_cgi, qr/limit=items\.onrequest%3Afalse/,
+        'items.onrequest limit is preserved in limit_cgi'
+    );
+    like( $onreq_desc // '', qr/On request: No/, 'limit_desc describes the on-request filter readably' );
 };
 
 # Collect the term clauses of the hard nested item filter, keyed by field. Used

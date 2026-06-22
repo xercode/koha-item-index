@@ -49,6 +49,21 @@
                 </div>
             </li>
 
+            [%# Bug 46309 (D2): exclude items that are requested in a hold (items.onrequest). %]
+            <li id="onrequest_facet">
+                <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#onrequest_collapse" id="filter_onrequest">Requests</a>
+                <div class="facet-collapse collapse show" id="onrequest_collapse">
+                    <ul>
+                        [% IF ( exclude_onrequest ) %]
+                            <li><strong>Excluding records whose items are all requested</strong></li
+                            ><li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_onrequest | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
+                        [% ELSE %]
+                            <li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.onrequest:false">Exclude requested items</a></li>
+                        [% END %]
+                    </ul>
+                </div>
+            </li>
+
             [% FOREACH facets_loo IN facets_loop %]
                 [% IF facets_loo.facets.size > 0 %]
                     <li id="[% facets_loo.type_id | html %]">
@@ -58,6 +73,7 @@
                             [% attrs = "class='facet-toggle' aria-expanded='true' data-bs-toggle='collapse' data-bs-target='#" _ facets_loo.type_id _ "_collapse'" %]
                         [% END %]
                         [% SWITCH facets_loo.label %]
+
                         [% CASE 'Authors' %]
                             <a [% attrs | $raw %] id="facet-authors">Authors</a>
                         [% CASE 'Titles' %]
@@ -126,6 +142,7 @@
                                     <li class="moretoggle">
                                         [% SET aria_label = t("Show more") %]
                                         [% SWITCH facets_loo.label %]
+
                                         [% CASE 'Authors' %]
                                             [% aria_label = t("Show more authors") %]
                                         [% CASE 'Titles' %]
@@ -155,6 +172,7 @@
                                     <li class="moretoggle" style="display:none">
                                         [% SET aria_label = t("Show more") %]
                                         [% SWITCH facets_loo.label %]
+
                                         [% CASE 'Authors' %]
                                             [% aria_label = t("Show fewer authors") %]
                                         [% CASE 'Titles' %]

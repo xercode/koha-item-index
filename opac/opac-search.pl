@@ -475,6 +475,16 @@ foreach my $limit (@limits) {
 }
 $template->param( available => $available );
 
+# Bug 46309 (D2): "Exclude on-request items" toggle. Like the availability
+# toggle, its active state is driven by the presence of the nested-channel limit
+# items.onrequest:false among the URL limits; the limit itself is added by the
+# facet link in the template.
+my $exclude_onrequest;
+foreach my $limit (@limits) {
+    $exclude_onrequest = 1 if $limit eq 'items.onrequest:false';
+}
+$template->param( exclude_onrequest => $exclude_onrequest );
+
 # append year limits if they exist
 if ( $params->{'limit-yr'} ) {
     if ( $params->{'limit-yr'} =~ /\d{4}/ ) {
@@ -882,7 +892,14 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
             my $limit_cgi_not_availablity = $limit_cgi;
             $limit_cgi_not_availablity =~ s/&limit=available//g if defined $limit_cgi_not_availablity;
             $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
-            $template->param( limit_cgi                 => $limit_cgi );
+
+            # Bug 46309 (D2): limit_cgi stripped of the on-request limit, so the
+            # toggle link can rebuild a clean URL without it (colon is escaped to
+            # %3A in limit_cgi).
+            my $limit_cgi_not_onrequest = $limit_cgi;
+            $limit_cgi_not_onrequest =~ s/&limit=items\.onrequest%3A(?:true|false)//g if defined $limit_cgi_not_onrequest;
+            $template->param( limit_cgi_not_onrequest => $limit_cgi_not_onrequest );
+            $template->param( limit_cgi               => $limit_cgi );
             $template->param( countrss                  => $countRSS );
             $template->param( query_cgi                 => $query_cgi );
             $template->param( query_desc                => $query_desc );
