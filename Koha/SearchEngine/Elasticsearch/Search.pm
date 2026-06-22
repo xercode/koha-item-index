@@ -47,6 +47,7 @@ use Koha::ItemTypes;
 use Koha::AuthorisedValues;
 use Koha::AuthorisedValueCategories;
 use Koha::SearchEngine::QueryBuilder;
+use Koha::SearchEngine::Elasticsearch::QueryBuilder;
 use Koha::SearchEngine::Search;
 use Koha::Exceptions::Elasticsearch;
 use MARC::Record;
@@ -538,7 +539,16 @@ sub _convert_facets {
         # level down (under an inner agg named like the facet) and the per-record
         # count comes from the reverse_nested sub-aggregation.
         my $is_nested = ref( $data->{$type} ) eq 'HASH' && exists $data->{$type}{buckets};
-        my $buckets = $is_nested ? $data->{$type}{buckets} : $data->{buckets};
+        my $buckets   = $is_nested ? $data->{$type}{buckets} : $data->{buckets};
+
+        # Item facets (Bug 46309) link through the nested "items.<field>" prefix
+        # so that clicking them emits a "items.homebranch:CPL" limit, which the
+        # query builder routes to the same-item nested filter. The displayed
+        # label still derives from the bare $type via %special / av_cat.
+        my $type_link_value =
+            $Koha::SearchEngine::Elasticsearch::QueryBuilder::ITEM_FACET_FIELDS{$type}
+            ? "items.$type"
+            : $type;
 
         # We restrict to the most popular $limit !results
         my $limit = C4::Context->preference('FacetMaxCount');
@@ -546,7 +556,7 @@ sub _convert_facets {
             type_id                                   => $type . '_id',
             "type_label_$type_to_label{$type}{label}" => 1,
             label                                     => $type_to_label{$type}{label},
-            type_link_value                           => $type,
+            type_link_value                           => $type_link_value,
             order                                     => $type_to_label{$type}{order},
             av_cat                                    => $type_to_label{$type}{av_cat},
         };
@@ -574,9 +584,9 @@ sub _convert_facets {
                 facet_count       => $c,
                 facet_link_value  => $t,
                 facet_title_value => $t,
-                facet_label_value => $label || q{},    # TODO either truncate this,
-                                                       # or make the template do it like it should anyway
-                type_link_value   => $type,
+                facet_label_value => $label || q{},      # TODO either truncate this,
+                                                         # or make the template do it like it should anyway
+                type_link_value   => $type_link_value,
             };
         }
         if ( C4::Context->preference('FacetOrder') eq 'Alphabetical' ) {

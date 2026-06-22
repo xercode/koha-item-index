@@ -50,6 +50,9 @@ use Koha::Exceptions;
 use Koha::Authority;
 use Koha::Caches;
 use Koha::AuthorisedValueCategories;
+use Koha::AuthorisedValues;
+use Koha::ItemTypes;
+use Koha::Libraries;
 
 our %index_field_convert = (
     'kw'                      => '',
@@ -347,7 +350,7 @@ sub _build_item_facet_aggregation {
         nested => { path => 'items' },
         aggs   => {
             $name => {
-                terms => { field => "items.$name", size => $size },
+                terms => { field        => "items.$name", size => $size },
                 aggs  => { record_count => { reverse_nested => {} } },
             },
         },
@@ -400,6 +403,70 @@ sub _extract_item_filters {
     return ( \@item_filters, \@remaining );
 }
 
+=head2 _describe_item_filters
+
+    my @descriptions = $builder->_describe_item_filters($item_filters);
+
+Returns a list of human-readable "Label: Value" strings (Bug 46309, D4) for the
+user-supplied item-level filters, so they can be shown in C<limit_desc> / the
+active-filters breadcrumb. C<item_filters> are no longer present in the limit
+list once L</_extract_item_filters> has moved them to the nested channel, so
+they would otherwise be invisible to the user.
+
+Only the item facet fields (homebranch, holdingbranch, itype, location, ccode)
+are described: their codes are mapped to names reusing the same sources as the
+facet builder (L<Koha::Libraries>, L<Koha::ItemTypes> and the C<LOC> / C<CCODE>
+authorised values). Other item filters (geo distance and the internal hiding /
+availability filters) are left out of the breadcrumb.
+
+=cut
+
+sub _describe_item_filters {
+    my ( $self, $item_filters ) = @_;
+    return () unless $item_filters && @$item_filters;
+
+    # Only describe facet fields; bail out early if none are present so we never
+    # hit the database for an availability-only or geo-only query.
+    return ()
+        unless grep { $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} } @$item_filters;
+
+    my $opac = C4::Context->interface eq 'opac';
+
+    # Field labels reuse the configured facet labels (e.g. homebranch => "Libraries").
+    my %field_label =
+        map { $_->name => $_->label } Koha::SearchEngine::Elasticsearch->get_facet_fields;
+
+    my %value_label;    # field => { code => name }, built lazily per field
+    my $names_for = sub {
+        my ($field) = @_;
+        return $value_label{$field} if exists $value_label{$field};
+        my $map;
+        if ( $field eq 'homebranch' || $field eq 'holdingbranch' ) {
+            $map = { map { $_->branchcode => $_->branchname } Koha::Libraries->search->as_list };
+        } elsif ( $field eq 'itype' ) {
+            $map = { map { $_->itemtype => $_->description } Koha::ItemTypes->search->as_list };
+        } elsif ( $field eq 'location' || $field eq 'ccode' ) {
+            my $category = $field eq 'location' ? 'LOC' : 'CCODE';
+            $map = { map { $_->authorised_value => ( $opac ? ( $_->lib_opac || $_->lib ) : $_->lib ) }
+                    Koha::AuthorisedValues->search( { category => $category } )->as_list };
+        } else {
+            $map = {};
+        }
+        return $value_label{$field} = $map;
+    };
+
+    my @descriptions;
+    for my $filter (@$item_filters) {
+        my $field = $filter->{field};
+        next unless $field && $ITEM_FACET_FIELDS{$field} && exists $filter->{value};
+        my $value = "$filter->{value}";    # de-bless any JSON boolean to a plain string
+        my $label = $field_label{$field}           // $field;
+        my $name  = $names_for->($field)->{$value} // $value;
+        push @descriptions, "$label: $name";
+    }
+    return @descriptions;
+}
+
 =head2 build_query_compat
 
     my (
@@ -430,6 +497,11 @@ sub build_query_compat {
     my $query_str              = '';
     my $search_param_query_str = '';
     my $limits                 = ();
+
+    # Readable descriptions of the item-level filters (Bug 46309, D4), kept so
+    # they can be appended to limit_desc once it is built further down.
+    my @item_filter_descriptions;
+
     if ($scan) {
         ( $query, $query_str ) = $self->_build_scan_query( $operands, $indexes );
         $search_param_query_str = $query_str;
@@ -440,10 +512,16 @@ sub build_query_compat {
             C4::Context->preference('ElasticsearchBoostFieldMatch')
             ? $self->_build_field_match_boost_query( { operands => $operands, indexes => \@index_params } )
             : [];
+
         # Pull item-level limits (Bug 46309) out of the limit list before they
         # reach the query_string machinery: nested fields cannot be queried with
         # query_string, so they are routed through a structured nested query.
         my ( $item_filters, $remaining_limits ) = $self->_extract_item_filters($orig_limits);
+
+        # Describe the user-supplied item filters before any internal filter
+        # (lost, hidden_in_opac_*) is pushed below, so the breadcrumb only shows
+        # what the user actually chose.
+        @item_filter_descriptions = $self->_describe_item_filters($item_filters);
 
         # In the OPAC, hidelostitems is resolved here as a nested filter on
         # items.lost rather than at index time (see Koha::Item->hidden_in_opac).
@@ -530,6 +608,13 @@ sub build_query_compat {
         : '';
     my $limit_desc;
     $limit_desc = "$limit" if $limit;
+
+    # Append the readable item filters (Bug 46309, D4); they live in the nested
+    # channel and are otherwise absent from $limit / limit_desc.
+    if (@item_filter_descriptions) {
+        my $items_desc = join( ' and ', @item_filter_descriptions );
+        $limit_desc = $limit_desc ? "$limit_desc and $items_desc" : $items_desc;
+    }
 
     return (
         undef,  $query,     $simple_query, $query_cgi, $query_desc,
