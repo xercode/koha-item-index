@@ -404,6 +404,17 @@ foreach my $limit (@limits) {
 }
 $template->param( available => $available );
 
+# Bug 46309 (D2): item on-request filter. The intranet exposes it as a three-way
+# choice (all / not on request / on request) whose selected option is driven by
+# the nested-channel limit items.onrequest:<bool>. The limit itself is added by
+# the facet link in the template.
+my $onrequest_filter = '';
+foreach my $limit (@limits) {
+    if    ( $limit eq 'items.onrequest:false' ) { $onrequest_filter = 'notonrequest'; }
+    elsif ( $limit eq 'items.onrequest:true' )  { $onrequest_filter = 'onrequest'; }
+}
+$template->param( onrequest_filter => $onrequest_filter );
+
 # append year limits if they exist
 my $limit_yr;
 my $limit_yr_value;
@@ -668,6 +679,12 @@ if ($hits) {
         my $limit_cgi_not_availablity = $limit_cgi;
         $limit_cgi_not_availablity =~ s/&limit=available//g;
         $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
+
+        # Bug 46309 (D2): limit_cgi stripped of any on-request limit so the
+        # three-way toggle links can rebuild a clean URL (colon escaped to %3A).
+        my $limit_cgi_not_onrequest = $limit_cgi;
+        $limit_cgi_not_onrequest =~ s/&limit=items\.onrequest%3A(?:true|false)//g;
+        $template->param( limit_cgi_not_onrequest => $limit_cgi_not_onrequest );
     }
     $template->param( DisplayMultiPlaceHold => $DisplayMultiPlaceHold );
     if ( $query_desc || $limit_desc ) {

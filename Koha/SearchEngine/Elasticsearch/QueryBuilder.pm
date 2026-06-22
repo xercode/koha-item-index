@@ -554,12 +554,15 @@ sub _describe_item_filters {
     my ( $self, $item_filters ) = @_;
     return () unless $item_filters && @$item_filters;
 
-    # Only describe facet fields and library limits; bail out early if none are
-    # present so we never hit the database for an availability-only or geo-only
-    # query.
+    # Only describe facet fields, the on-request filter and library limits; bail
+    # out early if none are present so we never hit the database for an
+    # availability-only or geo-only query.
     return ()
-        unless grep { ( $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} ) || $_->{branches} }
-        @$item_filters;
+        unless grep {
+        ( $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} )
+            || ( $_->{field} && $_->{field} eq 'onrequest' && exists $_->{value} )
+            || $_->{branches}
+        } @$item_filters;
 
     my $opac = C4::Context->interface eq 'opac';
 
@@ -600,6 +603,15 @@ sub _describe_item_filters {
         }
 
         my $field = $filter->{field};
+
+        # On-request filter (D2): not a facet field, so describe it on its own
+        # with a readable yes/no line.
+        if ( $field && $field eq 'onrequest' && exists $filter->{value} ) {
+            my $value = "$filter->{value}";    # de-bless any JSON boolean
+            push @descriptions, 'On request: ' . ( $value eq 'true' ? 'Yes' : 'No' );
+            next;
+        }
+
         next unless $field && $ITEM_FACET_FIELDS{$field} && exists $filter->{value};
         my $value = "$filter->{value}";    # de-bless any JSON boolean to a plain string
         my $label = $field_label{$field}           // $field;
