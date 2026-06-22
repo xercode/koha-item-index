@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 10;
+use Test::More tests => 11;
 
 use List::Util qw( all );
 
@@ -294,14 +294,24 @@ subtest 'build_query tests' => sub {
     t::lib::Mocks::mock_preference( 'FacetMaxCount',        '37' );
     t::lib::Mocks::mock_preference( 'DisplayLibraryFacets', 'both' );
     $query = $qb->build_query( 'test', %options );
-    ok( defined $query->{aggregations}{ccode}{terms}{size}, 'we need to ask for a size or we get only 5 facet' );
-    is( $query->{aggregations}{ccode}{terms}{size}, 37, 'we ask for the size as defined by the syspref FacetMaxCount' );
+
+    # ccode, homebranch and holdingbranch are item facets (Bug 46309): they
+    # aggregate over the nested items object, so the terms size lives one level
+    # down, under the inner aggregation named after the facet.
+    ok(
+        defined $query->{aggregations}{ccode}{aggs}{ccode}{terms}{size},
+        'we need to ask for a size or we get only 5 facet'
+    );
     is(
-        $query->{aggregations}{homebranch}{terms}{size}, 37,
+        $query->{aggregations}{ccode}{aggs}{ccode}{terms}{size}, 37,
+        'we ask for the size as defined by the syspref FacetMaxCount'
+    );
+    is(
+        $query->{aggregations}{homebranch}{aggs}{homebranch}{terms}{size}, 37,
         'we ask for the size as defined by the syspref FacetMaxCount for homebranch'
     );
     is(
-        $query->{aggregations}{holdingbranch}{terms}{size}, 37,
+        $query->{aggregations}{holdingbranch}{aggs}{holdingbranch}{terms}{size}, 37,
         'we ask for the size as defined by the syspref FacetMaxCount for holdingbranch'
     );
 
@@ -1351,6 +1361,56 @@ subtest "_build_field_match_boost_query() tests" => sub {
         'SHould query is correctly added'
     );
 
+};
+
+subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
+    plan tests => 6;
+
+    my $builder = t::lib::TestBuilder->new;
+    my $library = $builder->build_object(
+        {
+            class => 'Koha::Libraries',
+            value => { branchname => 'My Item Filter Library' },
+        }
+    );
+    my $itemtype = $builder->build_object(
+        {
+            class => 'Koha::ItemTypes',
+            value => { description => 'My Item Filter Type' },
+        }
+    );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    my ( undef, undef, undef, undef, undef, undef, $limit_cgi, $limit_desc ) =
+        $qb->build_query_compat(
+        undef, ['*'], undef,
+        [ 'items.homebranch:' . $library->branchcode, 'items.itype:' . $itemtype->itemtype ],
+        );
+
+    # D1: the raw items.* limits stay in limit_cgi so the facet stays active and
+    # survives pagination / sorting.
+    like(
+        $limit_cgi, qr/limit=items\.homebranch%3A\Q@{[ $library->branchcode ]}\E/,
+        'items.homebranch limit is preserved in limit_cgi'
+    );
+    like(
+        $limit_cgi, qr/limit=items\.itype%3A\Q@{[ $itemtype->itemtype ]}\E/,
+        'items.itype limit is preserved in limit_cgi'
+    );
+
+    # D4: limit_desc shows the resolved names, not the raw codes.
+    like( $limit_desc, qr/\QMy Item Filter Library\E/, 'limit_desc resolves the library code to its name' );
+    like( $limit_desc, qr/\QMy Item Filter Type\E/,    'limit_desc resolves the item type code to its description' );
+    unlike(
+        $limit_desc, qr/items\.homebranch/,
+        'limit_desc does not leak the raw items.<field> syntax'
+    );
+
+    # Availability-only filters are not part of the readable breadcrumb (D4 scope).
+    ( undef, undef, undef, undef, undef, undef, undef, my $avail_desc ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.available:true'] );
+    unlike( $avail_desc // '', qr/available/i, 'availability item filter is not described in limit_desc' );
 };
 
 $schema->storage->txn_rollback;

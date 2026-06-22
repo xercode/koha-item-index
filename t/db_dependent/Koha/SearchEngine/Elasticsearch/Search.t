@@ -175,7 +175,7 @@ SKIP: {
     };
 
     subtest "_convert_facets nested item facets (Bug 46309)" => sub {
-        plan tests => 4;
+        plan tests => 7;
 
         $schema->storage->txn_begin;
 
@@ -201,6 +201,21 @@ SKIP: {
         is( scalar keys %count_by_value, 2, "Both nested buckets are converted to facets" );
         is( $count_by_value{CPL}, 3, "CPL count comes from reverse_nested (records), not the item doc_count" );
         is( $count_by_value{MPL}, 2, "MPL count comes from reverse_nested (records)" );
+
+        # Bug 46309 (D1): item facets link through the nested "items.<field>"
+        # prefix so the limit reaches the same-item nested filter channel.
+        is(
+            $koha_facets->[0]->{type_link_value}, 'items.homebranch',
+            "Group type_link_value is prefixed with items. for an item facet"
+        );
+        unlike(
+            $koha_facets->[0]->{label}, qr/^items\./,
+            "Group label is left untouched (not prefixed with items.)"
+        );
+        is(
+            $koha_facets->[0]->{facets}->[0]->{type_link_value}, 'items.homebranch',
+            "Each facet entry also carries the items. prefixed type_link_value"
+        );
 
         $schema->storage->txn_rollback;
     };
