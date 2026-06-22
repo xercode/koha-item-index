@@ -119,7 +119,12 @@
                                     [% END %]
                                     <li class="[% li_class | html %]" style="[% li_style | html %]">
                                         [% IF facet.active %]
-                                            [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _  facet.type_link_value _ ":" _ facet.facet_link_value | url %][% END %]
+                                            [%# Bug 46309 (D8): a library limit kept as branch:/multibranchlimit: in the URL marks the facet active; its remove link must drop that raw token, not the items.<field> one %]
+                                            [% IF facet.remove_limit_value %]
+                                                [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _ facet.remove_limit_value | url %][% END %]
+                                            [% ELSE %]
+                                                [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _  facet.type_link_value _ ":" _ facet.facet_link_value | url %][% END %]
+                                            [% END %]
                                             [% FILTER collapse %]
                                                 <span class="facet-label facet-label-selected">
                                                     [% facet.facet_label_value | html %]

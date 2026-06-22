@@ -994,11 +994,30 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
     $template->param( outer_sup_results_loop => \@sup_results_array );
 }    #/end of the for loop
 
+# Bug 46309 (D8): a library limit (branch:/multibranchlimit:) is routed to the
+# nested items.homebranch/holdingbranch channel but kept verbatim in the URL, so
+# the matching library facets would not look selected. Map each such limit to the
+# item facet tokens it covers, remembering the raw limit so the facet remove link
+# can drop the real token rather than a non-existent items.<field> one.
+my %library_facet_remove;
+if ( $builder->can('library_limit_facet_tokens') ) {
+    for my $limit (@limits) {
+        for my $token ( $builder->library_limit_facet_tokens($limit) ) {
+            $library_facet_remove{$token} //= $limit;
+        }
+    }
+}
+
 for my $facet (@$facets) {
     for my $entry ( @{ $facet->{facets} } ) {
         my $index = $entry->{type_link_value};
         my $value = $entry->{facet_link_value};
-        $entry->{active} = grep { $_->{input_value} eq qq{$index:$value} } @limit_inputs;
+        if ( grep { $_->{input_value} eq qq{$index:$value} } @limit_inputs ) {
+            $entry->{active} = 1;
+        } elsif ( my $remove = $library_facet_remove{qq{$index:$value}} ) {
+            $entry->{active}             = 1;
+            $entry->{remove_limit_value} = $remove;
+        }
     }
 }
 

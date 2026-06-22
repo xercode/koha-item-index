@@ -532,6 +532,40 @@ sub _library_limit_to_item_filter {
     };
 }
 
+=head2 library_limit_facet_tokens
+
+    my @tokens = $builder->library_limit_facet_tokens('branch:CPL');
+
+Given a single-library C<branch:<code>> limit (Bug 46309, D8), returns the list of
+C<items.<field>:<code>> facet tokens it is equivalent to once routed to the nested
+channel (following C<SearchLimitLibrary>: C<homebranch>, C<holdingbranch> or
+both). The UI uses this to mark the matching library facets as selected even
+though the raw library limit is what the URL keeps.
+
+Group limits (C<multibranchlimit:<group_id>>) deliberately yield no tokens: a
+group is its own concept, so highlighting its individual member libraries (and
+only those that happen to appear in the results) would be misleading. Returns an
+empty list for group limits and for any other, non-library limit.
+
+=cut
+
+sub library_limit_facet_tokens {
+    my ( $self, $limit ) = @_;
+
+    return () unless defined $limit && $limit =~ /^branch:/;
+    my $descriptor = $self->_library_limit_to_item_filter($limit);
+    return () unless $descriptor;
+
+    # "both" yields a should of two leaves; home/holding yields a single leaf.
+    my @leaves = $descriptor->{should} ? @{ $descriptor->{should} } : ($descriptor);
+    my @tokens;
+    for my $leaf (@leaves) {
+        next unless $leaf->{field} && $leaf->{values};
+        push @tokens, map { "items.$leaf->{field}:$_" } @{ $leaf->{values} };
+    }
+    return @tokens;
+}
+
 =head2 _describe_item_filters
 
     my @descriptions = $builder->_describe_item_filters($item_filters);

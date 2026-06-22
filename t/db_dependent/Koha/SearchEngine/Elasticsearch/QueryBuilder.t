@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 13;
+use Test::More tests => 14;
 
 use List::Util qw( all );
 
@@ -1164,6 +1164,83 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
         "Multibranch limit routed to items.holdingbranch terms"
     );
     is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "limit cgi is kept verbatim" );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'library_limit_facet_tokens() tests (Bug 46309, D8)' => sub {
+
+    plan tests => 8;
+
+    $schema->storage->txn_begin;
+
+    my $builder  = t::lib::TestBuilder->new;
+    my $branch_1 = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $branch_2 = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $group    = $builder->build_object(
+        {
+            class => 'Koha::Library::Groups',
+            value => {
+                ft_search_groups_opac  => 1,
+                ft_search_groups_staff => 1,
+                parent_id              => undef,
+                branchcode             => undef
+            }
+        }
+    );
+    $builder->build_object(
+        { class => 'Koha::Library::Groups', value => { parent_id => $group->id, branchcode => $branch_1->id } } );
+    $builder->build_object(
+        { class => 'Koha::Library::Groups', value => { parent_id => $group->id, branchcode => $branch_2->id } } );
+    my $groupid = $group->id;
+
+    my $query_builder =
+        Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+
+    # The tokens let the UI mark a single-library facet selected even though the
+    # URL keeps the raw branch: limit. They must follow SearchLimitLibrary just
+    # like the query routing does. Group limits intentionally yield no tokens.
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'homebranch' );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('branch:CPL') ],
+        ['items.homebranch:CPL'],
+        "branch limit maps to the items.homebranch facet token"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens("multibranchlimit:$groupid") ],
+        [], "a group limit yields no tokens (members are not highlighted individually)"
+    );
+
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'holdingbranch' );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('branch:CPL') ],
+        ['items.holdingbranch:CPL'],
+        "branch limit maps to the items.holdingbranch facet token"
+    );
+
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'both' );
+    is_deeply(
+        [ sort $query_builder->library_limit_facet_tokens('branch:CPL') ],
+        [ 'items.holdingbranch:CPL', 'items.homebranch:CPL' ],
+        "branch limit maps to both home and holding facet tokens"
+    );
+
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('itype:BK') ],
+        [], "a non-library limit yields no tokens"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('available') ],
+        [], "the availability limit yields no tokens"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens(undef) ],
+        [], "an undefined limit yields no tokens"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('multibranchlimit:999999') ],
+        [], "an unknown group yields no tokens"
+    );
 
     $schema->storage->txn_rollback;
 };
