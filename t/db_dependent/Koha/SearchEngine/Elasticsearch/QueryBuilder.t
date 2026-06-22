@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 11;
+use Test::More tests => 12;
 
 use List::Util qw( all );
 
@@ -1411,6 +1411,62 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
     ( undef, undef, undef, undef, undef, undef, undef, my $avail_desc ) =
         $qb->build_query_compat( undef, ['*'], undef, ['items.available:true'] );
     unlike( $avail_desc // '', qr/available/i, 'availability item filter is not described in limit_desc' );
+};
+
+subtest 'OPAC item hiding filters (Bug 46309, D6)' => sub {
+    plan tests => 6;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    # Collect the term clauses pushed onto the nested items filter, keyed by field.
+    my $item_term_filters = sub {
+        my ($query) = @_;
+        my %found;
+        for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
+            next unless ref $clause eq 'HASH' && $clause->{nested};
+            for my $leaf ( @{ $clause->{nested}{query}{bool}{filter} || [] } ) {
+                next unless $leaf->{term};
+                my ($field) = keys %{ $leaf->{term} };
+                $found{$field} = $leaf->{term}{$field};
+            }
+        }
+        return \%found;
+    };
+
+    # Intranet (no is_opac): staff see everything, no hiding filters at all.
+    my ( undef, $query ) = $qb->build_query_compat( undef, ['*'] );
+    my $found = $item_term_filters->($query);
+    ok( !exists $found->{'items.hidden_in_opac_custom'},         'no custom-hiding filter outside the OPAC' );
+    ok( !exists $found->{'items.hidden_in_opac_by_preferences'}, 'no preferences-hiding filter outside the OPAC' );
+
+    # OPAC, regular patron: both hiding filters present and false.
+    ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
+    $found = $item_term_filters->($query);
+    ok(
+        exists $found->{'items.hidden_in_opac_custom'} && !$found->{'items.hidden_in_opac_custom'},
+        'custom-hiding filter (false) added in the OPAC'
+    );
+    ok(
+        exists $found->{'items.hidden_in_opac_by_preferences'} && !$found->{'items.hidden_in_opac_by_preferences'},
+        'preferences-hiding filter (false) added in the OPAC'
+    );
+
+    # OPAC, patron whose category overrides: custom stays, preferences lifted.
+    ( undef, $query ) = $qb->build_query_compat(
+        undef, ['*'], undef, undef, undef, 0, undef,
+        { is_opac => 1, override_hidden_items => 1 }
+    );
+    $found = $item_term_filters->($query);
+    ok(
+        exists $found->{'items.hidden_in_opac_custom'} && !$found->{'items.hidden_in_opac_custom'},
+        'custom-hiding filter still applied for an overriding category'
+    );
+    ok(
+        !exists $found->{'items.hidden_in_opac_by_preferences'},
+        'preferences-hiding filter lifted for an overriding category'
+    );
 };
 
 $schema->storage->txn_rollback;

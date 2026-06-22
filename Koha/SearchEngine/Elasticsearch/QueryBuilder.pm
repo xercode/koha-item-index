@@ -529,6 +529,18 @@ sub build_query_compat {
             push @$item_filters, { field => 'lost', value => '0' };
         }
 
+        # In the OPAC, hidden items must never match a search (Bug 46309, D6):
+        # filter them out on the same nested channel as the facet filters, so a
+        # hidden item cannot satisfy a same-item facet either. Both subfields are
+        # boolean, hence the JSON::false value. Custom hiding is always hard;
+        # preferences-based hiding is lifted for patrons whose category is listed
+        # in OpacHiddenItemsExceptions (override_hidden_items).
+        if ( $params->{is_opac} ) {
+            push @$item_filters, { field => 'hidden_in_opac_custom',         value => JSON::false };
+            push @$item_filters, { field => 'hidden_in_opac_by_preferences', value => JSON::false }
+                unless $params->{override_hidden_items};
+        }
+
         $limits = $self->_fix_limit_special_cases($remaining_limits);
         if ( $params->{suppress} ) { push @$limits, "suppress:false"; }
 
