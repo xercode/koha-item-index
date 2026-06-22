@@ -141,7 +141,12 @@
                                         [% SET facet_is_current_library = ( facets_loo.label == 'Home libraries' || facets_loo.label == 'Holding libraries' ) && !singleBranchMode && facet.facet_title_value == Branches.GetLoggedInBranchcode %]
                                         [% SET facet_label_class = facet_is_current_library ? 'facet-label currentlibrary' : 'facet-label' %]
                                         [% IF facet.active %]
-                                            [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _  facet.type_link_value _ ":" _ facet.facet_link_value | url %][% END %]
+                                            [%# Bug 46309 (D8): a library limit kept as branch:/multibranchlimit: in the URL marks the facet active; its remove link must drop that raw token, not the items.<field> one %]
+                                            [% IF facet.remove_limit_value %]
+                                                [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _ facet.remove_limit_value | url %][% END %]
+                                            [% ELSE %]
+                                                [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _  facet.type_link_value _ ":" _ facet.facet_link_value | url %][% END %]
+                                            [% END %]
                                             <span class="[% facet_label_class | html %]">[% facet.facet_label_value | html %]</span>
                                             <span class="facet-count"> ([% facet.facet_count | html %]) </span>
                                             [<a href="[% local_url | $raw %]" title="Remove facet [% facet.facet_label_value | html %]">x</a>]
