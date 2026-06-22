@@ -1030,7 +1030,7 @@ subtest 'build_query with weighted fields tests' => sub {
 
 subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
 
-    plan tests => 18;
+    plan tests => 14;
 
     $schema->storage->txn_begin;
 
@@ -1072,68 +1072,100 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
 
     my $query_builder =
         Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+
+    # Bug 46309 (D8): branch / multibranchlimit limits are routed to the nested
+    # items channel on items.homebranch / items.holdingbranch (terms), instead of
+    # the flat query_string field, so they resolve on the same item. The raw
+    # limit is still kept verbatim in limit_cgi for URL persistence.
+    my $nested_leaf = sub {
+        my ($query) = @_;
+        for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
+            return $clause->{nested}{query}{bool}{filter}[0] if ref $clause eq 'HASH' && $clause->{nested};
+        }
+        return undef;
+    };
+
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'both' );
-    my ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+    my ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
         $query_builder->build_query_compat( undef, undef, undef, ["branch:CPL"], undef, undef, undef, undef );
-    is( $limit,      '(homebranch: "CPL" OR holdingbranch: "CPL")', "Branch limit expanded to home/holding branch" );
-    is( $limit_desc, '(homebranch: "CPL" OR holdingbranch: "CPL")', "Limit description correctly expanded" );
-    is( $limit_cgi,  '&limit=branch%3ACPL',                         "Limit cgi does not get expanded" );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) = $query_builder->build_query_compat(
+    is_deeply(
+        $nested_leaf->($query),
+        {
+            bool => {
+                should => [
+                    { terms => { 'items.homebranch'    => ['CPL'] } },
+                    { terms => { 'items.holdingbranch' => ['CPL'] } },
+                ],
+                minimum_should_match => 1,
+            }
+        },
+        "Branch limit routed to a same-item home/holding disjunction"
+    );
+    is( $limit_cgi, '&limit=branch%3ACPL', "Branch limit cgi is kept verbatim" );
+
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+        $query_builder->build_query_compat(
         undef, undef, undef, ["multibranchlimit:$groupid"], undef, undef, undef,
         undef
+        );
+    is_deeply(
+        $nested_leaf->($query),
+        {
+            bool => {
+                should => [
+                    { terms => { 'items.homebranch'    => \@branchcodes } },
+                    { terms => { 'items.holdingbranch' => \@branchcodes } },
+                ],
+                minimum_should_match => 1,
+            }
+        },
+        "Multibranch limit expanded to the group branches on home/holding"
     );
-    is(
-        $limit,
-        "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\" OR holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "Multibranch limit expanded to home/holding branches"
-    );
-    is(
-        $limit_desc,
-        "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\" OR holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "Multibranch limit description correctly expanded"
-    );
-    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Multibranch limit cgi does not get expanded" );
+    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Multibranch limit cgi is kept verbatim" );
+    like( $limit_desc, qr/\Q@{[ $branch_1->branchname ]}\E/, "Multibranch limit_desc lists the branch names" );
+    like( $limit_desc, qr/\Q@{[ $branch_2->branchname ]}\E/, "Multibranch limit_desc lists the branch names" );
 
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'homebranch' );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
         $query_builder->build_query_compat( undef, undef, undef, ["branch:CPL"], undef, undef, undef, undef );
-    is( $limit,      "(homebranch: \"CPL\")", "branch limit expanded to home branch" );
-    is( $limit_desc, "(homebranch: \"CPL\")", "limit description correctly expanded" );
-    is( $limit_cgi,  "&limit=branch%3ACPL",   "limit cgi does not get expanded" );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) = $query_builder->build_query_compat(
+    is_deeply(
+        $nested_leaf->($query), { term => { 'items.homebranch' => 'CPL' } },
+        "Single-library branch limit routed to an items.homebranch term"
+    );
+    is( $limit_cgi, "&limit=branch%3ACPL", "limit cgi is kept verbatim" );
+
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+        $query_builder->build_query_compat(
         undef, undef, undef, ["multibranchlimit:$groupid"], undef, undef, undef,
         undef
+        );
+    is_deeply(
+        $nested_leaf->($query), { terms => { 'items.homebranch' => \@branchcodes } },
+        "Multibranch limit routed to items.homebranch terms"
     );
-    is(
-        $limit, "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\")",
-        "branch limit expanded to home branch"
-    );
-    is(
-        $limit_desc, "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\")",
-        "limit description correctly expanded"
-    );
-    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Limit cgi does not get expanded" );
+    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "limit cgi is kept verbatim" );
 
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'holdingbranch' );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
         $query_builder->build_query_compat( undef, undef, undef, ["branch:CPL"], undef, undef, undef, undef );
-    is( $limit,      "(holdingbranch: \"CPL\")", "branch limit expanded to holding branch" );
-    is( $limit_desc, "(holdingbranch: \"CPL\")", "Limit description correctly expanded" );
-    is( $limit_cgi,  "&limit=branch%3ACPL",      "Limit cgi does not get expanded" );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) = $query_builder->build_query_compat(
+    is_deeply(
+        $nested_leaf->($query), { term => { 'items.holdingbranch' => 'CPL' } },
+        "Single-library branch limit routed to an items.holdingbranch term"
+    );
+    is( $limit_cgi, "&limit=branch%3ACPL", "limit cgi is kept verbatim" );
+
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+        $query_builder->build_query_compat(
         undef, undef, undef, ["multibranchlimit:$groupid"], undef, undef, undef,
         undef
+        );
+    is_deeply(
+        $nested_leaf->($query), { terms => { 'items.holdingbranch' => \@branchcodes } },
+        "Multibranch limit routed to items.holdingbranch terms"
     );
-    is(
-        $limit, "(holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "branch limit expanded to holding branch"
-    );
-    is(
-        $limit_desc, "(holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "Limit description correctly expanded"
-    );
-    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Limit cgi does not get expanded" );
+    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "limit cgi is kept verbatim" );
 
+    $schema->storage->txn_rollback;
 };
 
 subtest "Handle search filters" => sub {

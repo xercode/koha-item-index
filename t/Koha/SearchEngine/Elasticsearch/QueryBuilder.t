@@ -420,7 +420,7 @@ subtest '_create_query_string' => sub {
 };
 
 subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
-    plan tests => 3;
+    plan tests => 7;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -481,6 +481,73 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
         ]
     );
     is( scalar @{ $combined->{nested}{query}{bool}{filter} }, 2, 'term and geo filters share the same nested bool' );
+
+    # D8: a multi-value library limit becomes a terms filter.
+    my $terms = $qb->_build_item_filter_query( [ { field => 'homebranch', values => [ 'CPL', 'MPL' ] } ] );
+    is_deeply(
+        $terms->{nested}{query}{bool}{filter},
+        [ { terms => { 'items.homebranch' => [ 'CPL', 'MPL' ] } } ],
+        'a values entry becomes a terms filter on the same item'
+    );
+
+    # D8: a "both branches" limit becomes a same-item should of two terms.
+    my $both = $qb->_build_item_filter_query(
+        [
+            {
+                should => [
+                    { field => 'homebranch',    values => ['CPL'] },
+                    { field => 'holdingbranch', values => ['CPL'] },
+                ]
+            }
+        ]
+    );
+    is_deeply(
+        $both->{nested}{query}{bool}{filter},
+        [
+            {
+                bool => {
+                    should => [
+                        { terms => { 'items.homebranch'    => ['CPL'] } },
+                        { terms => { 'items.holdingbranch' => ['CPL'] } },
+                    ],
+                    minimum_should_match => 1,
+                }
+            }
+        ],
+        'a should entry becomes a same-item bool disjunction'
+    );
+
+    # Several equality filters on the same field combine as an OR (terms), so a
+    # record with items in different libraries matches "homebranch:CPL OR FFL".
+    my $same_field = $qb->_build_item_filter_query(
+        [
+            { field => 'homebranch', value => 'CPL' },
+            { field => 'homebranch', value => 'FFL' },
+        ]
+    );
+    is_deeply(
+        $same_field->{nested}{query}{bool}{filter},
+        [ { terms => { 'items.homebranch' => [ 'CPL', 'FFL' ] } } ],
+        'two filters on the same field collapse into a single OR-ing terms clause'
+    );
+
+    # Different fields stay AND-ed (one clause each) while the repeated field is
+    # still merged, and the first-occurrence order of the fields is preserved.
+    my $mixed = $qb->_build_item_filter_query(
+        [
+            { field => 'homebranch', value => 'CPL' },
+            { field => 'available',  value => JSON::true },
+            { field => 'homebranch', value => 'FFL' },
+        ]
+    );
+    is_deeply(
+        $mixed->{nested}{query}{bool}{filter},
+        [
+            { terms => { 'items.homebranch' => [ 'CPL', 'FFL' ] } },
+            { term  => { 'items.available'  => JSON::true } },
+        ],
+        'same-field values merge while different fields stay separate, order preserved'
+    );
 };
 
 subtest '_extract_item_filters() tests (Bug 46309)' => sub {

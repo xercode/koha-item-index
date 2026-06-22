@@ -53,6 +53,7 @@ use Koha::AuthorisedValueCategories;
 use Koha::AuthorisedValues;
 use Koha::ItemTypes;
 use Koha::Libraries;
+use Koha::Library::Groups;
 
 our %index_field_convert = (
     'kw'                      => '',
@@ -287,6 +288,12 @@ Builds a single C<nested> query (path C<items>, Bug 46309) wrapping every
 item-level criterion in one C<bool> C<filter>, so that all the criteria are
 evaluated against the *same* item.
 
+Several equality filters on the *same* field (e.g. two C<homebranch> facets) are
+merged into a single C<terms> clause, so they combine as an OR, matching Koha's
+facet semantics: a record with items in CPL and FFL must still match
+C<homebranch:CPL OR homebranch:FFL>. Filters on *different* fields stay AND-ed on
+the same nested item (R1). First-occurrence order of the fields is preserved.
+
 Each entry of C<@item_filters> is a hashref describing one leaf condition:
 
 =over 4
@@ -296,9 +303,17 @@ C<< { term => { 'items.homebranch' => 'CPL' } } >>. The caller is responsible fo
 passing a value the field accepts (e.g. C<JSON::true> / C<\1> for boolean
 subfields such as C<onrequest>).
 
+=item * a terms filter (D8): C<< { field => 'homebranch', values => ['CPL','MPL'] } >>
+becomes C<< { terms => { 'items.homebranch' => ['CPL','MPL'] } } >>, matching any
+of the values on the same item.
+
 =item * a proximity filter (R11): C<< { field => 'home_geolocation', lat => ...,
 lon => ..., distance => '10km' } >> becomes a C<geo_distance> clause. The
 C<geo_distance> syntax is common to Elasticsearch 7 and 8.
+
+=item * a disjunction (D8): C<< { should => [ \%leaf, ... ] } >> becomes a
+C<bool> with C<minimum_should_match> 1, used e.g. for a library limit that must
+match either C<items.homebranch> or C<items.holdingbranch> on the same item.
 
 =back
 
@@ -307,19 +322,45 @@ C<geo_distance> syntax is common to Elasticsearch 7 and 8.
 sub _build_item_filter_query {
     my ( $self, $item_filters ) = @_;
 
-    my @clauses;
+    # Build the nested bool filters preserving first-occurrence order. Equality
+    # filters (term/terms) on the same field are accumulated into one slot so
+    # they collapse to a single OR-ing terms clause; geo_distance and should
+    # disjunctions are never merged and keep their own slot.
+    my @slots;          # ordered: { leaf => \%clause } or { field => $f, values => [], seen => {} }
+    my %field_slot;     # field name => index into @slots
+
     for my $filter (@$item_filters) {
-        my $field = "items.$filter->{field}";
-        if ( defined $filter->{distance} ) {
-            push @clauses, {
-                geo_distance => {
-                    distance => $filter->{distance},
-                    $field   => { lat => $filter->{lat}, lon => $filter->{lon} },
-                }
-            };
-        } else {
-            push @clauses, { term => { $field => $filter->{value} } };
+        if ( $filter->{should} || defined $filter->{distance} ) {
+            push @slots, { leaf => $self->_item_filter_leaf($filter) };
+            next;
         }
+
+        my $field = $filter->{field};
+        my @values = exists $filter->{values} ? @{ $filter->{values} } : ( $filter->{value} );
+
+        unless ( defined $field_slot{$field} ) {
+            $field_slot{$field} = scalar @slots;
+            push @slots, { field => $field, values => [], seen => {} };
+        }
+        my $slot = $slots[ $field_slot{$field} ];
+        for my $v (@values) {
+            my $key = "$v";    # JSON booleans stringify to 1/0, which is fine for de-duping
+            next if $slot->{seen}{$key}++;
+            push @{ $slot->{values} }, $v;
+        }
+    }
+
+    my @clauses;
+    for my $slot (@slots) {
+        if ( exists $slot->{leaf} ) {
+            push @clauses, $slot->{leaf};
+            next;
+        }
+        my $values = $slot->{values};
+        push @clauses,
+            @$values > 1
+            ? { terms => { "items.$slot->{field}" => $values } }
+            : { term => { "items.$slot->{field}" => $values->[0] } };
     }
 
     return {
@@ -328,6 +369,43 @@ sub _build_item_filter_query {
             query => { bool => { filter => \@clauses } },
         }
     };
+}
+
+=head2 _item_filter_leaf
+
+    my $clause = $builder->_item_filter_leaf(\%filter);
+
+Turns a single item-filter descriptor (see L</_build_item_filter_query>) into the
+matching Elasticsearch clause: C<should> (a C<bool> disjunction), C<distance> (a
+C<geo_distance>), C<values> (a C<terms>) or, by default, a single-value C<term>.
+
+=cut
+
+sub _item_filter_leaf {
+    my ( $self, $filter ) = @_;
+
+    if ( $filter->{should} ) {
+        return {
+            bool => {
+                should               => [ map { $self->_item_filter_leaf($_) } @{ $filter->{should} } ],
+                minimum_should_match => 1,
+            }
+        };
+    }
+
+    my $field = "items.$filter->{field}";
+    if ( defined $filter->{distance} ) {
+        return {
+            geo_distance => {
+                distance => $filter->{distance},
+                $field   => { lat => $filter->{lat}, lon => $filter->{lon} },
+            }
+        };
+    } elsif ( exists $filter->{values} ) {
+        return { terms => { $field => $filter->{values} } };
+    } else {
+        return { term => { $field => $filter->{value} } };
+    }
 }
 
 =head2 _build_item_facet_aggregation
@@ -374,6 +452,11 @@ quotes are stripped.
 =item * C<< items.<field>,geo_distance:<lat>,<lon>,<distance> >> — a proximity
 filter (R11), e.g. C<items.home_geolocation,geo_distance:40.4168,-3.7038,10km>.
 
+=item * C<< branch:<code> >> and C<< multibranchlimit:<group_id> >> — library
+limits (D8). They are expanded to branchcodes and routed to the nested channel
+on C<items.homebranch> / C<items.holdingbranch> per C<SearchLimitLibrary>,
+instead of the flat query_string field, so they resolve on the same item.
+
 =back
 
 Anything else is returned untouched in the remaining-limits list.
@@ -395,12 +478,58 @@ sub _extract_item_filters {
             if    ( $value eq 'true' )  { $value = JSON::true; }
             elsif ( $value eq 'false' ) { $value = JSON::false; }
             push @item_filters, { field => $field, value => $value };
+        } elsif ( $limit =~ /^(?:branch:|multibranchlimit:)/ ) {
+            my $lib_filter = $self->_library_limit_to_item_filter($limit);
+            if   ($lib_filter) { push @item_filters, $lib_filter; }
+            else               { push @remaining,    $limit; }
         } else {
             push @remaining, $limit;
         }
     }
 
     return ( \@item_filters, \@remaining );
+}
+
+=head2 _library_limit_to_item_filter
+
+    my $filter = $builder->_library_limit_to_item_filter('multibranchlimit:5');
+
+Expands a C<branch:<code>> or C<multibranchlimit:<group_id>> limit (Bug 46309,
+D8) into an item-filter descriptor on the nested items object. The target
+subfield follows C<SearchLimitLibrary>: C<homebranch>, C<holdingbranch> or, when
+set to both, a same-item disjunction of the two. Returns undef when the limit
+expands to no branchcode (e.g. an unknown or empty group), so the caller can
+leave it untouched.
+
+=cut
+
+sub _library_limit_to_item_filter {
+    my ( $self, $limit ) = @_;
+
+    my @branchcodes;
+    if ( $limit =~ /^multibranchlimit:(.*)$/ ) {
+        my $search_group = Koha::Library::Groups->find($1);
+        return unless $search_group;
+        @branchcodes = sort { $a cmp $b } map { $_->branchcode } $search_group->all_libraries;
+    } else {
+        @branchcodes = ( $limit =~ /^branch:(.*)$/ );
+    }
+    @branchcodes = grep { defined && length } @branchcodes;
+    return unless @branchcodes;
+
+    my $branchfield = C4::Context->preference('SearchLimitLibrary');
+    if ( $branchfield eq 'homebranch' || $branchfield eq 'holdingbranch' ) {
+        return { field => $branchfield, values => \@branchcodes, branches => \@branchcodes };
+    }
+
+    # "both": match either the home or the holding branch on the same item.
+    return {
+        branches => \@branchcodes,
+        should   => [
+            { field => 'homebranch',    values => \@branchcodes },
+            { field => 'holdingbranch', values => \@branchcodes },
+        ],
+    };
 }
 
 =head2 _describe_item_filters
@@ -413,11 +542,11 @@ active-filters breadcrumb. C<item_filters> are no longer present in the limit
 list once L</_extract_item_filters> has moved them to the nested channel, so
 they would otherwise be invisible to the user.
 
-Only the item facet fields (homebranch, holdingbranch, itype, location, ccode)
-are described: their codes are mapped to names reusing the same sources as the
-facet builder (L<Koha::Libraries>, L<Koha::ItemTypes> and the C<LOC> / C<CCODE>
-authorised values). Other item filters (geo distance and the internal hiding /
-availability filters) are left out of the breadcrumb.
+The item facet fields (homebranch, holdingbranch, itype, location, ccode) and
+the library limits (D8) are described: their codes are mapped to names reusing
+the same sources as the facet builder (L<Koha::Libraries>, L<Koha::ItemTypes>
+and the C<LOC> / C<CCODE> authorised values). Other item filters (geo distance
+and the internal hiding / availability filters) are left out of the breadcrumb.
 
 =cut
 
@@ -425,10 +554,12 @@ sub _describe_item_filters {
     my ( $self, $item_filters ) = @_;
     return () unless $item_filters && @$item_filters;
 
-    # Only describe facet fields; bail out early if none are present so we never
-    # hit the database for an availability-only or geo-only query.
+    # Only describe facet fields and library limits; bail out early if none are
+    # present so we never hit the database for an availability-only or geo-only
+    # query.
     return ()
-        unless grep { $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} } @$item_filters;
+        unless grep { ( $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} ) || $_->{branches} }
+        @$item_filters;
 
     my $opac = C4::Context->interface eq 'opac';
 
@@ -457,6 +588,17 @@ sub _describe_item_filters {
 
     my @descriptions;
     for my $filter (@$item_filters) {
+
+        # Library limit (D8): one line listing the branch names, whether it
+        # targets homebranch, holdingbranch or both.
+        if ( $filter->{branches} ) {
+            my $names = $names_for->('homebranch');
+            push @descriptions,
+                ( $field_label{homebranch} // 'Library' ) . ': '
+                . join( ', ', map { $names->{$_} // $_ } @{ $filter->{branches} } );
+            next;
+        }
+
         my $field = $filter->{field};
         next unless $field && $ITEM_FACET_FIELDS{$field} && exists $filter->{value};
         my $value = "$filter->{value}";    # de-bless any JSON boolean to a plain string
