@@ -551,7 +551,7 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
 };
 
 subtest '_extract_item_filters() tests (Bug 46309)' => sub {
-    plan tests => 5;
+    plan tests => 6;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -560,12 +560,13 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
             'items.homebranch:CPL',
             'itype:BK',
             'items.onrequest:true',
+            'items.available:true',
             'items.home_geolocation,geo_distance:40.4168,-3.7038,10km',
         ]
     );
 
     is_deeply( $remaining, ['itype:BK'], 'non-item limits are left untouched' );
-    is( scalar @$item_filters, 3, 'three item limits are extracted' );
+    is( scalar @$item_filters, 4, 'four item limits are extracted' );
     is_deeply(
         $item_filters->[0], { field => 'homebranch', value => 'CPL' },
         'a term item limit is parsed'
@@ -574,8 +575,16 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         $item_filters->[1], { field => 'onrequest', value => JSON::true },
         'a "true" value is coerced to a JSON boolean'
     );
+
+    # D3-C: the availability control emits items.available:true, which is routed
+    # to the same nested channel as the library facet so they resolve on the
+    # same item (R1).
     is_deeply(
-        $item_filters->[2],
+        $item_filters->[2], { field => 'available', value => JSON::true },
+        'the items.available limit is parsed into the nested channel'
+    );
+    is_deeply(
+        $item_filters->[3],
         { field => 'home_geolocation', lat => 40.4168, lon => -3.7038, distance => '10km' },
         'a geo_distance item limit is parsed'
     );

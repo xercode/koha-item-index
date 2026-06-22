@@ -890,7 +890,12 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
             }
             $template->param( total => $hits );
             my $limit_cgi_not_availablity = $limit_cgi;
-            $limit_cgi_not_availablity =~ s/&limit=available//g if defined $limit_cgi_not_availablity;
+
+            # Bug 46309 (D3-C): the availability control now emits the nested
+            # items.available:true limit; the flat "available" form is still
+            # stripped for backward compatibility.
+            $limit_cgi_not_availablity =~ s/&limit=(?:items\.available%3Atrue|available)//g
+                if defined $limit_cgi_not_availablity;
             $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
 
             # Bug 46309 (D2): limit_cgi stripped of the on-request limit, so the
