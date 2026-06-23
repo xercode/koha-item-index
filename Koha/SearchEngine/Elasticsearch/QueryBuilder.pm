@@ -151,6 +151,18 @@ my $es_advanced_searches = [];
 # items nested object instead of the flat __facet field.
 our %ITEM_FACET_FIELDS = map { $_ => 1 } qw( homebranch holdingbranch itype location ccode );
 
+# Advanced-search "multi-choice" limits that target an item field (Bug 46309,
+# DO-1). They are routed to the same-item nested channel by _extract_item_filters
+# (same as the item facets), instead of the flat query_string. mc-itemtype is
+# deliberately absent: that is the record-level item type (biblioitems.itemtype),
+# not an item field.
+my %ITEM_LIMIT_ALIAS = (
+    'mc-itype' => 'itype',
+    'mc-ccode' => 'ccode',
+    'mc-loc'   => 'location',
+    'loc'      => 'location',
+);
+
 =head2 get_index_field_convert
 
     my @index_params = Koha::SearchEngine::Elasticsearch::QueryBuilder->get_index_field_convert();
@@ -457,6 +469,12 @@ limits (D8). They are expanded to branchcodes and routed to the nested channel
 on C<items.homebranch> / C<items.holdingbranch> per C<SearchLimitLibrary>,
 instead of the flat query_string field, so they resolve on the same item.
 
+=item * C<< mc-itype:<code> >>, C<< mc-ccode:<code> >>, C<< mc-loc:<code> >> and
+C<< loc:<code> >> (DO-1) — advanced-search item-field limits (item type,
+collection, shelving location). They are routed to C<items.itype> /
+C<items.ccode> / C<items.location> so they combine same-item with the facets.
+C<mc-itemtype> is intentionally left flat (record-level item type).
+
 =back
 
 Anything else is returned untouched in the remaining-limits list.
@@ -477,6 +495,16 @@ sub _extract_item_filters {
             $value =~ s/^"(.*)"$/$1/;
             if    ( $value eq 'true' )  { $value = JSON::true; }
             elsif ( $value eq 'false' ) { $value = JSON::false; }
+            push @item_filters, { field => $field, value => $value };
+        } elsif ( $limit =~ /^(mc-itype|mc-ccode|mc-loc|loc)(?:,[\w-]+)*:(.+)$/ ) {
+
+            # DO-1: advanced-search item-field limits (item type / collection /
+            # location). An optional CCL modifier (e.g. the ",phr" the advanced
+            # search appends: "mc-itype,phr:CR") is tolerated and dropped: a
+            # keyword term match is exact regardless. mc-itemtype is NOT matched
+            # here (record-level type).
+            my ( $field, $value ) = ( $ITEM_LIMIT_ALIAS{$1}, $2 );
+            $value =~ s/^"(.*)"$/$1/;
             push @item_filters, { field => $field, value => $value };
         } elsif ( $limit =~ /^(?:branch:|multibranchlimit:)/ ) {
             my $lib_filter = $self->_library_limit_to_item_filter($limit);

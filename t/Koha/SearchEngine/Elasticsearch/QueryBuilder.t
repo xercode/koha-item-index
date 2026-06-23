@@ -551,7 +551,7 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
 };
 
 subtest '_extract_item_filters() tests (Bug 46309)' => sub {
-    plan tests => 6;
+    plan tests => 9;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -587,6 +587,40 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         $item_filters->[3],
         { field => 'home_geolocation', lat => 40.4168, lon => -3.7038, distance => '10km' },
         'a geo_distance item limit is parsed'
+    );
+
+    # DO-1: advanced-search item-field limits are routed to the nested channel.
+    my ( $mc_filters, $mc_remaining ) = $qb->_extract_item_filters(
+        [
+            'mc-itype:CR',
+            'mc-ccode:FIC',
+            'mc-loc:SHELF',
+            'loc:DISPLAY',
+            'mc-itemtype:BK',
+        ]
+    );
+    is_deeply(
+        $mc_filters,
+        [
+            { field => 'itype',    value => 'CR' },
+            { field => 'ccode',    value => 'FIC' },
+            { field => 'location', value => 'SHELF' },
+            { field => 'location', value => 'DISPLAY' },
+        ],
+        'mc-itype / mc-ccode / mc-loc / loc are routed to items.itype / ccode / location'
+    );
+    is_deeply(
+        $mc_remaining, ['mc-itemtype:BK'],
+        'mc-itemtype (record-level item type) is left flat'
+    );
+
+    # The advanced search appends a ",phr" CCL modifier (mc-itype,phr:CR); it must
+    # still be routed to the nested channel, with the modifier dropped.
+    my ($phr) = $qb->_extract_item_filters( [ 'mc-itype,phr:CR', 'mc-loc,phr:SHELF' ] );
+    is_deeply(
+        $phr,
+        [ { field => 'itype', value => 'CR' }, { field => 'location', value => 'SHELF' } ],
+        'a ",phr" modifier on an item-field limit is tolerated and routed'
     );
 };
 
