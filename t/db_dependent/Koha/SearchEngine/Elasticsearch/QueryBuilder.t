@@ -270,7 +270,7 @@ subtest 'build_authorities_query_compat() tests' => sub {
 };
 
 subtest 'build_query tests' => sub {
-    plan tests => 72;
+    plan tests => 73;
 
     my $qb;
 
@@ -726,10 +726,17 @@ subtest 'build_query tests' => sub {
         ['AND'], ['title:"donald duck"'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
     );
+    # Bug 46309 (DO-1): the mc-itype,phr item-type limits are routed to the nested
+    # channel, so they leave the flat query_string (the author limit stays flat).
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(title:"donald duck") AND (author:("Dillinger Escaplan")) AND itype:(("BOOK") OR ("CD"))',
-        "Limits quoted correctly when passed as phrase"
+        '(title:"donald duck") AND author:("Dillinger Escaplan")',
+        "Limits quoted correctly when passed as phrase (item type routed to nested)"
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { terms => { 'items.itype' => [ 'BOOK', 'CD' ] } } ],
+        "mc-itype,phr limits become a same-item terms clause on items.itype"
     );
 
     ( undef, $query ) = $qb->build_query_compat(
@@ -794,17 +801,19 @@ subtest 'build_query tests' => sub {
         ['AND'], ['kw:""'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
         );
+    # Bug 46309 (DO-1): only the flat author limit remains in $limit; the routed
+    # item-type limits are described in limit_desc instead.
     is(
-        $limit, '(author:("Dillinger Escaplan")) AND itype:(("BOOK") OR ("CD"))',
-        "Limit formed correctly when no search terms"
+        $limit, 'author:("Dillinger Escaplan")',
+        "Limit formed correctly when no search terms (item type routed to nested)"
     );
     is(
         $limit_cgi, '&limit=author%3ADillinger%20Escaplan&limit=mc-itype%2Cphr%3ABOOK&limit=mc-itype%2Cphr%3ACD',
         "Limit CGI formed correctly when no search terms"
     );
     is(
-        $limit_desc, '(author:("Dillinger Escaplan")) AND itype:(("BOOK") OR ("CD"))',
-        "Limit desc formed correctly when no search terms"
+        $limit_desc, 'author:("Dillinger Escaplan") and Item types: BOOK and Item types: CD',
+        "Limit desc formed correctly when no search terms (item types described from the nested channel)"
     );
 
     ( undef, $query ) = $qb->build_query_compat(
@@ -1531,6 +1540,17 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
     );
     like( $onreq_desc // '', qr/On request: No/, 'limit_desc describes the on-request filter readably' );
 };
+
+# Return the leaf clauses of the first hard nested item filter in the query
+# (any kind: term/terms/wildcard/range/...). Used by the operand-routing tests.
+sub _first_nested_item_leaves {
+    my ($query) = @_;
+    for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
+        return $clause->{nested}{query}{bool}{filter}
+            if ref $clause eq 'HASH' && $clause->{nested};
+    }
+    return [];
+}
 
 # Collect the term clauses of the hard nested item filter, keyed by field. Used
 # when a user filter is present, in which case the auto hiding filters are
