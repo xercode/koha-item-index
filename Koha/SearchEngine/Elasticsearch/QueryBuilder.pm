@@ -163,6 +163,28 @@ my %ITEM_LIMIT_ALIAS = (
     'loc'      => 'location',
 );
 
+# Advanced-search operands ("Search for" rows) that target an item field (Bug
+# 46309, DO-2). Maps the converted ES search field to the nested item subfield
+# and the leaf clause used to query it on the same item. Only AND-combined
+# operands are routed (DO-3a); OR/NOT keep flowing through the flat query_string.
+#   term     exact match on a keyword subfield
+#   wildcard substring match approximating right-truncation (DO-4)
+#   range    date range on the `date` subfield (DO-5)
+my %ITEM_OPERAND_FIELDS = (
+    'barcode'              => { subfield => 'barcode',         kind => 'term' },
+    'location'             => { subfield => 'location',        kind => 'term' },
+    'local-classification' => { subfield => 'callnumber',      kind => 'wildcard' },
+    'date-of-acquisition'  => { subfield => 'dateaccessioned', kind => 'range' },
+);
+
+# Readable labels for the routed item operands that are not facet fields, so the
+# breadcrumb (limit_desc) can still show what the user searched for (DO-6).
+my %ITEM_OPERAND_LABEL = (
+    barcode         => 'Barcode',
+    callnumber      => 'Call number',
+    dateaccessioned => 'Acquisition date',
+);
+
 =head2 get_index_field_convert
 
     my @index_params = Koha::SearchEngine::Elasticsearch::QueryBuilder->get_index_field_convert();
@@ -327,6 +349,14 @@ C<geo_distance> syntax is common to Elasticsearch 7 and 8.
 C<bool> with C<minimum_should_match> 1, used e.g. for a library limit that must
 match either C<items.homebranch> or C<items.holdingbranch> on the same item.
 
+=item * a wildcard filter (DO-4): C<< { field => 'callnumber', wildcard => '*ABC*' } >>
+becomes a C<wildcard> clause, used to approximate a right-truncated call-number
+search on the C<items.callnumber> keyword subfield.
+
+=item * a range filter (DO-5): C<< { field => 'dateaccessioned', range => { gte =>
+'2020-01-01', lte => '2020-12-31' } } >> becomes a C<range> clause on the
+C<items.dateaccessioned> date subfield.
+
 =back
 
 =cut
@@ -342,7 +372,13 @@ sub _build_item_filter_query {
     my %field_slot;     # field name => index into @slots
 
     for my $filter (@$item_filters) {
-        if ( $filter->{should} || defined $filter->{distance} ) {
+        if (   $filter->{should}
+            || defined $filter->{distance}
+            || exists $filter->{wildcard}
+            || exists $filter->{range} )
+        {
+            # Non-equality leaves (geo, disjunction, wildcard, range) are never
+            # merged with the term/terms slots: each keeps its own clause.
             push @slots, { leaf => $self->_item_filter_leaf($filter) };
             next;
         }
@@ -413,6 +449,16 @@ sub _item_filter_leaf {
                 $field   => { lat => $filter->{lat}, lon => $filter->{lon} },
             }
         };
+    } elsif ( exists $filter->{wildcard} ) {
+
+        # DO-4: substring match on a keyword subfield (e.g. items.callnumber),
+        # approximating the flat right-truncated search. The pattern is built by
+        # the caller. Common to Elasticsearch 7 and 8.
+        return { wildcard => { $field => { value => $filter->{wildcard} } } };
+    } elsif ( exists $filter->{range} ) {
+
+        # DO-5: date range on the `date` subfield (items.dateaccessioned).
+        return { range => { $field => $filter->{range} } };
     } elsif ( exists $filter->{values} ) {
         return { terms => { $field => $filter->{values} } };
     } else {
@@ -518,6 +564,77 @@ sub _extract_item_filters {
     return ( \@item_filters, \@remaining );
 }
 
+=head2 _item_operand_to_filter
+
+    my $filter = $builder->_item_operand_to_filter(\%spec, $value);
+
+Turns an advanced-search operand that targets an item field (Bug 46309, DO-2)
+into an item-filter descriptor for the nested channel. C<%spec> is the entry
+from C<%ITEM_OPERAND_FIELDS> (subfield + kind). The raw operand C<$value> is
+used as-is (before any query_string cleaning/truncation):
+
+=over 4
+
+=item * C<term> — exact match, C<< { field => <sub>, value => $value } >>.
+
+=item * C<wildcard> (DO-4) — C<< { field => <sub>, wildcard => '*<value>*' } >>,
+with any wildcard metacharacters in C<$value> escaped so they are matched
+literally.
+
+=item * C<range> (DO-5) — C<< { field => <sub>, range => {...} } >>, parsing
+C<$value> as a single date or a C<< from - to >> range.
+
+=back
+
+Returns undef when the value is empty (or, for a range, parses to nothing).
+
+=cut
+
+sub _item_operand_to_filter {
+    my ( $self, $spec, $value ) = @_;
+
+    return unless defined $value && $value ne '';
+    my $sub = $spec->{subfield};
+
+    if ( $spec->{kind} eq 'range' ) {
+        my $range = $self->_parse_item_date_range($value);
+        return unless $range && %$range;
+        return { field => $sub, range => $range };
+    } elsif ( $spec->{kind} eq 'wildcard' ) {
+        ( my $escaped = $value ) =~ s/([*?\\])/\\$1/g;
+        return { field => $sub, wildcard => "*$escaped*" };
+    } else {
+        return { field => $sub, value => $value };
+    }
+}
+
+=head2 _parse_item_date_range
+
+    my $range = $builder->_parse_item_date_range('2020-01-01 - 2020-12-31');
+
+Parses an acquisition-date operand (Bug 46309, DO-5) into an Elasticsearch
+C<range> hashref. A C<< from - to >> string (the C<st-date-normalized> separator
+is C<< space-dash-space >>) yields C<< { gte => from, lte => to } >>; either side
+may be C<*> for an open end. A single date yields C<< { gte => d, lte => d } >>,
+matching just that day on the date subfield. Returns a hashref (possibly empty
+when both ends are open).
+
+=cut
+
+sub _parse_item_date_range {
+    my ( $self, $value ) = @_;
+
+    my %range;
+    if ( $value =~ /^(.*?) - (.*)$/ ) {
+        my ( $from, $to ) = ( $1, $2 );
+        $range{gte} = $from if defined $from && $from ne '' && $from ne '*';
+        $range{lte} = $to   if defined $to   && $to   ne '' && $to   ne '*';
+    } else {
+        $range{gte} = $range{lte} = $value;
+    }
+    return \%range;
+}
+
 =head2 _library_limit_to_item_filter
 
     my $filter = $builder->_library_limit_to_item_filter('multibranchlimit:5');
@@ -607,8 +724,10 @@ they would otherwise be invisible to the user.
 The item facet fields (homebranch, holdingbranch, itype, location, ccode) and
 the library limits (D8) are described: their codes are mapped to names reusing
 the same sources as the facet builder (L<Koha::Libraries>, L<Koha::ItemTypes>
-and the C<LOC> / C<CCODE> authorised values). Other item filters (geo distance
-and the internal hiding / availability filters) are left out of the breadcrumb.
+and the C<LOC> / C<CCODE> authorised values). The routed item operands that are
+not facet fields (DO-2: barcode, call number, acquisition date) are described
+with their own labels. Other item filters (geo distance and the internal hiding
+/ availability filters) are left out of the breadcrumb.
 
 =cut
 
@@ -623,6 +742,9 @@ sub _describe_item_filters {
         unless grep {
         ( $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} )
             || ( $_->{field} && $_->{field} eq 'onrequest' && exists $_->{value} )
+            || ( $_->{field}
+            && $ITEM_OPERAND_LABEL{ $_->{field} }
+            && ( exists $_->{value} || exists $_->{wildcard} || exists $_->{range} ) )
             || $_->{branches}
         } @$item_filters;
 
@@ -671,6 +793,30 @@ sub _describe_item_filters {
         if ( $field && $field eq 'onrequest' && exists $filter->{value} ) {
             my $value = "$filter->{value}";    # de-bless any JSON boolean
             push @descriptions, 'On request: ' . ( $value eq 'true' ? 'Yes' : 'No' );
+            next;
+        }
+
+        # Routed item operands (DO-2) that are not facet fields: barcode, call
+        # number (wildcard) and acquisition date (range). Describe each with its
+        # own label and a readable value.
+        if ( $field && $ITEM_OPERAND_LABEL{$field} ) {
+            my $label = $ITEM_OPERAND_LABEL{$field};
+            if ( exists $filter->{range} ) {
+                my ( $from, $to ) = @{ $filter->{range} }{qw/gte lte/};
+                my $desc =
+                      ( defined $from && defined $to && $from eq $to ) ? $from
+                    : ( defined $from && defined $to )                 ? "$from to $to"
+                    : defined $from                                    ? "from $from"
+                    : defined $to                                      ? "until $to"
+                    :                                                     '';
+                push @descriptions, "$label: $desc" if $desc ne '';
+            } elsif ( exists $filter->{wildcard} ) {
+                ( my $disp = $filter->{wildcard} ) =~ s/^\*(.*)\*$/$1/;
+                $disp =~ s/\\([*?\\])/$1/g;
+                push @descriptions, "$label: $disp";
+            } elsif ( exists $filter->{value} ) {
+                push @descriptions, "$label: $filter->{value}";
+            }
             next;
         }
 
@@ -729,12 +875,53 @@ sub build_query_compat {
             ? $self->_build_field_match_boost_query( { operands => $operands, indexes => \@index_params } )
             : [];
 
+        # Merge the indexes in with the search terms and the operands so that
+        # each search thing is a handy unit, and in the same pass route the
+        # item-field operands to the nested channel (Bug 46309, DO-2/DO-3a). It
+        # is only safe to pull item operands out as same-item filters when the
+        # whole operand list is a pure AND; if any OR/NOT joins the rows, the
+        # linear boolean structure cannot be decomposed, so every operand keeps
+        # flowing through the flat query_string.
+        my $operands_pure_and = !grep { defined && /^(?:or|not)$/i } @$operators;
+        unshift @$operators, undef;    # The first one can't have an op
+        my @search_params;
+        my @operand_item_filters;
+        my $truncate = C4::Context->preference("QueryAutoTruncate") || 0;
+        my $ea       = each_array( @$operands, @$operators, @index_params );
+        while ( my ( $oand, $otor, $index ) = $ea->() ) {
+            next if ( !defined($oand) || $oand eq '' );
+            my $field = $index ? $index->{field} : undef;
+            my $spec  = ( $operands_pure_and && defined $field ) ? $ITEM_OPERAND_FIELDS{$field} : undef;
+            if ($spec) {
+
+                # Use the raw operand, before query_string cleaning/truncation
+                # would mangle it (e.g. a date range's separators).
+                my $f = $self->_item_operand_to_filter( $spec, $oand );
+                push @operand_item_filters, $f if $f;
+                next;
+            }
+            $oand = $self->clean_search_term($oand);
+            $oand = $self->_truncate_terms($oand)
+                if $truncate && $self->_is_safe_to_auto_truncate( $field, $oand );
+            push @search_params, {
+                operand => $oand,                                 # the search terms
+                operator => defined($otor) ? uc $otor : undef,    # AND and so on
+                $index ? %$index : (),
+            };
+        }
+
+        # After removing any leading routed operand, the first remaining one must
+        # not carry a boolean operator or the query_string would start with it.
+        $search_params[0]{operator} = undef if @search_params;
+
         # Pull item-level limits (Bug 46309) out of the limit list before they
         # reach the query_string machinery: nested fields cannot be queried with
         # query_string, so they are routed through a structured nested query.
-        # $user_item_filters are the ones the user chose (facets, onrequest...);
-        # @auto_item_filters are the ones the OPAC always enforces (hiding, lost).
+        # $user_item_filters are the ones the user chose (facets, onrequest and
+        # the routed item operands above); @auto_item_filters are the ones the
+        # OPAC always enforces (hiding, lost).
         my ( $user_item_filters, $remaining_limits ) = $self->_extract_item_filters($orig_limits);
+        push @$user_item_filters, @operand_item_filters;
 
         # Describe the user-supplied item filters (not the automatic ones) so the
         # breadcrumb only shows what the user actually chose.
@@ -796,24 +983,6 @@ sub build_query_compat {
         $limits = $self->_fix_limit_special_cases($remaining_limits);
         if ( $params->{suppress} ) { push @$limits, "suppress:false"; }
 
-        # Merge the indexes in with the search terms and the operands so that
-        # each search thing is a handy unit.
-        unshift @$operators, undef;    # The first one can't have an op
-        my @search_params;
-        my $truncate = C4::Context->preference("QueryAutoTruncate") || 0;
-        my $ea       = each_array( @$operands, @$operators, @index_params );
-        while ( my ( $oand, $otor, $index ) = $ea->() ) {
-            next if ( !defined($oand) || $oand eq '' );
-            $oand = $self->clean_search_term($oand);
-            $oand = $self->_truncate_terms($oand)
-                if $truncate && $self->_is_safe_to_auto_truncate( $index->{field}, $oand );
-            push @search_params, {
-                operand => $oand,                                 # the search terms
-                operator => defined($otor) ? uc $otor : undef,    # AND and so on
-                $index ? %$index : (),
-            };
-        }
-
         # We build a string query from limits and the queries. An alternative
         # would be to pass them separately into build_query and let it build
         # them into a structured ES query itself. Maybe later, though that'd be
@@ -832,6 +1001,12 @@ sub build_query_compat {
 
         # If there's no query on the left, let's remove the junk left behind
         $query_str =~ s/^ AND //;
+
+        # Bug 46309: when all the search content was routed to the nested item
+        # channel (item limits and/or operands) there is nothing left for the
+        # query_string. Match every record with "*" and let the nested filter do
+        # the narrowing -- e.g. "every CR item in library X" with an empty q.
+        $query_str = '*' if $query_str eq '' && @item_filter_clauses;
         my %options;
         $options{sort}                    = \@sort_params;
         $options{is_opac}                 = $params->{is_opac};

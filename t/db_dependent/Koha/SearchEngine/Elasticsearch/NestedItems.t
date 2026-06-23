@@ -63,6 +63,10 @@ $se->mock(
                         lost                          => { type => 'keyword' },
                         hidden_in_opac_custom         => { type => 'boolean' },
                         hidden_in_opac_by_preferences => { type => 'boolean' },
+                        barcode                       => { type => 'keyword' },
+                        itype                         => { type => 'keyword' },
+                        callnumber                    => { type => 'keyword' },
+                        dateaccessioned               => { type => 'date' },
                     },
                 },
             },
@@ -93,6 +97,8 @@ sub item {
         lost                          => '0',
         hidden_in_opac_custom         => JSON::false,
         hidden_in_opac_by_preferences => JSON::false,
+        itype                         => 'BK',
+        dateaccessioned               => '2000-01-01',
         %override,
     };
 }
@@ -106,15 +112,27 @@ my %docs = (
         items       => [
 
             # available copy in AAA, and a different unavailable copy in BBB that
-            # is on request.
-            item( homebranch => 'AAA', holdingbranch => 'AAA', available => JSON::true,  onrequest => JSON::false ),
-            item( homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::false, onrequest => JSON::true ),
+            # is on request. The two copies carry distinct barcode / itype /
+            # acquisition date so the operand-routing tests can tell them apart.
+            item(
+                homebranch => 'AAA', holdingbranch => 'AAA', available => JSON::true, onrequest => JSON::false,
+                barcode    => 'BC-A1', itype => 'BK', dateaccessioned => '2020-06-01'
+            ),
+            item(
+                homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::false, onrequest => JSON::true,
+                barcode    => 'BC-B1', itype => 'CD', dateaccessioned => '2019-06-01'
+            ),
         ],
     },
     2 => {
         title       => 'river',
         items_count => 1,
-        items       => [ item( homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::true ) ],
+        items       => [
+            item(
+                homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::true,
+                barcode    => 'BC-2', itype => 'BK', dateaccessioned => '2021-06-01'
+            )
+        ],
     },
     3 => {
         title       => 'river',
@@ -149,6 +167,17 @@ sub matching_ids {
     my %p = ( skip_facets => 1, %{ $params // {} } );
     my ( undef, $query ) =
         $builder->build_query_compat( undef, ['*'], undef, $limits, undef, undef, undef, \%p );
+    my $results = $searcher->search( $query, undef, 50 );
+    return [ sort { $a <=> $b } map { $_->{_id} } @{ $results->{hits}{hits} } ];
+}
+
+# Like matching_ids but driving the operand/index channel (the advanced-search
+# "Search for" rows), so the item operands are routed to the nested filter.
+sub matching_ids_search {
+    my ( $operators, $operands, $indexes, $limits, $params ) = @_;
+    my %p = ( skip_facets => 1, %{ $params // {} } );
+    my ( undef, $query ) =
+        $builder->build_query_compat( $operators, $operands, $indexes, $limits, undef, undef, undef, \%p );
     my $results = $searcher->search( $query, undef, 50 );
     return [ sort { $a <=> $b } map { $_->{_id} } @{ $results->{hits}{hits} } ];
 }
@@ -275,6 +304,62 @@ subtest 'library limit routed to the nested channel (D8)' => sub {
         matching_ids( ['branch:CCC'] ),
         [ 4, 5 ],
         'branch: limit with SearchLimitLibrary=both matches home or holding branch'
+    );
+};
+
+subtest 'advanced-search item operands routed to nested (DO-1/DO-2/DO-3a/DO-5)' => sub {
+    plan tests => 7;
+
+    # DO-2: a barcode operand (idx "bc") is routed to a same-item nested term.
+    is_deeply(
+        matching_ids_search( undef, ['BC-A1'], ['bc'] ),
+        [1],
+        'a barcode operand matches the record holding that exact copy'
+    );
+
+    # DO-5: an acquisition-date operand becomes a same-item range.
+    is_deeply(
+        matching_ids_search( undef, ['2020-01-01 - 2020-12-31'], ['acqdate,st-date-normalized'] ),
+        [1],
+        'an acqdate range operand matches the record with a copy acquired in that range'
+    );
+
+    # Same-item killer: record 1's 2020 copy is in AAA; its BBB copy was acquired
+    # in 2019. Acqdate-2020 AND homebranch:BBB must therefore match nothing (a
+    # flat cross-item query would wrongly return record 1).
+    is_deeply(
+        matching_ids_search(
+            undef, ['2020-01-01 - 2020-12-31'], ['acqdate,st-date-normalized'], ['items.homebranch:AAA']
+        ),
+        [1],
+        'acqdate range and library resolve on the same item (AAA copy acquired 2020)'
+    );
+    is_deeply(
+        matching_ids_search(
+            undef, ['2020-01-01 - 2020-12-31'], ['acqdate,st-date-normalized'], ['items.homebranch:BBB']
+        ),
+        [],
+        'acqdate range and a different library do not match across items (BBB copy is 2019)'
+    );
+
+    # DO-1: the mc-itype advanced-search limit is routed to items.itype.
+    is_deeply(
+        matching_ids_search( undef, ['*'], undef, ['mc-itype:CD'] ),
+        [1],
+        'mc-itype limit matches the record holding a copy of that item type'
+    );
+
+    # Empty q with only item filters must still return results (the query_string
+    # falls back to "*"): "every item in library BBB" with no keyword.
+    is_deeply(
+        matching_ids_search( undef, [''], undef, ['items.homebranch:BBB'] ),
+        [ 1, 2 ],
+        'an empty q with an item filter still matches via the * fallback'
+    );
+    is_deeply(
+        matching_ids_search( undef, [''], undef, ['mc-itype:CD'] ),
+        [1],
+        'an empty q with an mc-itype limit still matches via the * fallback'
     );
 };
 
