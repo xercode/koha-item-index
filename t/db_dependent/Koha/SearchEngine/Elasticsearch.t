@@ -1291,7 +1291,7 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
 };
 
 subtest 'marc_records_to_documents should build the nested "items" field' => sub {
-    plan tests => 25;
+    plan tests => 26;
 
     t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
     t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
@@ -1320,9 +1320,10 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     my $item = $builder->build_sample_item(
         {
             biblionumber  => $biblio->biblionumber,
-            homebranch    => $library->branchcode,
-            holdingbranch => $library->branchcode,
-            barcode       => 'NESTED-0001',
+            homebranch      => $library->branchcode,
+            holdingbranch   => $library->branchcode,
+            barcode         => 'NESTED-0001',
+            dateaccessioned => '2020-01-15',
         }
     );
 
@@ -1332,6 +1333,7 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     is( $doc->{itemnumber},              $item->itemnumber, 'itemnumber is mapped' );
     is( $doc->{homebranch},              $library->branchcode, 'homebranch is mapped' );
     is( $doc->{barcode},                 'NESTED-0001',     'barcode is mapped' );
+    is( $doc->{dateaccessioned},         '2020-01-15',      'dateaccessioned (date_of_acquisition) is mapped' );
     is_deeply( $doc->{intransit},             \0, 'intransit is false by default' );
     is_deeply( $doc->{onhold},                \0, 'onhold is false by default' );
     is_deeply( $doc->{onrequest},             \0, 'onrequest is false by default' );

@@ -98,7 +98,8 @@ sort:
 #   - integer            numeric identifier (itemnumber), usable in inner_hits
 #   - boolean            derived/computed status flags
 #   - geo_point          library coordinates for geo_distance proximity search
-# All four subfield types are common to Elasticsearch 7 and 8.
+#   - date               item dates usable in range queries (date_of_acquisition)
+# All five subfield types are common to Elasticsearch 7 and 8.
 item:
   type: nested
   properties:
@@ -136,6 +137,8 @@ item:
       type: keyword
     withdrawn:
       type: keyword
+    dateaccessioned:
+      type: date
     intransit:
       type: boolean
     onhold:

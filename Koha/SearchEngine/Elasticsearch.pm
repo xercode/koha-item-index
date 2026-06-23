@@ -1046,6 +1046,13 @@ sub _get_item_documents {
                 $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } ) ? \1 : \0,
         };
 
+        # date_of_acquisition (search field) lives on items.dateaccessioned. The
+        # column is a DATE (YYYY-MM-DD), already ES-parseable; omit the subfield
+        # when empty so the `date` mapping does not reject a blank value.
+        my $dateaccessioned = $item->dateaccessioned;
+        $document->{dateaccessioned} = $dateaccessioned
+            if defined $dateaccessioned && $dateaccessioned ne '';
+
         # geo_point accepts the native "lat,lon" string. Omit the subfield when
         # the library has no geolocation so ES does not reject an empty value.
         my $home_geolocation    = $geolocation_by_branch{ $item->homebranch };
