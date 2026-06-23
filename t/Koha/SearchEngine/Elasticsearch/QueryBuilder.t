@@ -18,7 +18,7 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 12;
+use Test::More tests => 13;
 use t::lib::Mocks;
 use JSON;
 
@@ -420,7 +420,7 @@ subtest '_create_query_string' => sub {
 };
 
 subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
-    plan tests => 7;
+    plan tests => 9;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -548,10 +548,36 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
         ],
         'same-field values merge while different fields stay separate, order preserved'
     );
+
+    # DO-4: a wildcard leaf (e.g. a call-number operand) is built verbatim and is
+    # never merged with the term/terms slots.
+    my $wildcard = $qb->_build_item_filter_query(
+        [
+            { field => 'callnumber', wildcard => '*ABC*' },
+            { field => 'homebranch', value    => 'CPL' },
+        ]
+    );
+    is_deeply(
+        $wildcard->{nested}{query}{bool}{filter},
+        [
+            { wildcard => { 'items.callnumber' => { value => '*ABC*' } } },
+            { term     => { 'items.homebranch' => 'CPL' } },
+        ],
+        'a wildcard leaf is built same-item alongside a term, unmerged'
+    );
+
+    # DO-5: a range leaf (acquisition-date operand) is built on the date subfield.
+    my $range = $qb->_build_item_filter_query(
+        [ { field => 'dateaccessioned', range => { gte => '2020-01-01', lte => '2020-12-31' } } ] );
+    is_deeply(
+        $range->{nested}{query}{bool}{filter},
+        [ { range => { 'items.dateaccessioned' => { gte => '2020-01-01', lte => '2020-12-31' } } } ],
+        'a range leaf becomes a range clause on the same item'
+    );
 };
 
 subtest '_extract_item_filters() tests (Bug 46309)' => sub {
-    plan tests => 9;
+    plan tests => 10;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -614,6 +640,10 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         'mc-itemtype (record-level item type) is left flat'
     );
 
+    # Quoted values have the surrounding quotes stripped.
+    my ($quoted) = $qb->_extract_item_filters( ['mc-itype:"CR"'] );
+    is_deeply( $quoted, [ { field => 'itype', value => 'CR' } ], 'surrounding quotes are stripped' );
+
     # The advanced search appends a ",phr" CCL modifier (mc-itype,phr:CR); it must
     # still be routed to the nested channel, with the modifier dropped.
     my ($phr) = $qb->_extract_item_filters( [ 'mc-itype,phr:CR', 'mc-loc,phr:SHELF' ] );
@@ -621,6 +651,55 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         $phr,
         [ { field => 'itype', value => 'CR' }, { field => 'location', value => 'SHELF' } ],
         'a ",phr" modifier on an item-field limit is tolerated and routed'
+    );
+};
+
+subtest '_item_operand_to_filter() tests (Bug 46309, DO-2)' => sub {
+    plan tests => 7;
+
+    my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
+
+    is_deeply(
+        $qb->_item_operand_to_filter( { subfield => 'barcode', kind => 'term' }, '12345' ),
+        { field => 'barcode', value => '12345' },
+        'a term operand becomes a plain value filter'
+    );
+
+    is_deeply(
+        $qb->_item_operand_to_filter( { subfield => 'callnumber', kind => 'wildcard' }, 'ABC' ),
+        { field => 'callnumber', wildcard => '*ABC*' },
+        'a wildcard operand is wrapped with leading/trailing wildcards'
+    );
+
+    is_deeply(
+        $qb->_item_operand_to_filter( { subfield => 'callnumber', kind => 'wildcard' }, 'A*B' ),
+        { field => 'callnumber', wildcard => '*A\\*B*' },
+        'wildcard metacharacters in the value are escaped'
+    );
+
+    is_deeply(
+        $qb->_item_operand_to_filter( { subfield => 'dateaccessioned', kind => 'range' }, '2020-05-01' ),
+        { field => 'dateaccessioned', range => { gte => '2020-05-01', lte => '2020-05-01' } },
+        'a single date becomes a one-day range'
+    );
+
+    is_deeply(
+        $qb->_item_operand_to_filter(
+            { subfield => 'dateaccessioned', kind => 'range' }, '2020-01-01 - 2020-12-31'
+        ),
+        { field => 'dateaccessioned', range => { gte => '2020-01-01', lte => '2020-12-31' } },
+        'a "from - to" value becomes a bounded range'
+    );
+
+    is_deeply(
+        $qb->_item_operand_to_filter( { subfield => 'dateaccessioned', kind => 'range' }, '2020-01-01 - *' ),
+        { field => 'dateaccessioned', range => { gte => '2020-01-01' } },
+        'an open upper bound is omitted'
+    );
+
+    is(
+        $qb->_item_operand_to_filter( { subfield => 'barcode', kind => 'term' }, '' ),
+        undef, 'an empty operand yields no filter'
     );
 };
 

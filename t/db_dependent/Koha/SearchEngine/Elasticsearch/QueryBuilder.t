@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 14;
+use Test::More tests => 15;
 
 use List::Util qw( all );
 
@@ -817,42 +817,42 @@ subtest 'build_query tests' => sub {
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized= - ']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[* TO *]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[* TO *]',
         'If no date all date-of-acquisition are selected'
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized=2024-08-01 - ']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[2024-08-01 TO *]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[2024-08-01 TO *]',
         'Open start date in date range of an st-date-normalized search is handled properly'
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized= - 2024-08-30']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[* TO 2024-08-30]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[* TO 2024-08-30]',
         'Open end date in date range of an st-date-normalized search is handled properly'
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized=2024-08-01 - 2024-08-30']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[2024-08-01 TO 2024-08-30]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[2024-08-01 TO 2024-08-30]',
         'Date range in an st-date-normalized search is handled properly'
     );
 };
@@ -1539,6 +1539,101 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
         'items.onrequest limit is preserved in limit_cgi'
     );
     like( $onreq_desc // '', qr/On request: No/, 'limit_desc describes the on-request filter readably' );
+};
+
+subtest 'advanced-search item operands and limits routed to nested (Bug 46309, DO-1/DO-2/DO-3a)' => sub {
+    plan tests => 15;
+
+    my $builder  = t::lib::TestBuilder->new;
+    my $itemtype = $builder->build_object(
+        { class => 'Koha::ItemTypes', value => { description => 'Operand Test Type' } } );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    # DO-2: a barcode operand (item field) AND a title operand. The barcode is
+    # pulled out to the nested channel; the title stays in the query_string.
+    my ( undef, $query, undef, $query_cgi, undef, undef, undef, $limit_desc ) =
+        $qb->build_query_compat(
+        ['AND'], [ '12345', 'foo' ], [ 'bc', 'ti' ],
+        undef, undef, undef, undef, { skip_facets => 1 }
+        );
+    my $qstr = $query->{query}{bool}{must}[0]{query_string}{query};
+    like( $qstr,   qr/foo/,    'the title operand stays in the query_string' );
+    unlike( $qstr, qr/12345/,  'the barcode operand is removed from the query_string' );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { term => { 'items.barcode' => '12345' } } ],
+        'the barcode operand becomes a same-item nested term'
+    );
+    like( $limit_desc // '', qr/Barcode: 12345/, 'the routed barcode operand is described in limit_desc' );
+    like( $query_cgi, qr/idx=bc/, 'the barcode operand round-trips in query_cgi' );
+
+    # DO-3a: with an OR joining the rows, nothing is routed; the barcode stays
+    # flat in the query_string and there is no nested item filter.
+    ( undef, $query ) = $qb->build_query_compat(
+        ['OR'], [ '12345', 'foo' ], [ 'bc', 'ti' ],
+        undef, undef, undef, undef, { skip_facets => 1 }
+    );
+    like(
+        $query->{query}{bool}{must}[0]{query_string}{query}, qr/barcode/,
+        'with OR, the barcode operand stays in the flat query_string'
+    );
+    is_deeply( _first_nested_item_leaves($query), [], 'with OR, no nested item filter is built' );
+
+    # DO-5: an acquisition-date operand becomes a same-item range. As it is the
+    # only operand, the text query falls back to "*".
+    ( undef, $query, undef, undef, undef, undef, undef, $limit_desc ) =
+        $qb->build_query_compat(
+        undef, ['2020-01-01 - 2020-12-31'], ['acqdate,st-date-normalized'],
+        undef, undef, undef, undef, { skip_facets => 1 }
+        );
+    is(
+        $query->{query}{bool}{must}[0]{query_string}{query}, '*',
+        'with only an item operand, the query_string falls back to *'
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { range => { 'items.dateaccessioned' => { gte => '2020-01-01', lte => '2020-12-31' } } } ],
+        'the acqdate operand becomes a same-item range on items.dateaccessioned'
+    );
+    like(
+        $limit_desc // '', qr/\QAcquisition date: 2020-01-01 to 2020-12-31\E/,
+        'the routed acqdate operand is described in limit_desc'
+    );
+
+    # DO-1: the mc-itype advanced-search limit is routed to items.itype.
+    ( undef, $query, undef, undef, undef, undef, my $limit_cgi, $limit_desc ) =
+        $qb->build_query_compat(
+        undef, ['*'], undef, [ 'mc-itype:' . $itemtype->itemtype ],
+        undef, undef, undef, { skip_facets => 1 }
+        );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { term => { 'items.itype' => $itemtype->itemtype } } ],
+        'mc-itype limit becomes a same-item nested term on items.itype'
+    );
+    like(
+        $limit_cgi, qr/limit=mc-itype%3A\Q@{[ $itemtype->itemtype ]}\E/,
+        'the raw mc-itype limit is preserved in limit_cgi'
+    );
+    like( $limit_desc // '', qr/\QOperand Test Type\E/, 'mc-itype limit resolves to the item type description' );
+
+    # Empty q with only item filters: the query_string must fall back to "*" so
+    # the nested filter (not an empty text query, which matches nothing) drives
+    # the results -- e.g. "every item of a type in a library" without a keyword.
+    ( undef, $query ) = $qb->build_query_compat(
+        undef, [''], undef, [ 'mc-itype:' . $itemtype->itemtype ],
+        undef, undef, undef, { skip_facets => 1 }
+    );
+    is(
+        $query->{query}{bool}{must}[0]{query_string}{query}, '*',
+        'an empty q with only item limits falls back to * so the nested filter applies'
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { term => { 'items.itype' => $itemtype->itemtype } } ],
+        'the item limit is still applied as a nested term with an empty q'
+    );
 };
 
 # Return the leaf clauses of the first hard nested item filter in the query
