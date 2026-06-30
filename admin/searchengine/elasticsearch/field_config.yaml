@@ -80,7 +80,7 @@ sort:
     type: icu_collation_keyword
     index: false
     numeric: false
-# Nested item object (Bug 46309).
+# Nested item object (Bug XXXXX).
 #
 # Item-level data is indexed as a single `nested` object so that library and
 # availability criteria are evaluated against the *same* item (e.g. "library X
@@ -93,7 +93,7 @@ sort:
 # are injected directly into the mapping and are intentionally NOT managed
 # through the search_field / search_marc_map tables nor the mappings.pl UI.
 #
-# Type choices follow the frozen F0 schema:
+# Type choices follow the frozen schema:
 #   - keyword            exact filtering + faceting on codes/identifiers
 #   - integer            numeric identifier (itemnumber), usable in inner_hits
 #   - boolean            derived/computed status flags
@@ -146,6 +146,8 @@ item:
     onrequest:
       type: boolean
     available:
+      type: boolean
+    available_for_patron:
       type: boolean
     hidden_in_opac_custom:
       type: boolean

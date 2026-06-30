@@ -278,7 +278,7 @@ sub get_elasticsearch_mappings {
             $mappings->{properties}{'subject-heading-thesaurus'} = _get_elasticsearch_field_config( 'search', 'text' );
         }
 
-        # Nested item object (Bug 46309). The `items` field is a `nested` object
+        # Nested item object (Bug XXXXX). The `items` field is a `nested` object
         # whose values are computed from the database at index time, so it is not
         # represented in the search_field / search_marc_map tables. Inject its
         # mapping directly from the dedicated 'item' section of field_config.yaml.
@@ -682,7 +682,7 @@ sub marc_records_to_documents {
         %auth_match_headings = map { $_->authtypecode => $_->auth_tag_to_report } @auth_types;
     }
 
-    # Build the nested item documents (Bug 46309) for the whole batch up front,
+    # Build the nested item documents (Bug XXXXX) for the whole batch up front,
     # so transit/hold status and library geolocation are resolved with grouped
     # queries instead of one lookup per item inside the loop below.
     my $item_documents = {};
@@ -917,7 +917,7 @@ sub marc_records_to_documents {
         }
 
         # Check if there is at least one available item, and attach the nested
-        # item documents (Bug 46309) built up front for this batch.
+        # item documents (Bug XXXXX) built up front for this batch.
         if ( $self->index eq $BIBLIOS_INDEX ) {
             my ( $tag, $code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
             my $field = $record->field($tag);
@@ -934,7 +934,7 @@ sub marc_records_to_documents {
                 $record_document->{available} = $avail_items ? \1 : \0;
                 $record_document->{items}     = $item_documents->{$biblionumber} // [];
 
-                # Record-level item count (Bug 46309). Structural (patron
+                # Record-level item count (Bug XXXXX). Structural (patron
                 # independent): lets a query tell "record with no items" apart
                 # from "record whose items are all filtered out".
                 $record_document->{items_count} = scalar @{ $record_document->{items} };
@@ -959,7 +959,7 @@ sub marc_records_to_documents {
 
     my $items_by_biblio = $self->_get_item_documents(\@biblionumbers);
 
-Builds the C<items> nested objects (Bug 46309) for a batch of biblionumbers and
+Builds the C<items> nested objects (Bug XXXXX) for a batch of biblionumbers and
 returns a hashref mapping each biblionumber to an arrayref of item documents.
 
 Item-level state that does not live in the C<items> table (transit and hold
@@ -993,7 +993,9 @@ sub _get_item_documents {
 
     # onrequest: any active (not cancelled, not suspended) hold on the item.
     # onhold: such a hold that is also waiting ('W') or in transit ('T').
-    my ( %onhold, %onrequest );
+    # blocking_hold: such a hold that is found ('W'/'T'/'P'), i.e. it makes the
+    # item unreachable to a patron (feeds available_for_patron, Bug XXXXX).
+    my ( %onhold, %onrequest, %blocking_hold );
     my $holds = Koha::Holds->search(
         {
             itemnumber       => { -in => \@itemnumbers },
@@ -1005,7 +1007,8 @@ sub _get_item_documents {
         my $itemnumber = $hold->itemnumber;
         $onrequest{$itemnumber} = 1;
         my $found = $hold->found;
-        $onhold{$itemnumber} = 1 if defined $found && ( $found eq 'W' || $found eq 'T' );
+        $onhold{$itemnumber}        = 1 if defined $found && ( $found eq 'W' || $found eq 'T' );
+        $blocking_hold{$itemnumber} = 1 if $hold->is_found;    # W/T/P (canonical Koha method)
     }
 
     # branches is a small table: load branchcode => geolocation once and resolve
@@ -1041,6 +1044,10 @@ sub _get_item_documents {
             onhold                        => $onhold{$itemnumber}    ? \1 : \0,
             onrequest                     => $onrequest{$itemnumber} ? \1 : \0,
             available                     => ( !$item->onloan && !$item->itemlost ) ? \1 : \0,
+            available_for_patron          =>
+                $self->_item_available_for_patron( $item, $intransit{$itemnumber}, $blocking_hold{$itemnumber} )
+                ? \1
+                : \0,
             hidden_in_opac_custom         => $self->_item_hidden_in_opac_custom($item) ? \1 : \0,
             hidden_in_opac_by_preferences =>
                 $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } ) ? \1 : \0,
@@ -1070,7 +1077,7 @@ sub _get_item_documents {
 
     my $bool = $self->_item_hidden_in_opac_custom($item);
 
-Custom OPAC item-hiding rules (Bug 46309). Feeds the C<item.hidden_in_opac_custom>
+Custom OPAC item-hiding rules (Bug XXXXX). Feeds the C<item.hidden_in_opac_custom>
 field. Delegates to the C<item_hidden_in_opac> plugin hook, passing the item, and
 is B<restrictive>: it stops and hides the item as soon as the first plugin returns
 a true value, without calling the remaining plugins.
@@ -1099,6 +1106,92 @@ sub _item_hidden_in_opac_custom {
     }
 
     return 0;
+}
+
+=head2 _item_available_for_patron
+
+    my $bool = $self->_item_available_for_patron( $item, $intransit, $blocked_by_hold );
+
+Patron-facing availability (Bug XXXXX). Feeds the C<item.available_for_patron>
+field: whether a patron could request the loan or consultation of this item. This
+is B<distinct> from C<item.available> (the community, staff-facing flag), which is
+left untouched.
+
+Delegates to the C<item_available_for_patron> plugin hook with B<three-state>
+semantics and priority C<< false > true > default >> (which differs from the
+additive veto of C<_item_hidden_in_opac_custom>). The hook receives the item plus
+the batch-computed C<intransit> and C<blocked_by_hold> flags, so a plugin can weigh
+the same inputs as the default conditions without querying C<branchtransfers> and
+C<reserves> again:
+
+=over 4
+
+=item * the first plugin returning a defined B<false> makes the item unavailable
+and short-circuits (false is final);
+
+=item * if no plugin returns false and at least one returns B<true>, the item is
+available;
+
+=item * if there are no plugins, plugins are disabled, or every plugin abstains
+(returns C<undef>), the default conditions below apply.
+
+=back
+
+Default conditions: the item is B<not> available if any of these holds:
+C<itemlost> is non-zero, C<withdrawn> is truthy, C<damaged> is truthy, the item is
+C<$intransit>, or it is C<$blocked_by_hold> (an active hold found in 'W'/'T'/'P').
+
+C<onloan>, C<restricted> and C<notforloan> do B<not> affect the value. C<onloan> is
+excluded on purpose: an item that is checked out can still be reserved by a patron,
+so a loan does not make it unrequestable (C4::Reserves::IsAvailableForItemLevelRequest
+never excludes on-loan items). This is what makes the field diverge from the
+community C<available> flag, which does treat C<onloan> as unavailable.
+
+C<$intransit> and C<$blocked_by_hold> are the batch-computed booleans for this item
+(see L</_get_item_documents>).
+
+=cut
+
+sub _item_available_for_patron {
+    my ( $self, $item, $intransit, $blocked_by_hold ) = @_;
+
+    if ( C4::Context->config('enable_plugins') ) {
+        my @plugins = grep { $_->can('item_available_for_patron') }
+            Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
+
+        my $saw_true = 0;
+        for my $plugin (@plugins) {
+            my $value = eval {
+                $plugin->item_available_for_patron(
+                    {
+                        item            => $item,
+                        intransit       => $intransit,
+                        blocked_by_hold => $blocked_by_hold,
+                    }
+                );
+            };
+            if ($@) {
+                warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
+                next;
+            }
+            next unless defined $value;    # abstention
+            return 0 unless $value;        # defined false: not available, short-circuit
+            $saw_true = 1;
+        }
+        return 1 if $saw_true;             # some true, no false: available
+    }
+
+    # Default conditions (no plugin opinion): not available if any of these holds.
+    # `onloan` is deliberately NOT a condition: a checked-out item can still be
+    # placed on hold by a patron (see C4::Reserves::IsAvailableForItemLevelRequest,
+    # which never excludes on-loan items).
+    return 0 if $item->itemlost;           # non-zero
+    return 0 if $item->withdrawn;          # truthy
+    return 0 if $item->damaged;            # truthy
+    return 0 if $intransit;                # derived from branchtransfers
+    return 0 if $blocked_by_hold;          # active hold found IN ('W','T','P')
+
+    return 1;
 }
 
 =head2 _process_data_field_rules($rules, $field, $record_document, $altscript, $exclude_target_fields_regexp)

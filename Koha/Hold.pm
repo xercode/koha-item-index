@@ -1088,7 +1088,7 @@ item that filled the hold.
 sub fill {
     my ( $self, $params ) = @_;
 
-    # Bug 46309: filling an item-level hold removes the active reserve, so the
+    # Bug XXXXX: filling an item-level hold removes the active reserve, so the
     # item stops being onhold/onrequest. fill() bypasses store() (it uses set()
     # + delete), so reindex the biblio explicitly afterwards.
     my $reindex_biblionumber =
@@ -1340,7 +1340,7 @@ sub store {
 
     Koha::Exceptions::Hold::MissingPickupLocation->throw() unless $self->branchcode;
 
-    # Bug 46309: reindex the biblio only when this change actually flips the
+    # Bug XXXXX: reindex the biblio only when this change actually flips the
     # item-level onhold/onrequest search status (see _item_search_status_*).
     my $reindex_item_status = 0;
 
@@ -1395,7 +1395,7 @@ sub store {
 
 Internal helper. Returns true when this hold, with its current values, makes its
 target item I<onrequest>/I<onhold> for the Elasticsearch nested item documents
-(Bug 46309): it must target a specific item and be active (not cancelled, not
+(Bug XXXXX): it must target a specific item and be active (not cancelled, not
 suspended). Returns false on non-Elasticsearch engines, where these derived
 statuses are not indexed.
 
@@ -1413,22 +1413,32 @@ sub _affects_item_search_status {
 
     my $sig = $hold->_item_search_status_signature;
 
-Internal helper. Returns a hashref { itemnumber, onhold, onrequest } describing
-this hold's contribution to its item's indexed status, following the same rules
-as the indexer (Bug 46309): I<onrequest> when it targets an item and is active
-(no cancellationdate, not suspended); I<onhold> when, in addition, C<found> is
-'W' or 'T'.
+Internal helper. Returns a hashref { itemnumber, onhold, onrequest,
+blocked_by_hold } describing this hold's contribution to its item's indexed
+status, following the same rules as the indexer (Bug XXXXX): I<onrequest> when it
+targets an item and is active (no cancellationdate, not suspended); I<onhold>
+when, in addition, C<found> is 'W' or 'T'; I<blocked_by_hold> when, in addition,
+C<found> is 'W', 'T' or 'P' (i.e. C<is_found>), which feeds the
+C<available_for_patron> item field. The 'P' state is why this component is
+tracked separately from C<onhold>: a NULL -> 'P' transition leaves
+onhold/onrequest untouched but flips C<available_for_patron>.
 
 =cut
 
 sub _item_search_status_signature {
     my ($self) = @_;
 
-    my $onrequest = ( defined $self->itemnumber && !$self->cancellationdate && !$self->suspend ) ? 1 : 0;
-    my $found     = $self->found // '';
-    my $onhold    = ( $onrequest && ( $found eq 'W' || $found eq 'T' ) ) ? 1 : 0;
+    my $onrequest       = ( defined $self->itemnumber && !$self->cancellationdate && !$self->suspend ) ? 1 : 0;
+    my $found           = $self->found // '';
+    my $onhold          = ( $onrequest && ( $found eq 'W' || $found eq 'T' ) ) ? 1 : 0;
+    my $blocked_by_hold = ( $onrequest && $self->is_found )                     ? 1 : 0;    # W/T/P
 
-    return { itemnumber => $self->itemnumber, onhold => $onhold, onrequest => $onrequest };
+    return {
+        itemnumber      => $self->itemnumber,
+        onhold          => $onhold,
+        onrequest       => $onrequest,
+        blocked_by_hold => $blocked_by_hold,
+    };
 }
 
 =head3 _item_search_status_changed
@@ -1436,10 +1446,11 @@ sub _item_search_status_signature {
     my $bool = $hold->_item_search_status_changed( \%updated_columns );
 
 Internal helper. Given the dirty columns of an update, returns true only when the
-change flips this hold's contribution to its item's indexed onhold/onrequest
-status (Bug 46309), so the biblio is reindexed only when strictly needed. A
-transition that leaves the derived status untouched (e.g. found 'W' -> 'T', or a
-priority/date change) returns false. Returns false on non-Elasticsearch engines.
+change flips this hold's contribution to its item's indexed
+onhold/onrequest/blocked_by_hold status (Bug XXXXX), so the biblio is reindexed
+only when strictly needed. A transition that leaves all three untouched (e.g.
+found 'W' -> 'T', or a priority/date change) returns false. Returns false on
+non-Elasticsearch engines.
 
 =cut
 
@@ -1461,6 +1472,7 @@ sub _item_search_status_changed {
     return 1 if ( $old_sig->{itemnumber} // 0 ) != ( $new_sig->{itemnumber} // 0 );
     return 1 if $old_sig->{onhold} != $new_sig->{onhold};
     return 1 if $old_sig->{onrequest} != $new_sig->{onrequest};
+    return 1 if $old_sig->{blocked_by_hold} != $new_sig->{blocked_by_hold};
     return 0;
 }
 
@@ -1469,7 +1481,7 @@ sub _item_search_status_changed {
     $hold->_reindex_biblio_for_item_status;
 
 Internal helper. Enqueues a reindex of this hold's biblio so its nested item
-documents pick up the new onhold/onrequest status (Bug 46309).
+documents pick up the new onhold/onrequest status (Bug XXXXX).
 
 =cut
 

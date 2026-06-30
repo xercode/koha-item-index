@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with Koha; if not, see <https://www.gnu.org/licenses>.
 
-# Bug 46309: reactive reindexing hooks (F2C). Transit, hold and library
+# Bug XXXXX: reactive reindexing hooks. Transit, hold and library
 # geolocation changes that do not touch the items table must still reindex the
 # affected biblio(s), so the nested item documents keep the derived
 # intransit/onhold/onrequest/geolocation fields fresh.
@@ -23,7 +23,7 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 5;
+use Test::More tests => 6;
 use Test::MockModule;
 
 use Koha::Database;
@@ -53,7 +53,7 @@ $indexer_module->mock(
 
 sub reset_calls { @index_calls = (); return; }
 
-subtest 'Koha::Hold reactive reindex (Bug 46309)' => sub {
+subtest 'Koha::Hold reactive reindex (Bug XXXXX)' => sub {
     plan tests => 11;
 
     $schema->storage->txn_begin;
@@ -128,7 +128,50 @@ subtest 'Koha::Hold reactive reindex (Bug 46309)' => sub {
     $schema->storage->txn_rollback;
 };
 
-subtest 'Koha::Item::Transfer reactive reindex (Bug 46309)' => sub {
+subtest 'Koha::Hold found-P transition reindexes for available_for_patron (Bug XXXXX)' => sub {
+    plan tests => 3;
+
+    $schema->storage->txn_begin;
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
+
+    my $library = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $patron  = $builder->build_object( { class => 'Koha::Patrons' } );
+    my $biblio  = $builder->build_sample_biblio;
+    my $item    = $builder->build_sample_item( { biblionumber => $biblio->biblionumber } );
+    my $bibnum  = $biblio->biblionumber;
+
+    my $hold = Koha::Hold->new(
+        {
+            borrowernumber  => $patron->borrowernumber,
+            biblionumber    => $bibnum,
+            itemnumber      => $item->itemnumber,
+            branchcode      => $library->branchcode,
+            reservedate     => dt_from_string->ymd,
+            item_level_hold => 1,
+            priority        => 1,
+        }
+    )->store;
+
+    # A pending (found NULL) item-level hold has onrequest=1, onhold=0,
+    # blocked_by_hold=0. Moving it to 'P' (processing) leaves onhold/onrequest
+    # untouched but flips blocked_by_hold true: it must still reindex so
+    # available_for_patron is refreshed. This is the §4.1 gap that the
+    # onhold/onrequest signature alone would miss.
+    reset_calls();
+    $hold->set( { found => 'P' } )->store;
+    is( scalar @index_calls, 1,       q{found NULL -> 'P' reindexes (blocked_by_hold flips true)} );
+    is( $index_calls[0],     $bibnum, '...the hold biblio' );
+
+    # 'P' -> NULL flips blocked_by_hold back to false while onhold/onrequest stay
+    # put, so it reindexes purely on the new component.
+    reset_calls();
+    $hold->set( { found => undef } )->store;
+    is( scalar @index_calls, 1, q{found 'P' -> NULL reindexes (blocked_by_hold flips false)} );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'Koha::Item::Transfer reactive reindex (Bug XXXXX)' => sub {
     plan tests => 4;
 
     $schema->storage->txn_begin;
@@ -164,7 +207,7 @@ subtest 'Koha::Item::Transfer reactive reindex (Bug 46309)' => sub {
     $schema->storage->txn_rollback;
 };
 
-subtest 'Koha::Library geolocation triggers a batch reindex (Bug 46309)' => sub {
+subtest 'Koha::Library geolocation triggers a batch reindex (Bug XXXXX)' => sub {
     plan tests => 4;
 
     $schema->storage->txn_begin;
@@ -203,7 +246,7 @@ subtest 'Koha::Library geolocation triggers a batch reindex (Bug 46309)' => sub 
     $schema->storage->txn_rollback;
 };
 
-subtest 'UpdateBiblioItemsGeolocation background job (Bug 46309)' => sub {
+subtest 'UpdateBiblioItemsGeolocation background job (Bug XXXXX)' => sub {
     plan tests => 6;
 
     $schema->storage->txn_begin;
