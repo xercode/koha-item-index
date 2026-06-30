@@ -59,6 +59,7 @@ $se->mock(
                         homebranch                    => { type => 'keyword' },
                         holdingbranch                 => { type => 'keyword' },
                         available                     => { type => 'boolean' },
+                        available_for_patron          => { type => 'boolean' },
                         onrequest                     => { type => 'boolean' },
                         lost                          => { type => 'keyword' },
                         hidden_in_opac_custom         => { type => 'boolean' },
@@ -93,6 +94,7 @@ sub item {
         homebranch                    => 'AAA',
         holdingbranch                 => 'AAA',
         available                     => JSON::true,
+        available_for_patron          => JSON::true,
         onrequest                     => JSON::false,
         lost                          => '0',
         hidden_in_opac_custom         => JSON::false,
@@ -119,8 +121,9 @@ my %docs = (
                 barcode    => 'BC-A1', itype => 'BK', dateaccessioned => '2020-06-01'
             ),
             item(
-                homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::false, onrequest => JSON::true,
-                barcode    => 'BC-B1', itype => 'CD', dateaccessioned => '2019-06-01'
+                homebranch           => 'BBB', holdingbranch => 'BBB', available => JSON::false, onrequest => JSON::true,
+                available_for_patron => JSON::false,
+                barcode              => 'BC-B1', itype => 'CD', dateaccessioned => '2019-06-01'
             ),
         ],
     },
@@ -210,6 +213,30 @@ subtest 'same-item availability + library (R1, D1 + D3-C)' => sub {
         matching_ids( ['items.homebranch:AAA'] ),
         [1],
         'library alone matches the record holding a copy in that library'
+    );
+};
+
+subtest 'same-item patron availability + library (F3c)' => sub {
+    plan tests => 3;
+
+    is_deeply(
+        matching_ids( [ 'items.available_for_patron:true', 'items.homebranch:AAA' ] ),
+        [1],
+        'patron-available in AAA matches only the record whose AAA copy is patron-available'
+    );
+
+    # Same-item killer: record 1's BBB copy is NOT patron-available, record 2's
+    # BBB copy is. A flat cross-item query would wrongly return record 1 too.
+    is_deeply(
+        matching_ids( [ 'items.available_for_patron:true', 'items.homebranch:BBB' ] ),
+        [2],
+        'patron-available in BBB matches only record 2 (record 1 BBB copy is blocked)'
+    );
+
+    is_deeply(
+        matching_ids( ['items.available_for_patron:true'] ),
+        [ 1, 2, 4, 5 ],
+        'patron-available alone matches every record with a patron-available copy'
     );
 };
 

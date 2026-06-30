@@ -401,12 +401,21 @@ if ( $operands[0] && !$operands[1] ) {
 }
 
 my $available;
+my $available_for_patron;
 foreach my $limit (@limits) {
-    if ( $limit =~ /available/ ) {
+
+    # Bug 46309 (F3c): the intranet keeps the staff-facing availability control
+    # (items.available) AND adds a separate patron-facing one
+    # (items.available_for_patron). Match the patron limit first so it does not
+    # also light up the staff toggle (its limit string contains "available").
+    if ( $limit eq 'items.available_for_patron:true' ) {
+        $available_for_patron = 1;
+    } elsif ( $limit =~ /available/ ) {
         $available = 1;
     }
 }
-$template->param( available => $available );
+$template->param( available             => $available );
+$template->param( available_for_patron  => $available_for_patron );
 
 # Bug 46309 (D2): item on-request filter. The intranet exposes it as a three-way
 # choice (all / not on request / on request) whose selected option is driven by
@@ -686,6 +695,12 @@ if ($hits) {
         # the legacy flat "available" form.
         $limit_cgi_not_availablity =~ s/&limit=(?:items\.available%3Atrue|available)//g;
         $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
+
+        # Bug 46309 (F3c): limit_cgi stripped of the patron-availability limit so
+        # its "Show all records" link can rebuild a clean URL without it.
+        my $limit_cgi_not_available_for_patron = $limit_cgi;
+        $limit_cgi_not_available_for_patron =~ s/&limit=items\.available_for_patron%3Atrue//g;
+        $template->param( limit_cgi_not_available_for_patron => $limit_cgi_not_available_for_patron );
 
         # Bug 46309 (D2): limit_cgi stripped of any on-request limit so the
         # three-way toggle links can rebuild a clean URL (colon escaped to %3A).

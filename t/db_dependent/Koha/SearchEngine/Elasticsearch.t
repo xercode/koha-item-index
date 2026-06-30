@@ -18,7 +18,7 @@
 use Modern::Perl;
 use Encode;
 
-use Test::More tests => 10;
+use Test::More tests => 11;
 use Test::NoWarnings;
 use Test::Warn;
 use Test::Exception;
@@ -1291,7 +1291,7 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
 };
 
 subtest 'marc_records_to_documents should build the nested "items" field' => sub {
-    plan tests => 26;
+    plan tests => 27;
 
     t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
     t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
@@ -1338,6 +1338,7 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     is_deeply( $doc->{onhold},                \0, 'onhold is false by default' );
     is_deeply( $doc->{onrequest},             \0, 'onrequest is false by default' );
     is_deeply( $doc->{available},             \1, 'available is true for a plain item (no loan, not lost)' );
+    is_deeply( $doc->{available_for_patron},  \1, 'available_for_patron is true for a plain reachable item' );
     is_deeply( $doc->{hidden_in_opac_custom}, \0, 'hidden_in_opac_custom is false with no plugins enabled' );
     ok( !exists $doc->{home_geolocation}, 'home_geolocation is omitted when the library has no geolocation' );
 
@@ -1432,6 +1433,97 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     $builder->build_sample_item( { biblionumber => $biblio->biblionumber } );
     $docs = $see->marc_records_to_documents( [$record] );
     is( scalar @{ $docs->[0]->{items} }, 2, 'two items produce two nested item documents' );
+};
+
+subtest 'marc_records_to_documents should compute the nested "available_for_patron" field' => sub {
+    plan tests => 9;
+
+    t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+
+    my $se = Test::MockModule->new('Koha::SearchEngine::Elasticsearch');
+    $se->noop('_foreach_mapping');
+
+    my $see = Koha::SearchEngine::Elasticsearch::Search->new(
+        { index => $Koha::SearchEngine::Elasticsearch::BIBLIOS_INDEX } );
+    $see->get_elasticsearch_mappings();
+
+    my $builder = t::lib::TestBuilder->new;
+    my $biblio  = $builder->build_sample_biblio;
+    my $record  = $biblio->metadata->record;
+    my $item    = $builder->build_sample_item(
+        {
+            biblionumber => $biblio->biblionumber,
+            onloan       => undef,
+            itemlost     => 0,
+            withdrawn    => 0,
+            damaged      => 0,
+            restricted   => 0,
+            notforloan   => 0,
+        }
+    );
+
+    # Helper: reindex and return the item's available_for_patron flag.
+    my $afp = sub {
+        my $docs = $see->marc_records_to_documents( [$record] );
+        return $docs->[0]->{items}->[0]->{available_for_patron};
+    };
+
+    is_deeply( $afp->(), \1, 'available_for_patron is true for a plain reachable item' );
+
+    # restricted / notforloan must NOT affect the value.
+    $item->set( { restricted => 1, notforloan => 1 } )->store;
+    is_deeply( $afp->(), \1, 'restricted and notforloan do not affect available_for_patron' );
+    $item->set( { restricted => 0, notforloan => 0 } )->store;
+
+    # On loan does NOT block the patron: a checked-out item can still be reserved.
+    $item->set( { onloan => '2024-01-01' } )->store;
+    is_deeply( $afp->(), \1, 'available_for_patron is true for an item on loan (it can be reserved)' );
+    $item->set( { onloan => undef } )->store;
+
+    # A lost item is not requestable.
+    $item->set( { itemlost => 1 } )->store;
+    is_deeply( $afp->(), \0, 'available_for_patron is false for a lost item' );
+    $item->set( { itemlost => 0 } )->store;
+
+    # withdrawn / damaged (truthy) block the patron.
+    $item->set( { withdrawn => 1 } )->store;
+    is_deeply( $afp->(), \0, 'available_for_patron is false for a withdrawn item' );
+    $item->set( { withdrawn => 0, damaged => 1 } )->store;
+    is_deeply( $afp->(), \0, 'available_for_patron is false for a damaged item' );
+    $item->set( { damaged => 0 } )->store;
+
+    # intransit: an active transfer.
+    my $transfer = $builder->build_object(
+        {
+            class => 'Koha::Item::Transfers',
+            value => {
+                itemnumber    => $item->itemnumber,
+                datesent      => '2024-01-01 00:00:00',
+                datearrived   => undef,
+                datecancelled => undef,
+            }
+        }
+    );
+    is_deeply( $afp->(), \0, 'available_for_patron is false for an item in transit' );
+    $transfer->datearrived('2024-01-02 00:00:00')->store;
+
+    # A found hold (W/T/P) blocks the patron; a plain (pending) hold does not.
+    my $hold = $builder->build_object(
+        {
+            class => 'Koha::Holds',
+            value => {
+                biblionumber     => $biblio->biblionumber,
+                itemnumber       => $item->itemnumber,
+                found            => 'P',
+                cancellationdate => undef,
+                suspend          => 0,
+            }
+        }
+    );
+    is_deeply( $afp->(), \0, 'available_for_patron is false for a processing (P) hold' );
+    $hold->set( { found => undef } )->store;
+    is_deeply( $afp->(), \1, 'available_for_patron is true for a non-found (pending) hold' );
 };
 
 $schema->storage->txn_rollback;

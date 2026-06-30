@@ -266,7 +266,7 @@
                                 <fieldset>
                                     <legend>Availability: </legend>
                                     <div style="margin-top:.4em">
-                                        <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="items.available:true" /> Only items currently available for loan or reference</label>
+                                        <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="items.available_for_patron:true" /> Only items available for hold or reference</label>
                                     </div>
                                 </fieldset>
                             </div>
@@ -308,7 +308,7 @@
                                         [% END %]
                                     [% END %]
                                     <div style="margin-top:.4em">
-                                        <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="items.available:true" /> Only items currently available for loan or reference</label>
+                                        <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="items.available_for_patron:true" /> Only items available for hold or reference</label>
                                     </div>
                                 </fieldset>
                             </div>

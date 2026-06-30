@@ -726,8 +726,10 @@ the library limits (D8) are described: their codes are mapped to names reusing
 the same sources as the facet builder (L<Koha::Libraries>, L<Koha::ItemTypes>
 and the C<LOC> / C<CCODE> authorised values). The routed item operands that are
 not facet fields (DO-2: barcode, call number, acquisition date) are described
-with their own labels. Other item filters (geo distance and the internal hiding
-/ availability filters) are left out of the breadcrumb.
+with their own labels. The on-request (D2) and patron-availability (F3c,
+C<available_for_patron>) filters get their own readable yes/no line. Other item
+filters (geo distance and the internal hiding / staff-availability filters) are
+left out of the breadcrumb.
 
 =cut
 
@@ -741,7 +743,8 @@ sub _describe_item_filters {
     return ()
         unless grep {
         ( $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} )
-            || ( $_->{field} && $_->{field} eq 'onrequest' && exists $_->{value} )
+            || ( $_->{field} && $_->{field} eq 'onrequest'            && exists $_->{value} )
+            || ( $_->{field} && $_->{field} eq 'available_for_patron' && exists $_->{value} )
             || ( $_->{field}
             && $ITEM_OPERAND_LABEL{ $_->{field} }
             && ( exists $_->{value} || exists $_->{wildcard} || exists $_->{range} ) )
@@ -791,8 +794,17 @@ sub _describe_item_filters {
         # On-request filter (D2): not a facet field, so describe it on its own
         # with a readable yes/no line.
         if ( $field && $field eq 'onrequest' && exists $filter->{value} ) {
-            my $value = "$filter->{value}";    # de-bless any JSON boolean
-            push @descriptions, 'On request: ' . ( $value eq 'true' ? 'Yes' : 'No' );
+
+            # The value is a JSON boolean (coerced in _extract_item_filters); use
+            # its truthiness directly (it stringifies to 1/0, not true/false).
+            push @descriptions, 'On request: ' . ( $filter->{value} ? 'Yes' : 'No' );
+            next;
+        }
+
+        # Patron-availability filter (F3c): not a facet field, so describe it on
+        # its own with a readable yes/no line.
+        if ( $field && $field eq 'available_for_patron' && exists $filter->{value} ) {
+            push @descriptions, 'Available for hold or reference: ' . ( $filter->{value} ? 'Yes' : 'No' );
             next;
         }
 

@@ -577,7 +577,7 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
 };
 
 subtest '_extract_item_filters() tests (Bug 46309)' => sub {
-    plan tests => 10;
+    plan tests => 11;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -651,6 +651,15 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         $phr,
         [ { field => 'itype', value => 'CR' }, { field => 'location', value => 'SHELF' } ],
         'a ",phr" modifier on an item-field limit is tolerated and routed'
+    );
+
+    # F3c: the patron-facing availability control emits
+    # items.available_for_patron:true, routed to the same nested channel as the
+    # staff items.available, so it resolves same-item (R1) with the facets.
+    my ($afp) = $qb->_extract_item_filters( ['items.available_for_patron:true'] );
+    is_deeply(
+        $afp, [ { field => 'available_for_patron', value => JSON::true } ],
+        'the items.available_for_patron limit is parsed into the nested channel'
     );
 };
 

@@ -1482,7 +1482,7 @@ subtest "_build_field_match_boost_query() tests" => sub {
 };
 
 subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
-    plan tests => 8;
+    plan tests => 10;
 
     my $builder = t::lib::TestBuilder->new;
     my $library = $builder->build_object(
@@ -1539,6 +1539,19 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
         'items.onrequest limit is preserved in limit_cgi'
     );
     like( $onreq_desc // '', qr/On request: No/, 'limit_desc describes the on-request filter readably' );
+
+    # F3c: the patron-availability user filter persists in limit_cgi and IS
+    # described readably in limit_desc (unlike the staff items.available above).
+    ( undef, undef, undef, undef, undef, undef, my $afp_cgi, my $afp_desc ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.available_for_patron:true'] );
+    like(
+        $afp_cgi, qr/limit=items\.available_for_patron%3Atrue/,
+        'items.available_for_patron limit is preserved in limit_cgi'
+    );
+    like(
+        $afp_desc // '', qr/Available for hold or reference: Yes/,
+        'limit_desc describes the patron-availability filter readably'
+    );
 };
 
 subtest 'advanced-search item operands and limits routed to nested (Bug 46309, DO-1/DO-2/DO-3a)' => sub {

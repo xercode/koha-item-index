@@ -475,7 +475,7 @@ foreach my $limit (@limits) {
 }
 $template->param( available => $available );
 
-# Bug 46309 (D2): "Exclude on-request items" toggle. Like the availability
+# Bug XXXXX: "Exclude on-request items" toggle. Like the availability
 # toggle, its active state is driven by the presence of the nested-channel limit
 # items.onrequest:false among the URL limits; the limit itself is added by the
 # facet link in the template.
@@ -515,7 +515,7 @@ my ( $error, $query, $simple_query, $query_cgi, $query_desc, $limit, $limit_cgi,
 my $suppress = C4::Context->is_opac_suppressed;
 
 # Patrons whose category is listed in OpacHiddenItemsExceptions can see items
-# hidden by the OpacHiddenItems preferences (Bug 46309, D6); the custom hiding is
+# hidden by the OpacHiddenItems preferences (Bug XXXXX); the custom hiding is
 # never lifted. Used to decide which item-hiding filters build_query_compat adds.
 my $override_hidden_items = ( $patron && $patron->category->override_hidden_items ) ? 1 : 0;
 
@@ -891,14 +891,16 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
             $template->param( total => $hits );
             my $limit_cgi_not_availablity = $limit_cgi;
 
-            # Bug 46309 (D3-C): the availability control now emits the nested
-            # items.available:true limit; the flat "available" form is still
-            # stripped for backward compatibility.
-            $limit_cgi_not_availablity =~ s/&limit=(?:items\.available%3Atrue|available)//g
+            # Bug XXXXX: the OPAC availability control now emits the
+            # patron-facing items.available_for_patron:true limit; the staff
+            # items.available:true and the legacy flat "available" forms are still
+            # stripped for backward compatibility with bookmarked URLs.
+            $limit_cgi_not_availablity =~
+                s/&limit=(?:items\.available_for_patron%3Atrue|items\.available%3Atrue|available)//g
                 if defined $limit_cgi_not_availablity;
             $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
 
-            # Bug 46309 (D2): limit_cgi stripped of the on-request limit, so the
+            # Bug XXXXX: limit_cgi stripped of the on-request limit, so the
             # toggle link can rebuild a clean URL without it (colon is escaped to
             # %3A in limit_cgi).
             my $limit_cgi_not_onrequest = $limit_cgi;
@@ -994,7 +996,7 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
     $template->param( outer_sup_results_loop => \@sup_results_array );
 }    #/end of the for loop
 
-# Bug 46309 (D8): a library limit (branch:/multibranchlimit:) is routed to the
+# Bug XXXXX: a library limit (branch:/multibranchlimit:) is routed to the
 # nested items.homebranch/holdingbranch channel but kept verbatim in the URL, so
 # the matching library facets would not look selected. Map each such limit to the
 # item facet tokens it covers, remembering the raw limit so the facet remove link

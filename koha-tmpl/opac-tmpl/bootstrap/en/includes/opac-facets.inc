@@ -34,13 +34,14 @@
                 <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#availability_collapse" id="filter_facets">Availability</a>
                 <div class="facet-collapse collapse show" id="availability_collapse">
                     <ul>
+                        [%# Bug XXXXX: OPAC shows a single, patron-facing availability control (items.available_for_patron), replacing the staff-facing items.available toggle. %]
                         [% IF ( available ) %]
-                            <li><strong>Showing only records with available items</strong></li
+                            <li><strong>Showing only records with items available for hold or reference</strong></li
                             ><li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_availablity | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
                         [% ELSE %]
                             <li
-                                ><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.available:true"
-                                    >Limit to records with available items</a
+                                ><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.available_for_patron:true"
+                                    >Limit to records with items available for hold or reference</a
                                 ></li
                             >
                         [% END %]
@@ -49,7 +50,7 @@
                 </div>
             </li>
 
-            [%# Bug 46309 (D2): exclude items that are requested in a hold (items.onrequest). %]
+            [%# Bug XXXXX: exclude items that are requested in a hold (items.onrequest). %]
             <li id="onrequest_facet">
                 <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#onrequest_collapse" id="filter_onrequest">Requests</a>
                 <div class="facet-collapse collapse show" id="onrequest_collapse">
@@ -119,7 +120,7 @@
                                     [% END %]
                                     <li class="[% li_class | html %]" style="[% li_style | html %]">
                                         [% IF facet.active %]
-                                            [%# Bug 46309 (D8): a library limit kept as branch:/multibranchlimit: in the URL marks the facet active; its remove link must drop that raw token, not the items.<field> one %]
+                                            [%# Bug XXXXX: a library limit kept as branch:/multibranchlimit: in the URL marks the facet active; its remove link must drop that raw token, not the items.<field> one %]
                                             [% IF facet.remove_limit_value %]
                                                 [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _ facet.remove_limit_value | url %][% END %]
                                             [% ELSE %]
