@@ -17,7 +17,7 @@
 # You should have received a copy of the GNU General Public License
 # along with Koha; if not, see <https://www.gnu.org/licenses>.
 
-# End-to-end tests for the nested items channel (Bug 46309) against a live
+# End-to-end tests for the nested items channel (Bug XXXXX) against a live
 # Elasticsearch server. They build the query with build_query_compat exactly as
 # the search controllers do and run it against a throwaway index ("mydb", never
 # the real biblios index), so they exercise the real same-item nested
@@ -39,7 +39,7 @@ use Koha::SearchEngine::Elasticsearch::Search;
 
 my $index = 'mydb';
 
-# Mirror the production injection (F1): the throwaway index carries the nested
+# Mirror the production injection: the throwaway index carries the nested
 # items object plus the record-level items_count, without touching the real
 # biblios mapping.
 my $se = Test::MockModule->new('Koha::SearchEngine::Elasticsearch');
@@ -56,6 +56,7 @@ $se->mock(
                 items       => {
                     type       => 'nested',
                     properties => {
+                        itemnumber                    => { type => 'integer' },
                         homebranch                    => { type => 'keyword' },
                         holdingbranch                 => { type => 'keyword' },
                         available                     => { type => 'boolean' },
@@ -117,10 +118,12 @@ my %docs = (
             # is on request. The two copies carry distinct barcode / itype /
             # acquisition date so the operand-routing tests can tell them apart.
             item(
+                itemnumber => 11,
                 homebranch => 'AAA', holdingbranch => 'AAA', available => JSON::true, onrequest => JSON::false,
                 barcode    => 'BC-A1', itype => 'BK', dateaccessioned => '2020-06-01'
             ),
             item(
+                itemnumber           => 12,
                 homebranch           => 'BBB', holdingbranch => 'BBB', available => JSON::false, onrequest => JSON::true,
                 available_for_patron => JSON::false,
                 barcode              => 'BC-B1', itype => 'CD', dateaccessioned => '2019-06-01'
@@ -132,6 +135,7 @@ my %docs = (
         items_count => 1,
         items       => [
             item(
+                itemnumber => 21,
                 homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::true,
                 barcode    => 'BC-2', itype => 'BK', dateaccessioned => '2021-06-01'
             )
@@ -145,13 +149,14 @@ my %docs = (
     4 => {
         title       => 'river',
         items_count => 1,
-        items       => [ item( homebranch => 'CCC', holdingbranch => 'CCC', hidden_in_opac_custom => JSON::true ) ],
+        items       =>
+            [ item( itemnumber => 41, homebranch => 'CCC', holdingbranch => 'CCC', hidden_in_opac_custom => JSON::true ) ],
     },
     5 => {
         title       => 'river',
         items_count => 1,
         items =>
-            [ item( homebranch => 'CCC', holdingbranch => 'CCC', hidden_in_opac_by_preferences => JSON::true ) ],
+            [ item( itemnumber => 51, homebranch => 'CCC', holdingbranch => 'CCC', hidden_in_opac_by_preferences => JSON::true ) ],
     },
 );
 
@@ -185,7 +190,49 @@ sub matching_ids_search {
     return [ sort { $a <=> $b } map { $_->{_id} } @{ $results->{hits}{hits} } ];
 }
 
-subtest 'same-item availability + library (R1, D1 + D3-C)' => sub {
+# Build the query with want_matched_items and, for each returned record, extract
+# the itemnumbers ES reports as matching via inner_hits. Returns a map
+# record id => sorted arrayref of matched itemnumbers (or undef if not filtered).
+sub matched_map {
+    my ( $limits, $params ) = @_;
+    my %p = ( skip_facets => 1, want_matched_items => 1, %{ $params // {} } );
+    my ( undef, $query ) =
+        $builder->build_query_compat( undef, ['*'], undef, $limits, undef, undef, undef, \%p );
+    my $results = $searcher->search( $query, undef, 50 );
+    my %by_id;
+    for my $hit ( @{ $results->{hits}{hits} } ) {
+        my $nums = $searcher->matched_itemnumbers($hit);
+        $by_id{ $hit->{_id} } = defined $nums ? [ sort { $a <=> $b } @$nums ] : undef;
+    }
+    return \%by_id;
+}
+
+subtest 'inner_hits reports the matching items (Bug XXXXX)' => sub {
+    plan tests => 6;
+
+    # Same-item filter: only record 1's AAA copy (11) matches, not its BBB copy (12).
+    my $by_id = matched_map( [ 'items.available:true', 'items.homebranch:AAA' ] );
+    is_deeply( [ sort keys %$by_id ], [1], 'only record 1 matches the same-item filter' );
+    is_deeply( $by_id->{1}, [11], 'inner_hits reports just the matching AAA copy, not the BBB copy' );
+
+    # homebranch:BBB (intranet) matches records 1 and 2, each reporting only its
+    # own BBB copy -- record 1 reports item 12 (its BBB copy), not item 11.
+    $by_id = matched_map( ['items.homebranch:BBB'] );
+    is_deeply( [ sort keys %$by_id ], [ 1, 2 ], 'homebranch:BBB matches records 1 and 2' );
+    is_deeply( $by_id->{1}, [12], 'record 1 reports only its BBB copy (12), not its AAA copy' );
+    is_deeply( $by_id->{2}, [21], 'record 2 reports its BBB copy (21)' );
+
+    # Without want_matched_items there is no inner_hits, so matched_itemnumbers is
+    # undef (the caller must not filter).
+    my ( undef, $query ) =
+        $builder->build_query_compat( undef, ['*'], undef, ['items.homebranch:AAA'], undef, undef, undef,
+        { skip_facets => 1 } );
+    my $results = $searcher->search( $query, undef, 50 );
+    my ($hit) = grep { $_->{_id} == 1 } @{ $results->{hits}{hits} };
+    is( $searcher->matched_itemnumbers($hit), undef, 'no inner_hits without want_matched_items => undef' );
+};
+
+subtest 'same-item availability + library' => sub {
     plan tests => 4;
 
     is_deeply(
@@ -216,7 +263,7 @@ subtest 'same-item availability + library (R1, D1 + D3-C)' => sub {
     );
 };
 
-subtest 'same-item patron availability + library (F3c)' => sub {
+subtest 'same-item patron availability + library' => sub {
     plan tests => 3;
 
     is_deeply(
@@ -240,7 +287,7 @@ subtest 'same-item patron availability + library (F3c)' => sub {
     );
 };
 
-subtest 'on-request filter (D2, R10)' => sub {
+subtest 'on-request filter (R10)' => sub {
     plan tests => 2;
 
     is_deeply(
@@ -256,7 +303,7 @@ subtest 'on-request filter (D2, R10)' => sub {
     );
 };
 
-subtest 'OPAC item hiding (D6)' => sub {
+subtest 'OPAC item hiding' => sub {
     plan tests => 3;
 
     # In the OPAC the hidden copies must not satisfy a same-item filter.
@@ -282,7 +329,7 @@ subtest 'OPAC item hiding (D6)' => sub {
     );
 };
 
-subtest 'record suppression without user filters (D7)' => sub {
+subtest 'record suppression without user filters' => sub {
     plan tests => 3;
 
     t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 1 );
@@ -306,7 +353,7 @@ subtest 'record suppression without user filters (D7)' => sub {
     );
 };
 
-subtest 'library limit routed to the nested channel (D8)' => sub {
+subtest 'library limit routed to the nested channel' => sub {
     plan tests => 3;
 
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'homebranch' );
@@ -334,17 +381,17 @@ subtest 'library limit routed to the nested channel (D8)' => sub {
     );
 };
 
-subtest 'advanced-search item operands routed to nested (DO-1/DO-2/DO-3a/DO-5)' => sub {
+subtest 'advanced-search item operands routed to nested' => sub {
     plan tests => 7;
 
-    # DO-2: a barcode operand (idx "bc") is routed to a same-item nested term.
+    # a barcode operand (idx "bc") is routed to a same-item nested term.
     is_deeply(
         matching_ids_search( undef, ['BC-A1'], ['bc'] ),
         [1],
         'a barcode operand matches the record holding that exact copy'
     );
 
-    # DO-5: an acquisition-date operand becomes a same-item range.
+    # an acquisition-date operand becomes a same-item range.
     is_deeply(
         matching_ids_search( undef, ['2020-01-01 - 2020-12-31'], ['acqdate,st-date-normalized'] ),
         [1],
@@ -369,7 +416,7 @@ subtest 'advanced-search item operands routed to nested (DO-1/DO-2/DO-3a/DO-5)' 
         'acqdate range and a different library do not match across items (BBB copy is 2019)'
     );
 
-    # DO-1: the mc-itype advanced-search limit is routed to items.itype.
+    # the mc-itype advanced-search limit is routed to items.itype.
     is_deeply(
         matching_ids_search( undef, ['*'], undef, ['mc-itype:CD'] ),
         [1],
