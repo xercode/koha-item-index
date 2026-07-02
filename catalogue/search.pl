@@ -299,7 +299,7 @@ if ( $template_type eq 'advsearch' ) {
     foreach my $limit (@limits) {
         if ( $limit eq 'available' || $limit eq 'items.available:true' ) {
 
-            # Bug 46309 (D3-C): the availability checkbox now emits the nested
+            # Bug XXXXX: the availability checkbox now emits the nested
             # items.available:true limit; the flat "available" is still honoured
             # for backward compatibility when reconstructing the advanced form.
             $template->param( limit_available => 1 );
@@ -404,7 +404,7 @@ my $available;
 my $available_for_patron;
 foreach my $limit (@limits) {
 
-    # Bug 46309 (F3c): the intranet keeps the staff-facing availability control
+    # Bug XXXXX: the intranet keeps the staff-facing availability control
     # (items.available) AND adds a separate patron-facing one
     # (items.available_for_patron). Match the patron limit first so it does not
     # also light up the staff toggle (its limit string contains "available").
@@ -417,7 +417,7 @@ foreach my $limit (@limits) {
 $template->param( available             => $available );
 $template->param( available_for_patron  => $available_for_patron );
 
-# Bug 46309 (D2): item on-request filter. The intranet exposes it as a three-way
+# Bug XXXXX: item on-request filter. The intranet exposes it as a three-way
 # choice (all / not on request / on request) whose selected option is driven by
 # the nested-channel limit items.onrequest:<bool>. The limit itself is added by
 # the facet link in the template.
@@ -474,6 +474,11 @@ my ( $error, $query, $simple_query, $query_cgi, $query_desc, $limit, $limit_cgi,
 my $builder  = Koha::SearchEngine::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
 my $searcher = Koha::SearchEngine::Search->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
 
+# Bug XXXXX: when on (default), the results only list the items that matched
+# the search's item filters, with recomputed counters. Only meaningful under
+# Elasticsearch (inner_hits); Zebra ignores the query option.
+my $show_only_matching_items = C4::Context->preference('StaffSearchResultsShowOnlyMatchingItems') ? 1 : 0;
+
 # If index indicates the value is a barcode, we need to preprocess it before searching
 for ( my $i = 0 ; $i < @operands ; $i++ ) {
     $operands[$i] = barcodedecode( $operands[$i] ) if ( defined( $indexes[$i] ) && $indexes[$i] eq 'bc' );
@@ -492,7 +497,11 @@ for ( my $i = 0 ; $i < @operands ; $i++ ) {
     {
         weighted_fields         => $weight_search,
         whole_record            => $whole_record,
-        weight_search_submitted => $params->{'weight_search_submitted'}
+        weight_search_submitted => $params->{'weight_search_submitted'},
+
+        # Bug XXXXX: ask ES which items matched (inner_hits) so results
+        # show only the matching items and recomputed counters.
+        want_matched_items => $show_only_matching_items,
     }
     );
 
@@ -596,7 +605,8 @@ if ( $hits == 0 && $basic_search && $operands[0] !~ /^\".*\"$/ ) {
         {
             weighted_fields         => $weight_search,
             whole_record            => $whole_record,
-            weight_search_submitted => $params->{'weight_search_submitted'}
+            weight_search_submitted => $params->{'weight_search_submitted'},
+            want_matched_items      => $show_only_matching_items,
         }
         );
     my $quoted_results_hashref;
@@ -620,7 +630,12 @@ if ( $hits == 0 && $basic_search && $operands[0] !~ /^\".*\"$/ ) {
 }
 my @newresults = searchResults(
     { 'interface' => 'intranet' }, $query_desc, $hits, $results_per_page, $offset, $scan,
-    $results_hashref->{$server}->{"RECORDS"}
+    $results_hashref->{$server}->{"RECORDS"},
+    undef,    # $xslt_variables
+
+    # Bug XXXXX: show only the items that matched the item filters (undef
+    # entries when there were none). Gated by the syspref via want_matched_items.
+    $show_only_matching_items ? $results_hashref->{$server}->{"MATCHED_ITEMNUMBERS"} : undef,
 );
 $total = $total + $hits;
 
@@ -691,18 +706,18 @@ if ($hits) {
     if ($limit_cgi) {
         my $limit_cgi_not_availablity = $limit_cgi;
 
-        # Bug 46309 (D3-C): strip both the nested items.available:true limit and
+        # Bug XXXXX: strip both the nested items.available:true limit and
         # the legacy flat "available" form.
         $limit_cgi_not_availablity =~ s/&limit=(?:items\.available%3Atrue|available)//g;
         $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
 
-        # Bug 46309 (F3c): limit_cgi stripped of the patron-availability limit so
+        # Bug XXXXX: limit_cgi stripped of the patron-availability limit so
         # its "Show all records" link can rebuild a clean URL without it.
         my $limit_cgi_not_available_for_patron = $limit_cgi;
         $limit_cgi_not_available_for_patron =~ s/&limit=items\.available_for_patron%3Atrue//g;
         $template->param( limit_cgi_not_available_for_patron => $limit_cgi_not_available_for_patron );
 
-        # Bug 46309 (D2): limit_cgi stripped of any on-request limit so the
+        # Bug XXXXX: limit_cgi stripped of any on-request limit so the
         # three-way toggle links can rebuild a clean URL (colon escaped to %3A).
         my $limit_cgi_not_onrequest = $limit_cgi;
         $limit_cgi_not_onrequest =~ s/&limit=items\.onrequest%3A(?:true|false)//g;
@@ -769,7 +784,7 @@ my $gotopage = $cgi->param('gotoPage');
 $template->{'VARS'}->{'gotoPage'} = $gotopage
     if $gotopage && $gotopage =~ m/^(ISBD|labeledMARC|MARC|more)?detail.pl$/;
 
-# Bug 46309 (D8): a library limit (branch:/multibranchlimit:) is routed to the
+# Bug XXXXX: a library limit (branch:/multibranchlimit:) is routed to the
 # nested items.homebranch/holdingbranch channel but kept verbatim in the URL, so
 # the matching library facets would not look selected. Map each such limit to the
 # item facet tokens it covers, remembering the raw limit so the facet remove link

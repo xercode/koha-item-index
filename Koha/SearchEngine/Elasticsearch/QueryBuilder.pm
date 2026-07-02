@@ -146,13 +146,13 @@ my $field_name_pattern   = '[\w\-]+';
 my $multi_field_pattern  = "(?:\\.$field_name_pattern)*";
 my $es_advanced_searches = [];
 
-# Facet fields that live on the nested items object (Bug 46309). When a search
+# Facet fields that live on the nested items object (Bug XXXXX). When a search
 # field with one of these names is faceted, the aggregation is built over the
 # items nested object instead of the flat __facet field.
 our %ITEM_FACET_FIELDS = map { $_ => 1 } qw( homebranch holdingbranch itype location ccode );
 
-# Advanced-search "multi-choice" limits that target an item field (Bug 46309,
-# DO-1). They are routed to the same-item nested channel by _extract_item_filters
+# Advanced-search "multi-choice" limits that target an item field (Bug XXXXX).
+# They are routed to the same-item nested channel by _extract_item_filters
 # (same as the item facets), instead of the flat query_string. mc-itemtype is
 # deliberately absent: that is the record-level item type (biblioitems.itemtype),
 # not an item field.
@@ -163,13 +163,13 @@ my %ITEM_LIMIT_ALIAS = (
     'loc'      => 'location',
 );
 
-# Advanced-search operands ("Search for" rows) that target an item field (Bug
-# 46309, DO-2). Maps the converted ES search field to the nested item subfield
+# Advanced-search operands ("Search for" rows) that target an item field
+# (Bug XXXXX). Maps the converted ES search field to the nested item subfield
 # and the leaf clause used to query it on the same item. Only AND-combined
-# operands are routed (DO-3a); OR/NOT keep flowing through the flat query_string.
+# operands are routed; OR/NOT keep flowing through the flat query_string.
 #   term     exact match on a keyword subfield
-#   wildcard substring match approximating right-truncation (DO-4)
-#   range    date range on the `date` subfield (DO-5)
+#   wildcard substring match approximating right-truncation
+#   range    date range on the `date` subfield
 my %ITEM_OPERAND_FIELDS = (
     'barcode'              => { subfield => 'barcode',         kind => 'term' },
     'location'             => { subfield => 'location',        kind => 'term' },
@@ -178,12 +178,19 @@ my %ITEM_OPERAND_FIELDS = (
 );
 
 # Readable labels for the routed item operands that are not facet fields, so the
-# breadcrumb (limit_desc) can still show what the user searched for (DO-6).
+# breadcrumb (limit_desc) can still show what the user searched for.
 my %ITEM_OPERAND_LABEL = (
     barcode         => 'Barcode',
     callnumber      => 'Call number',
     dateaccessioned => 'Acquisition date',
 );
+
+# Bug XXXXX: cap of matched items reported via inner_hits per record. Sized
+# for serials (a periodical can hold well over 100 issues, one item each), well
+# above ES's default of 3. It must not exceed index.max_inner_result_window
+# (set to the same value in index_config.yaml); a record whose real match count
+# exceeds it is left unfiltered by the caller (no truncated counters).
+our $MATCHED_ITEMS_WINDOW = 50000;
 
 =head2 get_index_field_convert
 
@@ -261,7 +268,7 @@ sub build_query {
 
     $res->{query}->{bool}->{should} = $options{field_match_boost_query} if $options{field_match_boost_query};
 
-    # Item-level clauses (Bug 46309). build_query_compat assembles the final
+    # Item-level clauses (Bug XXXXX). build_query_compat assembles the final
     # item-related clauses -- the same-item nested filter and, in the OPAC, the
     # record-suppression logic of OpacHiddenItemsHidesRecord -- and passes them
     # ready to be AND-ed into the query.
@@ -295,14 +302,23 @@ sub build_query {
         # things that Koha can use.
         my $size   = C4::Context->preference('FacetMaxCount');
         my @facets = Koha::SearchEngine::Elasticsearch->get_facet_fields;
+
+        # Item facet counts must respect the same active item filters as the hard
+        # query filter (own fork fix, not in community 26.05): the clauses are
+        # applied in an item_filter sub-agg inside every item facet's nested scope,
+        # so bucket counts match what activating the facet returns (same item).
+        # With no active filters the list is empty and the counts are unchanged.
+        my $item_facet_clauses = $self->_item_filter_clauses( $options{item_facet_filters} || [] );
+
         for my $f (@facets) {
             my $name = $f->name;
             if ( $ITEM_FACET_FIELDS{$name} ) {
 
-                # Item facets (Bug 46309) aggregate over the nested items, and use
+                # Item facets (Bug XXXXX) aggregate over the nested items, and use
                 # reverse_nested so the bucket counts remain per-record, matching
                 # Koha's record-count facet semantics. See _convert_facets in Search.pm.
-                $res->{aggregations}->{$name} = $self->_build_item_facet_aggregation( $name, $size );
+                $res->{aggregations}->{$name} =
+                    $self->_build_item_facet_aggregation( $name, $size, $item_facet_clauses );
             } else {
                 $res->{aggregations}->{$name} = { terms => { field => "${name}__facet", size => $size } };
             }
@@ -317,16 +333,23 @@ sub build_query {
 =head2 _build_item_filter_query
 
     my $nested = $builder->_build_item_filter_query(\@item_filters);
+    my $nested = $builder->_build_item_filter_query(\@item_filters, { want_inner_hits => 1 });
 
-Builds a single C<nested> query (path C<items>, Bug 46309) wrapping every
+Builds a single C<nested> query (path C<items>, Bug XXXXX) wrapping every
 item-level criterion in one C<bool> C<filter>, so that all the criteria are
 evaluated against the *same* item.
+
+With C<want_inner_hits> (Bug XXXXX) the C<nested> block also requests
+C<inner_hits> restricted to C<items.itemnumber>, so Elasticsearch reports which
+nested items matched. The caller uses those itemnumbers to show only the
+matching items (and recompute their counters) in the results. C<size> is capped
+at C<$MATCHED_ITEMS_WINDOW>; the payload is limited to the identifier.
 
 Several equality filters on the *same* field (e.g. two C<homebranch> facets) are
 merged into a single C<terms> clause, so they combine as an OR, matching Koha's
 facet semantics: a record with items in CPL and FFL must still match
 C<homebranch:CPL OR homebranch:FFL>. Filters on *different* fields stay AND-ed on
-the same nested item (R1). First-occurrence order of the fields is preserved.
+the same nested item. First-occurrence order of the fields is preserved.
 
 Each entry of C<@item_filters> is a hashref describing one leaf condition:
 
@@ -337,23 +360,23 @@ C<< { term => { 'items.homebranch' => 'CPL' } } >>. The caller is responsible fo
 passing a value the field accepts (e.g. C<JSON::true> / C<\1> for boolean
 subfields such as C<onrequest>).
 
-=item * a terms filter (D8): C<< { field => 'homebranch', values => ['CPL','MPL'] } >>
+=item * a terms filter: C<< { field => 'homebranch', values => ['CPL','MPL'] } >>
 becomes C<< { terms => { 'items.homebranch' => ['CPL','MPL'] } } >>, matching any
 of the values on the same item.
 
-=item * a proximity filter (R11): C<< { field => 'home_geolocation', lat => ...,
+=item * a proximity filter: C<< { field => 'home_geolocation', lat => ...,
 lon => ..., distance => '10km' } >> becomes a C<geo_distance> clause. The
 C<geo_distance> syntax is common to Elasticsearch 7 and 8.
 
-=item * a disjunction (D8): C<< { should => [ \%leaf, ... ] } >> becomes a
+=item * a disjunction: C<< { should => [ \%leaf, ... ] } >> becomes a
 C<bool> with C<minimum_should_match> 1, used e.g. for a library limit that must
 match either C<items.homebranch> or C<items.holdingbranch> on the same item.
 
-=item * a wildcard filter (DO-4): C<< { field => 'callnumber', wildcard => '*ABC*' } >>
+=item * a wildcard filter: C<< { field => 'callnumber', wildcard => '*ABC*' } >>
 becomes a C<wildcard> clause, used to approximate a right-truncated call-number
 search on the C<items.callnumber> keyword subfield.
 
-=item * a range filter (DO-5): C<< { field => 'dateaccessioned', range => { gte =>
+=item * a range filter: C<< { field => 'dateaccessioned', range => { gte =>
 '2020-01-01', lte => '2020-12-31' } } >> becomes a C<range> clause on the
 C<items.dateaccessioned> date subfield.
 
@@ -362,6 +385,45 @@ C<items.dateaccessioned> date subfield.
 =cut
 
 sub _build_item_filter_query {
+    my ( $self, $item_filters, $options ) = @_;
+
+    my $clauses = $self->_item_filter_clauses($item_filters);
+
+    my %nested = (
+        path  => 'items',
+        query => { bool => { filter => $clauses } },
+    );
+
+    # ask ES which nested items matched, so the caller can show only those
+    # items and recompute their counters. Only the itemnumber is needed.
+    if ( $options && $options->{want_inner_hits} ) {
+        $nested{inner_hits} = {
+            _source => ['items.itemnumber'],
+            size    => $MATCHED_ITEMS_WINDOW,
+        };
+    }
+
+    return { nested => \%nested };
+}
+
+=head2 _item_filter_clauses
+
+    my $clauses = $builder->_item_filter_clauses(\@item_filters);
+
+Turns a list of item-filter descriptors (see L</_build_item_filter_query> for the
+descriptor grammar) into the ordered arrayref of Elasticsearch clauses that goes
+inside a C<bool> C<filter> (Bug XXXXX). Equality filters (term/terms) on the
+*same* field are accumulated into a single C<terms> clause (OR semantics, matching
+Koha facets); geo_distance, should disjunctions, wildcard and range leaves are
+never merged and keep their own slot, preserving first-occurrence order.
+
+Shared by L</_build_item_filter_query> (the hard same-item filter) and the item
+facet aggregations (L</_build_item_facet_aggregation>), so the facet bucket counts
+respect the same active filters (same item) as the query filter.
+
+=cut
+
+sub _item_filter_clauses {
     my ( $self, $item_filters ) = @_;
 
     # Build the nested bool filters preserving first-occurrence order. Equality
@@ -411,12 +473,7 @@ sub _build_item_filter_query {
             : { term => { "items.$slot->{field}" => $values->[0] } };
     }
 
-    return {
-        nested => {
-            path  => 'items',
-            query => { bool => { filter => \@clauses } },
-        }
-    };
+    return \@clauses;
 }
 
 =head2 _item_filter_leaf
@@ -451,13 +508,13 @@ sub _item_filter_leaf {
         };
     } elsif ( exists $filter->{wildcard} ) {
 
-        # DO-4: substring match on a keyword subfield (e.g. items.callnumber),
+        # substring match on a keyword subfield (e.g. items.callnumber),
         # approximating the flat right-truncated search. The pattern is built by
         # the caller. Common to Elasticsearch 7 and 8.
         return { wildcard => { $field => { value => $filter->{wildcard} } } };
     } elsif ( exists $filter->{range} ) {
 
-        # DO-5: date range on the `date` subfield (items.dateaccessioned).
+        # date range on the `date` subfield (items.dateaccessioned).
         return { range => { $field => $filter->{range} } };
     } elsif ( exists $filter->{values} ) {
         return { terms => { $field => $filter->{values} } };
@@ -468,26 +525,39 @@ sub _item_filter_leaf {
 
 =head2 _build_item_facet_aggregation
 
-    my $agg = $builder->_build_item_facet_aggregation($name, $size);
+    my $agg = $builder->_build_item_facet_aggregation($name, $size, $filter_clauses);
 
-Builds a C<nested> aggregation (path C<items>, Bug 46309) for an item-level
+Builds a C<nested> aggregation (path C<items>, Bug XXXXX) for an item-level
 facet field. The inner C<terms> aggregation runs on C<items.$name>, and a
 C<reverse_nested> sub-aggregation yields the number of distinct parent records
 for each bucket, so the facet counts stay per-record (Koha's facet semantics)
 rather than per-item. The C<nested>/C<reverse_nested> syntax is common to
 Elasticsearch 7 and 8.
 
+C<$filter_clauses> (an arrayref built by L</_item_filter_clauses> from the active
+item filters) is applied in an C<item_filter> C<filter> sub-aggregation wrapping
+the C<terms>, so the bucket counts respect the same same-item constraint as
+the hard query filter (own fork fix, not in community 26.05). When it is empty or
+absent the C<filter> matches everything and the counts are unchanged.
+
 =cut
 
 sub _build_item_facet_aggregation {
-    my ( $self, $name, $size ) = @_;
+    my ( $self, $name, $size, $filter_clauses ) = @_;
+
+    $filter_clauses ||= [];
 
     return {
         nested => { path => 'items' },
         aggs   => {
-            $name => {
-                terms => { field        => "items.$name", size => $size },
-                aggs  => { record_count => { reverse_nested => {} } },
+            item_filter => {
+                filter => { bool => { filter => $filter_clauses } },
+                aggs   => {
+                    $name => {
+                        terms => { field        => "items.$name", size => $size },
+                        aggs  => { record_count => { reverse_nested => {} } },
+                    },
+                },
             },
         },
     };
@@ -497,7 +567,7 @@ sub _build_item_facet_aggregation {
 
     my ( $item_filters, $remaining_limits ) = $builder->_extract_item_filters(\@limits);
 
-Partitions a list of limit strings (Bug 46309) into item-level filters, which
+Partitions a list of limit strings (Bug XXXXX) into item-level filters, which
 must be turned into a nested query, and the remaining limits, which keep flowing
 through the regular query_string machinery. Recognised forms:
 
@@ -508,15 +578,15 @@ are coerced to JSON booleans (for the boolean subfields). Surrounding double
 quotes are stripped.
 
 =item * C<< items.<field>,geo_distance:<lat>,<lon>,<distance> >> — a proximity
-filter (R11), e.g. C<items.home_geolocation,geo_distance:40.4168,-3.7038,10km>.
+filter, e.g. C<items.home_geolocation,geo_distance:40.4168,-3.7038,10km>.
 
 =item * C<< branch:<code> >> and C<< multibranchlimit:<group_id> >> — library
-limits (D8). They are expanded to branchcodes and routed to the nested channel
+limits. They are expanded to branchcodes and routed to the nested channel
 on C<items.homebranch> / C<items.holdingbranch> per C<SearchLimitLibrary>,
 instead of the flat query_string field, so they resolve on the same item.
 
 =item * C<< mc-itype:<code> >>, C<< mc-ccode:<code> >>, C<< mc-loc:<code> >> and
-C<< loc:<code> >> (DO-1) — advanced-search item-field limits (item type,
+C<< loc:<code> >> — advanced-search item-field limits (item type,
 collection, shelving location). They are routed to C<items.itype> /
 C<items.ccode> / C<items.location> so they combine same-item with the facets.
 C<mc-itemtype> is intentionally left flat (record-level item type).
@@ -544,7 +614,7 @@ sub _extract_item_filters {
             push @item_filters, { field => $field, value => $value };
         } elsif ( $limit =~ /^(mc-itype|mc-ccode|mc-loc|loc)(?:,[\w-]+)*:(.+)$/ ) {
 
-            # DO-1: advanced-search item-field limits (item type / collection /
+            # advanced-search item-field limits (item type / collection /
             # location). An optional CCL modifier (e.g. the ",phr" the advanced
             # search appends: "mc-itype,phr:CR") is tolerated and dropped: a
             # keyword term match is exact regardless. mc-itemtype is NOT matched
@@ -568,7 +638,7 @@ sub _extract_item_filters {
 
     my $filter = $builder->_item_operand_to_filter(\%spec, $value);
 
-Turns an advanced-search operand that targets an item field (Bug 46309, DO-2)
+Turns an advanced-search operand that targets an item field (Bug XXXXX)
 into an item-filter descriptor for the nested channel. C<%spec> is the entry
 from C<%ITEM_OPERAND_FIELDS> (subfield + kind). The raw operand C<$value> is
 used as-is (before any query_string cleaning/truncation):
@@ -577,11 +647,11 @@ used as-is (before any query_string cleaning/truncation):
 
 =item * C<term> — exact match, C<< { field => <sub>, value => $value } >>.
 
-=item * C<wildcard> (DO-4) — C<< { field => <sub>, wildcard => '*<value>*' } >>,
+=item * C<wildcard> — C<< { field => <sub>, wildcard => '*<value>*' } >>,
 with any wildcard metacharacters in C<$value> escaped so they are matched
 literally.
 
-=item * C<range> (DO-5) — C<< { field => <sub>, range => {...} } >>, parsing
+=item * C<range> — C<< { field => <sub>, range => {...} } >>, parsing
 C<$value> as a single date or a C<< from - to >> range.
 
 =back
@@ -612,7 +682,7 @@ sub _item_operand_to_filter {
 
     my $range = $builder->_parse_item_date_range('2020-01-01 - 2020-12-31');
 
-Parses an acquisition-date operand (Bug 46309, DO-5) into an Elasticsearch
+Parses an acquisition-date operand (Bug XXXXX) into an Elasticsearch
 C<range> hashref. A C<< from - to >> string (the C<st-date-normalized> separator
 is C<< space-dash-space >>) yields C<< { gte => from, lte => to } >>; either side
 may be C<*> for an open end. A single date yields C<< { gte => d, lte => d } >>,
@@ -639,8 +709,8 @@ sub _parse_item_date_range {
 
     my $filter = $builder->_library_limit_to_item_filter('multibranchlimit:5');
 
-Expands a C<branch:<code>> or C<multibranchlimit:<group_id>> limit (Bug 46309,
-D8) into an item-filter descriptor on the nested items object. The target
+Expands a C<branch:<code>> or C<multibranchlimit:<group_id>> limit
+(Bug XXXXX) into an item-filter descriptor on the nested items object. The target
 subfield follows C<SearchLimitLibrary>: C<homebranch>, C<holdingbranch> or, when
 set to both, a same-item disjunction of the two. Returns undef when the limit
 expands to no branchcode (e.g. an unknown or empty group), so the caller can
@@ -681,7 +751,7 @@ sub _library_limit_to_item_filter {
 
     my @tokens = $builder->library_limit_facet_tokens('branch:CPL');
 
-Given a single-library C<branch:<code>> limit (Bug 46309, D8), returns the list of
+Given a single-library C<branch:<code>> limit (Bug XXXXX), returns the list of
 C<items.<field>:<code>> facet tokens it is equivalent to once routed to the nested
 channel (following C<SearchLimitLibrary>: C<homebranch>, C<holdingbranch> or
 both). The UI uses this to mark the matching library facets as selected even
@@ -715,19 +785,19 @@ sub library_limit_facet_tokens {
 
     my @descriptions = $builder->_describe_item_filters($item_filters);
 
-Returns a list of human-readable "Label: Value" strings (Bug 46309, D4) for the
+Returns a list of human-readable "Label: Value" strings (Bug XXXXX) for the
 user-supplied item-level filters, so they can be shown in C<limit_desc> / the
 active-filters breadcrumb. C<item_filters> are no longer present in the limit
 list once L</_extract_item_filters> has moved them to the nested channel, so
 they would otherwise be invisible to the user.
 
 The item facet fields (homebranch, holdingbranch, itype, location, ccode) and
-the library limits (D8) are described: their codes are mapped to names reusing
+the library limits are described: their codes are mapped to names reusing
 the same sources as the facet builder (L<Koha::Libraries>, L<Koha::ItemTypes>
 and the C<LOC> / C<CCODE> authorised values). The routed item operands that are
-not facet fields (DO-2: barcode, call number, acquisition date) are described
-with their own labels. The on-request (D2) and patron-availability (F3c,
-C<available_for_patron>) filters get their own readable yes/no line. Other item
+not facet fields (barcode, call number, acquisition date) are described
+with their own labels. The on-request and patron-availability
+(C<available_for_patron>) filters get their own readable yes/no line. Other item
 filters (geo distance and the internal hiding / staff-availability filters) are
 left out of the breadcrumb.
 
@@ -779,7 +849,7 @@ sub _describe_item_filters {
     my @descriptions;
     for my $filter (@$item_filters) {
 
-        # Library limit (D8): one line listing the branch names, whether it
+        # Library limit: one line listing the branch names, whether it
         # targets homebranch, holdingbranch or both.
         if ( $filter->{branches} ) {
             my $names = $names_for->('homebranch');
@@ -791,7 +861,7 @@ sub _describe_item_filters {
 
         my $field = $filter->{field};
 
-        # On-request filter (D2): not a facet field, so describe it on its own
+        # On-request filter: not a facet field, so describe it on its own
         # with a readable yes/no line.
         if ( $field && $field eq 'onrequest' && exists $filter->{value} ) {
 
@@ -801,14 +871,14 @@ sub _describe_item_filters {
             next;
         }
 
-        # Patron-availability filter (F3c): not a facet field, so describe it on
+        # Patron-availability filter: not a facet field, so describe it on
         # its own with a readable yes/no line.
         if ( $field && $field eq 'available_for_patron' && exists $filter->{value} ) {
             push @descriptions, 'Available for hold or reference: ' . ( $filter->{value} ? 'Yes' : 'No' );
             next;
         }
 
-        # Routed item operands (DO-2) that are not facet fields: barcode, call
+        # Routed item operands that are not facet fields: barcode, call
         # number (wildcard) and acquisition date (range). Describe each with its
         # own label and a readable value.
         if ( $field && $ITEM_OPERAND_LABEL{$field} ) {
@@ -872,7 +942,7 @@ sub build_query_compat {
     my $search_param_query_str = '';
     my $limits                 = ();
 
-    # Readable descriptions of the item-level filters (Bug 46309, D4), kept so
+    # Readable descriptions of the item-level filters (Bug XXXXX), kept so
     # they can be appended to limit_desc once it is built further down.
     my @item_filter_descriptions;
 
@@ -889,7 +959,7 @@ sub build_query_compat {
 
         # Merge the indexes in with the search terms and the operands so that
         # each search thing is a handy unit, and in the same pass route the
-        # item-field operands to the nested channel (Bug 46309, DO-2/DO-3a). It
+        # item-field operands to the nested channel (Bug XXXXX). It
         # is only safe to pull item operands out as same-item filters when the
         # whole operand list is a pure AND; if any OR/NOT joins the rows, the
         # linear boolean structure cannot be decomposed, so every operand keeps
@@ -926,7 +996,7 @@ sub build_query_compat {
         # not carry a boolean operator or the query_string would start with it.
         $search_params[0]{operator} = undef if @search_params;
 
-        # Pull item-level limits (Bug 46309) out of the limit list before they
+        # Pull item-level limits (Bug XXXXX) out of the limit list before they
         # reach the query_string machinery: nested fields cannot be queried with
         # query_string, so they are routed through a structured nested query.
         # $user_item_filters are the ones the user chose (facets, onrequest and
@@ -947,7 +1017,7 @@ sub build_query_compat {
             push @auto_item_filters, { field => 'lost', value => '0' };
         }
 
-        # In the OPAC, hidden items must never match a search (Bug 46309, D6): a
+        # In the OPAC, hidden items must never match a search (Bug XXXXX): a
         # hidden item must not satisfy a same-item facet, so the hiding filters
         # are combined with the user filters in the same nested bool below. Both
         # subfields are boolean, hence the JSON::false value. Custom hiding is
@@ -959,7 +1029,7 @@ sub build_query_compat {
                 unless $params->{override_hidden_items};
         }
 
-        # Assemble the item clause(s) per the record-suppression rules (D7).
+        # Assemble the item clause(s) per the record-suppression rules.
         # Notation: U = user item filters, auto = the OPAC ones above,
         # H = OpacHiddenItemsHidesRecord.
         my @item_filter_clauses;
@@ -968,8 +1038,14 @@ sub build_query_compat {
             # With U: one nested over (auto AND U) as a hard filter. Records with
             # no matching/visible item -- including those with no items at all --
             # drop out, which is the intended behaviour when the user filters.
+            # when the caller wants the matching items (want_matched_items),
+            # request inner_hits on this nested so it can report which items
+            # matched and show only those in the results.
             push @item_filter_clauses,
-                $self->_build_item_filter_query( [ @auto_item_filters, @$user_item_filters ] );
+                $self->_build_item_filter_query(
+                [ @auto_item_filters, @$user_item_filters ],
+                { want_inner_hits => $params->{want_matched_items} }
+                );
         } elsif ( $params->{is_opac}
             && @auto_item_filters
             && C4::Context->preference('OpacHiddenItemsHidesRecord') )
@@ -1014,7 +1090,7 @@ sub build_query_compat {
         # If there's no query on the left, let's remove the junk left behind
         $query_str =~ s/^ AND //;
 
-        # Bug 46309: when all the search content was routed to the nested item
+        # Bug XXXXX: when all the search content was routed to the nested item
         # channel (item limits and/or operands) there is nothing left for the
         # query_string. Match every record with "*" and let the nested filter do
         # the narrowing -- e.g. "every CR item in library X" with an empty q.
@@ -1027,6 +1103,13 @@ sub build_query_compat {
         $options{skip_facets}             = $params->{skip_facets};
         $options{field_match_boost_query} = $field_match_boost_query if @$field_match_boost_query;
         $options{item_filter_clauses}     = \@item_filter_clauses    if @item_filter_clauses;
+
+        # Feed the same active item filters (auto hiding/lost + user facets) into
+        # the item facet aggregations so their counts respect the same-item
+        # constraint (Bug XXXXX fork fix; see _build_item_facet_aggregation). Only
+        # the same-item descriptors are passed, never the OpacHiddenItemsHidesRecord
+        # should/items_count:0 wrapper, so the counts track the visible items.
+        $options{item_facet_filters} = [ @auto_item_filters, @$user_item_filters ];
         $query                            = $self->build_query( $query_str, %options );
     }
 
@@ -1060,7 +1143,7 @@ sub build_query_compat {
     my $limit_desc;
     $limit_desc = "$limit" if $limit;
 
-    # Append the readable item filters (Bug 46309, D4); they live in the nested
+    # Append the readable item filters (Bug XXXXX); they live in the nested
     # channel and are otherwise absent from $limit / limit_desc.
     if (@item_filter_descriptions) {
         my $items_desc = join( ' and ', @item_filter_descriptions );

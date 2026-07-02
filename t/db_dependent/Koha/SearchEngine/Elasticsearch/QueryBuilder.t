@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 15;
+use Test::More tests => 16;
 
 use List::Util qw( all );
 
@@ -295,23 +295,25 @@ subtest 'build_query tests' => sub {
     t::lib::Mocks::mock_preference( 'DisplayLibraryFacets', 'both' );
     $query = $qb->build_query( 'test', %options );
 
-    # ccode, homebranch and holdingbranch are item facets (Bug 46309): they
-    # aggregate over the nested items object, so the terms size lives one level
-    # down, under the inner aggregation named after the facet.
+    # ccode, homebranch and holdingbranch are item facets (Bug XXXXX): they
+    # aggregate over the nested items object and, so their bucket counts respect
+    # the active item filters (own fork fix), the terms aggregation is wrapped in
+    # an item_filter sub-aggregation. The terms size therefore lives two levels
+    # down: under item_filter, then under the aggregation named after the facet.
     ok(
-        defined $query->{aggregations}{ccode}{aggs}{ccode}{terms}{size},
+        defined $query->{aggregations}{ccode}{aggs}{item_filter}{aggs}{ccode}{terms}{size},
         'we need to ask for a size or we get only 5 facet'
     );
     is(
-        $query->{aggregations}{ccode}{aggs}{ccode}{terms}{size}, 37,
+        $query->{aggregations}{ccode}{aggs}{item_filter}{aggs}{ccode}{terms}{size}, 37,
         'we ask for the size as defined by the syspref FacetMaxCount'
     );
     is(
-        $query->{aggregations}{homebranch}{aggs}{homebranch}{terms}{size}, 37,
+        $query->{aggregations}{homebranch}{aggs}{item_filter}{aggs}{homebranch}{terms}{size}, 37,
         'we ask for the size as defined by the syspref FacetMaxCount for homebranch'
     );
     is(
-        $query->{aggregations}{holdingbranch}{aggs}{holdingbranch}{terms}{size}, 37,
+        $query->{aggregations}{holdingbranch}{aggs}{item_filter}{aggs}{holdingbranch}{terms}{size}, 37,
         'we ask for the size as defined by the syspref FacetMaxCount for holdingbranch'
     );
 
@@ -726,7 +728,7 @@ subtest 'build_query tests' => sub {
         ['AND'], ['title:"donald duck"'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
     );
-    # Bug 46309 (DO-1): the mc-itype,phr item-type limits are routed to the nested
+    # Bug XXXXX: the mc-itype,phr item-type limits are routed to the nested
     # channel, so they leave the flat query_string (the author limit stays flat).
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
@@ -801,7 +803,7 @@ subtest 'build_query tests' => sub {
         ['AND'], ['kw:""'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
         );
-    # Bug 46309 (DO-1): only the flat author limit remains in $limit; the routed
+    # Bug XXXXX: only the flat author limit remains in $limit; the routed
     # item-type limits are described in limit_desc instead.
     is(
         $limit, 'author:("Dillinger Escaplan")',
@@ -1082,7 +1084,7 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
     my $query_builder =
         Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
 
-    # Bug 46309 (D8): branch / multibranchlimit limits are routed to the nested
+    # Bug XXXXX: branch / multibranchlimit limits are routed to the nested
     # items channel on items.homebranch / items.holdingbranch (terms), instead of
     # the flat query_string field, so they resolve on the same item. The raw
     # limit is still kept verbatim in limit_cgi for URL persistence.
@@ -1177,7 +1179,7 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
     $schema->storage->txn_rollback;
 };
 
-subtest 'library_limit_facet_tokens() tests (Bug 46309, D8)' => sub {
+subtest 'library_limit_facet_tokens() tests (Bug XXXXX)' => sub {
 
     plan tests => 8;
 
@@ -1481,7 +1483,7 @@ subtest "_build_field_match_boost_query() tests" => sub {
 
 };
 
-subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
+subtest 'item filters in limit_desc and limit_cgi (Bug XXXXX)' => sub {
     plan tests => 10;
 
     my $builder = t::lib::TestBuilder->new;
@@ -1506,7 +1508,7 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
         [ 'items.homebranch:' . $library->branchcode, 'items.itype:' . $itemtype->itemtype ],
         );
 
-    # D1: the raw items.* limits stay in limit_cgi so the facet stays active and
+    # the raw items.* limits stay in limit_cgi so the facet stays active and
     # survives pagination / sorting.
     like(
         $limit_cgi, qr/limit=items\.homebranch%3A\Q@{[ $library->branchcode ]}\E/,
@@ -1517,7 +1519,7 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
         'items.itype limit is preserved in limit_cgi'
     );
 
-    # D4: limit_desc shows the resolved names, not the raw codes.
+    # limit_desc shows the resolved names, not the raw codes.
     like( $limit_desc, qr/\QMy Item Filter Library\E/, 'limit_desc resolves the library code to its name' );
     like( $limit_desc, qr/\QMy Item Filter Type\E/,    'limit_desc resolves the item type code to its description' );
     unlike(
@@ -1525,12 +1527,12 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
         'limit_desc does not leak the raw items.<field> syntax'
     );
 
-    # Availability-only filters are not part of the readable breadcrumb (D4 scope).
+    # Availability-only filters are not part of the readable breadcrumb.
     ( undef, undef, undef, undef, undef, undef, undef, my $avail_desc ) =
         $qb->build_query_compat( undef, ['*'], undef, ['items.available:true'] );
     unlike( $avail_desc // '', qr/available/i, 'availability item filter is not described in limit_desc' );
 
-    # D2: the on-request user filter persists in limit_cgi and is described
+    # the on-request user filter persists in limit_cgi and is described
     # readably in limit_desc.
     ( undef, undef, undef, undef, undef, undef, my $onreq_cgi, my $onreq_desc ) =
         $qb->build_query_compat( undef, ['*'], undef, ['items.onrequest:false'] );
@@ -1540,7 +1542,7 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
     );
     like( $onreq_desc // '', qr/On request: No/, 'limit_desc describes the on-request filter readably' );
 
-    # F3c: the patron-availability user filter persists in limit_cgi and IS
+    # the patron-availability user filter persists in limit_cgi and IS
     # described readably in limit_desc (unlike the staff items.available above).
     ( undef, undef, undef, undef, undef, undef, my $afp_cgi, my $afp_desc ) =
         $qb->build_query_compat( undef, ['*'], undef, ['items.available_for_patron:true'] );
@@ -1554,7 +1556,7 @@ subtest 'item filters in limit_desc and limit_cgi (Bug 46309)' => sub {
     );
 };
 
-subtest 'advanced-search item operands and limits routed to nested (Bug 46309, DO-1/DO-2/DO-3a)' => sub {
+subtest 'advanced-search item operands and limits routed to nested (Bug XXXXX)' => sub {
     plan tests => 15;
 
     my $builder  = t::lib::TestBuilder->new;
@@ -1563,7 +1565,7 @@ subtest 'advanced-search item operands and limits routed to nested (Bug 46309, D
 
     my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
 
-    # DO-2: a barcode operand (item field) AND a title operand. The barcode is
+    # a barcode operand (item field) AND a title operand. The barcode is
     # pulled out to the nested channel; the title stays in the query_string.
     my ( undef, $query, undef, $query_cgi, undef, undef, undef, $limit_desc ) =
         $qb->build_query_compat(
@@ -1581,7 +1583,7 @@ subtest 'advanced-search item operands and limits routed to nested (Bug 46309, D
     like( $limit_desc // '', qr/Barcode: 12345/, 'the routed barcode operand is described in limit_desc' );
     like( $query_cgi, qr/idx=bc/, 'the barcode operand round-trips in query_cgi' );
 
-    # DO-3a: with an OR joining the rows, nothing is routed; the barcode stays
+    # with an OR joining the rows, nothing is routed; the barcode stays
     # flat in the query_string and there is no nested item filter.
     ( undef, $query ) = $qb->build_query_compat(
         ['OR'], [ '12345', 'foo' ], [ 'bc', 'ti' ],
@@ -1593,7 +1595,7 @@ subtest 'advanced-search item operands and limits routed to nested (Bug 46309, D
     );
     is_deeply( _first_nested_item_leaves($query), [], 'with OR, no nested item filter is built' );
 
-    # DO-5: an acquisition-date operand becomes a same-item range. As it is the
+    # an acquisition-date operand becomes a same-item range. As it is the
     # only operand, the text query falls back to "*".
     ( undef, $query, undef, undef, undef, undef, undef, $limit_desc ) =
         $qb->build_query_compat(
@@ -1614,7 +1616,7 @@ subtest 'advanced-search item operands and limits routed to nested (Bug 46309, D
         'the routed acqdate operand is described in limit_desc'
     );
 
-    # DO-1: the mc-itype advanced-search limit is routed to items.itype.
+    # the mc-itype advanced-search limit is routed to items.itype.
     ( undef, $query, undef, undef, undef, undef, my $limit_cgi, $limit_desc ) =
         $qb->build_query_compat(
         undef, ['*'], undef, [ 'mc-itype:' . $itemtype->itemtype ],
@@ -1662,7 +1664,7 @@ sub _first_nested_item_leaves {
 
 # Collect the term clauses of the hard nested item filter, keyed by field. Used
 # when a user filter is present, in which case the auto hiding filters are
-# combined with it in a single nested bool (D6 same-item coherence).
+# combined with it in a single nested bool (same-item coherence).
 sub _nested_item_term_filters {
     my ($query) = @_;
     my %found;
@@ -1677,7 +1679,7 @@ sub _nested_item_term_filters {
     return \%found;
 }
 
-subtest 'OPAC item hiding filters (Bug 46309, D6)' => sub {
+subtest 'OPAC item hiding filters (Bug XXXXX)' => sub {
     plan tests => 7;
 
     t::lib::Mocks::mock_preference( 'hidelostitems',              0 );
@@ -1725,7 +1727,7 @@ subtest 'OPAC item hiding filters (Bug 46309, D6)' => sub {
     );
 };
 
-subtest 'OPAC record suppression (Bug 46309, D7)' => sub {
+subtest 'OPAC record suppression (Bug XXXXX)' => sub {
     plan tests => 8;
 
     t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
@@ -1776,6 +1778,47 @@ subtest 'OPAC record suppression (Bug 46309, D7)' => sub {
         $qb->build_query_compat( undef, ['*'], undef, ['items.homebranch:CPL'], undef, 0, undef, { is_opac => 1 } );
     ok( $has_hard_nested->($query),       'a hard nested item filter is used when the user filters' );
     ok( !$has_items_count_zero->($query), 'no items_count:0 OR when the user filters (item-less records hidden)' );
+};
+
+subtest 'matched-item inner_hits (Bug XXXXX)' => sub {
+    plan tests => 4;
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    # Pull the same-item nested clause out of the assembled query.
+    my $nested_of = sub {
+        my ($query) = @_;
+        for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
+            return $clause->{nested} if ref $clause eq 'HASH' && $clause->{nested};
+        }
+        return undef;
+    };
+
+    # want_matched_items on: the nested item filter carries inner_hits limited to
+    # items.itemnumber, so search_compat can report the matching items.
+    my ( undef, $query ) = $qb->build_query_compat(
+        undef, ['*'], undef, ['items.homebranch:CPL'], undef, 0, undef,
+        { want_matched_items => 1 }
+    );
+    my $nested = $nested_of->($query);
+    ok( $nested, 'a nested item filter is assembled when the user filters' );
+    is_deeply(
+        $nested->{inner_hits},
+        { _source => ['items.itemnumber'], size => 50000 },
+        'inner_hits requested over items.itemnumber when want_matched_items is on'
+    );
+
+    # want_matched_items off: no inner_hits (default behaviour).
+    ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, ['items.homebranch:CPL'] );
+    $nested = $nested_of->($query);
+    ok( $nested && !exists $nested->{inner_hits}, 'no inner_hits when want_matched_items is off' );
+
+    # want_matched_items on but no item filter: no nested, hence no inner_hits.
+    ( undef, $query ) = $qb->build_query_compat(
+        undef, ['donald duck'], undef, undef, undef, 0, undef,
+        { want_matched_items => 1 }
+    );
+    ok( !$nested_of->($query), 'no nested (and no inner_hits) without item filters' );
 };
 
 $schema->storage->txn_rollback;

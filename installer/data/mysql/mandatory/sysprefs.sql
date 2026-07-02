@@ -811,6 +811,7 @@ INSERT INTO systempreferences ( `variable`, `value` ) VALUES
 ('StaffLoginLibraryBasedOnIP', '1'),
 ('StaffLoginRestrictLibraryByIP','0'),
 ('StaffSearchResultsDisplayBranch','holdingbranch'),
+('StaffSearchResultsShowOnlyMatchingItems','1'),
 ('StaffSerialIssueDisplayCount','3'),
 ('staffShibOnly','0'),
 ('StaticHoldsQueueWeight','0'),

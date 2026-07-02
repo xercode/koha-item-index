@@ -174,21 +174,26 @@ SKIP: {
 
     };
 
-    subtest "_convert_facets nested item facets (Bug 46309)" => sub {
+    subtest "_convert_facets nested item facets (Bug XXXXX)" => sub {
         plan tests => 7;
 
         $schema->storage->txn_begin;
 
         # homebranch is faceted and lives on the nested items object, so the
-        # aggregation is shaped as: items nested -> terms -> reverse_nested.
+        # aggregation is shaped as: items nested -> item_filter -> terms ->
+        # reverse_nested. The item_filter level applies the active item filters
+        # (Bug XXXXX fork fix), so the buckets live under it.
         my $es_facets = {
             homebranch => {
-                doc_count  => 7,
-                homebranch => {
-                    buckets => [
-                        { key => 'CPL', doc_count => 5, record_count => { doc_count => 3 } },
-                        { key => 'MPL', doc_count => 2, record_count => { doc_count => 2 } },
-                    ],
+                doc_count   => 7,
+                item_filter => {
+                    doc_count  => 7,
+                    homebranch => {
+                        buckets => [
+                            { key => 'CPL', doc_count => 5, record_count => { doc_count => 3 } },
+                            { key => 'MPL', doc_count => 2, record_count => { doc_count => 2 } },
+                        ],
+                    },
                 },
             },
         };
@@ -202,7 +207,7 @@ SKIP: {
         is( $count_by_value{CPL}, 3, "CPL count comes from reverse_nested (records), not the item doc_count" );
         is( $count_by_value{MPL}, 2, "MPL count comes from reverse_nested (records)" );
 
-        # Bug 46309 (D1): item facets link through the nested "items.<field>"
+        # Bug XXXXX: item facets link through the nested "items.<field>"
         # prefix so the limit reaches the same-item nested filter channel.
         is(
             $koha_facets->[0]->{type_link_value}, 'items.homebranch',

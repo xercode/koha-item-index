@@ -419,8 +419,8 @@ subtest '_create_query_string' => sub {
 
 };
 
-subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
-    plan tests => 9;
+subtest '_build_item_filter_query() tests (Bug XXXXX)' => sub {
+    plan tests => 12;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -482,7 +482,7 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
     );
     is( scalar @{ $combined->{nested}{query}{bool}{filter} }, 2, 'term and geo filters share the same nested bool' );
 
-    # D8: a multi-value library limit becomes a terms filter.
+    # a multi-value library limit becomes a terms filter.
     my $terms = $qb->_build_item_filter_query( [ { field => 'homebranch', values => [ 'CPL', 'MPL' ] } ] );
     is_deeply(
         $terms->{nested}{query}{bool}{filter},
@@ -490,7 +490,7 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
         'a values entry becomes a terms filter on the same item'
     );
 
-    # D8: a "both branches" limit becomes a same-item should of two terms.
+    # a "both branches" limit becomes a same-item should of two terms.
     my $both = $qb->_build_item_filter_query(
         [
             {
@@ -549,7 +549,7 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
         'same-field values merge while different fields stay separate, order preserved'
     );
 
-    # DO-4: a wildcard leaf (e.g. a call-number operand) is built verbatim and is
+    # a wildcard leaf (e.g. a call-number operand) is built verbatim and is
     # never merged with the term/terms slots.
     my $wildcard = $qb->_build_item_filter_query(
         [
@@ -566,7 +566,7 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
         'a wildcard leaf is built same-item alongside a term, unmerged'
     );
 
-    # DO-5: a range leaf (acquisition-date operand) is built on the date subfield.
+    # a range leaf (acquisition-date operand) is built on the date subfield.
     my $range = $qb->_build_item_filter_query(
         [ { field => 'dateaccessioned', range => { gte => '2020-01-01', lte => '2020-12-31' } } ] );
     is_deeply(
@@ -574,9 +574,29 @@ subtest '_build_item_filter_query() tests (Bug 46309)' => sub {
         [ { range => { 'items.dateaccessioned' => { gte => '2020-01-01', lte => '2020-12-31' } } } ],
         'a range leaf becomes a range clause on the same item'
     );
+
+    # without want_inner_hits the nested carries no inner_hits.
+    my $no_ih = $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ] );
+    ok( !exists $no_ih->{nested}{inner_hits}, 'no inner_hits requested by default' );
+
+    my $no_ih2 = $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ], { want_inner_hits => 0 } );
+    ok( !exists $no_ih2->{nested}{inner_hits}, 'no inner_hits when want_inner_hits is false' );
+
+    # with want_inner_hits the nested asks ES which items matched, limited
+    # to items.itemnumber and capped at the matched-items window (50000, kept in
+    # sync with index.max_inner_result_window in index_config.yaml).
+    my $with_ih = $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ], { want_inner_hits => 1 } );
+    is_deeply(
+        $with_ih->{nested}{inner_hits},
+        {
+            _source => ['items.itemnumber'],
+            size    => 50000,
+        },
+        'want_inner_hits adds inner_hits over items.itemnumber capped at the window'
+    );
 };
 
-subtest '_extract_item_filters() tests (Bug 46309)' => sub {
+subtest '_extract_item_filters() tests (Bug XXXXX)' => sub {
     plan tests => 11;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
@@ -602,9 +622,9 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         'a "true" value is coerced to a JSON boolean'
     );
 
-    # D3-C: the availability control emits items.available:true, which is routed
+    # the availability control emits items.available:true, which is routed
     # to the same nested channel as the library facet so they resolve on the
-    # same item (R1).
+    # same item.
     is_deeply(
         $item_filters->[2], { field => 'available', value => JSON::true },
         'the items.available limit is parsed into the nested channel'
@@ -615,7 +635,7 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         'a geo_distance item limit is parsed'
     );
 
-    # DO-1: advanced-search item-field limits are routed to the nested channel.
+    # advanced-search item-field limits are routed to the nested channel.
     my ( $mc_filters, $mc_remaining ) = $qb->_extract_item_filters(
         [
             'mc-itype:CR',
@@ -653,9 +673,9 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
         'a ",phr" modifier on an item-field limit is tolerated and routed'
     );
 
-    # F3c: the patron-facing availability control emits
+    # the patron-facing availability control emits
     # items.available_for_patron:true, routed to the same nested channel as the
-    # staff items.available, so it resolves same-item (R1) with the facets.
+    # staff items.available, so it resolves same-item with the facets.
     my ($afp) = $qb->_extract_item_filters( ['items.available_for_patron:true'] );
     is_deeply(
         $afp, [ { field => 'available_for_patron', value => JSON::true } ],
@@ -663,7 +683,7 @@ subtest '_extract_item_filters() tests (Bug 46309)' => sub {
     );
 };
 
-subtest '_item_operand_to_filter() tests (Bug 46309, DO-2)' => sub {
+subtest '_item_operand_to_filter() tests (Bug XXXXX)' => sub {
     plan tests => 7;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
@@ -712,8 +732,8 @@ subtest '_item_operand_to_filter() tests (Bug 46309, DO-2)' => sub {
     );
 };
 
-subtest '_build_item_facet_aggregation() tests (Bug 46309)' => sub {
-    plan tests => 1;
+subtest '_build_item_facet_aggregation() tests (Bug XXXXX)' => sub {
+    plan tests => 3;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -722,13 +742,44 @@ subtest '_build_item_facet_aggregation() tests (Bug 46309)' => sub {
         {
             nested => { path => 'items' },
             aggs   => {
-                homebranch => {
-                    terms => { field => 'items.homebranch', size => 30 },
-                    aggs  => { record_count => { reverse_nested => {} } },
+                item_filter => {
+                    filter => { bool => { filter => [] } },
+                    aggs   => {
+                        homebranch => {
+                            terms => { field => 'items.homebranch', size => 30 },
+                            aggs  => { record_count => { reverse_nested => {} } },
+                        },
+                    },
                 },
             },
         },
-        'item facet is a nested aggregation with a reverse_nested record count'
+        'item facet wraps the reverse_nested terms in an empty item_filter (no active filters)'
+    );
+
+    is_deeply(
+        $qb->_build_item_facet_aggregation( 'homebranch', 30, [] ),
+        $qb->_build_item_facet_aggregation( 'homebranch', 30 ),
+        'an empty clause list is equivalent to passing none (match-all, counts unchanged)'
+    );
+
+    my @clauses = ( { term => { 'items.itype' => 'BK' } } );
+    is_deeply(
+        $qb->_build_item_facet_aggregation( 'homebranch', 30, \@clauses ),
+        {
+            nested => { path => 'items' },
+            aggs   => {
+                item_filter => {
+                    filter => { bool => { filter => \@clauses } },
+                    aggs   => {
+                        homebranch => {
+                            terms => { field => 'items.homebranch', size => 30 },
+                            aggs  => { record_count => { reverse_nested => {} } },
+                        },
+                    },
+                },
+            },
+        },
+        'active item-filter clauses are applied inside the item_filter sub-agg (same-item counts)'
     );
 };
 
