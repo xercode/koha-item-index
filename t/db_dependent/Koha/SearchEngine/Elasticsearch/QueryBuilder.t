@@ -728,6 +728,7 @@ subtest 'build_query tests' => sub {
         ['AND'], ['title:"donald duck"'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
     );
+
     # Bug XXXXX: the mc-itype,phr item-type limits are routed to the nested
     # channel, so they leave the flat query_string (the author limit stays flat).
     is(
@@ -803,6 +804,7 @@ subtest 'build_query tests' => sub {
         ['AND'], ['kw:""'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
         );
+
     # Bug XXXXX: only the flat author limit remains in $limit; the routed
     # item-type limits are described in limit_desc instead.
     is(
@@ -1502,11 +1504,10 @@ subtest 'item filters in limit_desc and limit_cgi (Bug XXXXX)' => sub {
 
     my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
 
-    my ( undef, undef, undef, undef, undef, undef, $limit_cgi, $limit_desc ) =
-        $qb->build_query_compat(
+    my ( undef, undef, undef, undef, undef, undef, $limit_cgi, $limit_desc ) = $qb->build_query_compat(
         undef, ['*'], undef,
         [ 'items.homebranch:' . $library->branchcode, 'items.itype:' . $itemtype->itemtype ],
-        );
+    );
 
     # the raw items.* limits stay in limit_cgi so the facet stays active and
     # survives pagination / sorting.
@@ -1559,35 +1560,34 @@ subtest 'item filters in limit_desc and limit_cgi (Bug XXXXX)' => sub {
 subtest 'advanced-search item operands and limits routed to nested (Bug XXXXX)' => sub {
     plan tests => 15;
 
-    my $builder  = t::lib::TestBuilder->new;
-    my $itemtype = $builder->build_object(
-        { class => 'Koha::ItemTypes', value => { description => 'Operand Test Type' } } );
+    my $builder = t::lib::TestBuilder->new;
+    my $itemtype =
+        $builder->build_object( { class => 'Koha::ItemTypes', value => { description => 'Operand Test Type' } } );
 
     my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
 
     # a barcode operand (item field) AND a title operand. The barcode is
     # pulled out to the nested channel; the title stays in the query_string.
-    my ( undef, $query, undef, $query_cgi, undef, undef, undef, $limit_desc ) =
-        $qb->build_query_compat(
+    my ( undef, $query, undef, $query_cgi, undef, undef, undef, $limit_desc ) = $qb->build_query_compat(
         ['AND'], [ '12345', 'foo' ], [ 'bc', 'ti' ],
         undef, undef, undef, undef, { skip_facets => 1 }
-        );
+    );
     my $qstr = $query->{query}{bool}{must}[0]{query_string}{query};
-    like( $qstr,   qr/foo/,    'the title operand stays in the query_string' );
-    unlike( $qstr, qr/12345/,  'the barcode operand is removed from the query_string' );
+    like( $qstr, qr/foo/, 'the title operand stays in the query_string' );
+    unlike( $qstr, qr/12345/, 'the barcode operand is removed from the query_string' );
     is_deeply(
         _first_nested_item_leaves($query),
         [ { term => { 'items.barcode' => '12345' } } ],
         'the barcode operand becomes a same-item nested term'
     );
     like( $limit_desc // '', qr/Barcode: 12345/, 'the routed barcode operand is described in limit_desc' );
-    like( $query_cgi, qr/idx=bc/, 'the barcode operand round-trips in query_cgi' );
+    like( $query_cgi,        qr/idx=bc/,         'the barcode operand round-trips in query_cgi' );
 
     # with an OR joining the rows, nothing is routed; the barcode stays
     # flat in the query_string and there is no nested item filter.
     ( undef, $query ) = $qb->build_query_compat(
         ['OR'], [ '12345', 'foo' ], [ 'bc', 'ti' ],
-        undef, undef, undef, undef, { skip_facets => 1 }
+        undef,  undef, undef, undef, { skip_facets => 1 }
     );
     like(
         $query->{query}{bool}{must}[0]{query_string}{query}, qr/barcode/,
@@ -1597,11 +1597,10 @@ subtest 'advanced-search item operands and limits routed to nested (Bug XXXXX)' 
 
     # an acquisition-date operand becomes a same-item range. As it is the
     # only operand, the text query falls back to "*".
-    ( undef, $query, undef, undef, undef, undef, undef, $limit_desc ) =
-        $qb->build_query_compat(
+    ( undef, $query, undef, undef, undef, undef, undef, $limit_desc ) = $qb->build_query_compat(
         undef, ['2020-01-01 - 2020-12-31'], ['acqdate,st-date-normalized'],
         undef, undef, undef, undef, { skip_facets => 1 }
-        );
+    );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query}, '*',
         'with only an item operand, the query_string falls back to *'
@@ -1617,11 +1616,10 @@ subtest 'advanced-search item operands and limits routed to nested (Bug XXXXX)' 
     );
 
     # the mc-itype advanced-search limit is routed to items.itype.
-    ( undef, $query, undef, undef, undef, undef, my $limit_cgi, $limit_desc ) =
-        $qb->build_query_compat(
+    ( undef, $query, undef, undef, undef, undef, my $limit_cgi, $limit_desc ) = $qb->build_query_compat(
         undef, ['*'], undef, [ 'mc-itype:' . $itemtype->itemtype ],
         undef, undef, undef, { skip_facets => 1 }
-        );
+    );
     is_deeply(
         _first_nested_item_leaves($query),
         [ { term => { 'items.itype' => $itemtype->itemtype } } ],
@@ -1637,7 +1635,7 @@ subtest 'advanced-search item operands and limits routed to nested (Bug XXXXX)' 
     # the nested filter (not an empty text query, which matches nothing) drives
     # the results -- e.g. "every item of a type in a library" without a keyword.
     ( undef, $query ) = $qb->build_query_compat(
-        undef, [''], undef, [ 'mc-itype:' . $itemtype->itemtype ],
+        undef, [''],  undef, [ 'mc-itype:' . $itemtype->itemtype ],
         undef, undef, undef, { skip_facets => 1 }
     );
     is(
@@ -1769,7 +1767,7 @@ subtest 'OPAC record suppression (Bug XXXXX)' => sub {
     # OPAC, no user filter, H off: no suppression and no hard nested filter.
     t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 0 );
     ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
-    ok( !$suppression->($query),  'no suppression clause when H is off' );
+    ok( !$suppression->($query),     'no suppression clause when H is off' );
     ok( !$has_hard_nested->($query), 'no hard nested item filter without a user filter when H is off' );
 
     # OPAC, user filter present, H on: hard nested filter, no items_count OR.

@@ -462,7 +462,7 @@ subtest '_build_item_filter_query() tests (Bug XXXXX)' => sub {
                         filter => [
                             {
                                 geo_distance => {
-                                    distance              => '10km',
+                                    distance                 => '10km',
                                     'items.home_geolocation' => { lat => 40.4168, lon => -3.7038 },
                                 }
                             }
@@ -579,13 +579,15 @@ subtest '_build_item_filter_query() tests (Bug XXXXX)' => sub {
     my $no_ih = $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ] );
     ok( !exists $no_ih->{nested}{inner_hits}, 'no inner_hits requested by default' );
 
-    my $no_ih2 = $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ], { want_inner_hits => 0 } );
+    my $no_ih2 =
+        $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ], { want_inner_hits => 0 } );
     ok( !exists $no_ih2->{nested}{inner_hits}, 'no inner_hits when want_inner_hits is false' );
 
     # with want_inner_hits the nested asks ES which items matched, limited
     # to items.itemnumber and capped at the matched-items window (50000, kept in
     # sync with index.max_inner_result_window in index_config.yaml).
-    my $with_ih = $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ], { want_inner_hits => 1 } );
+    my $with_ih =
+        $qb->_build_item_filter_query( [ { field => 'homebranch', value => 'CPL' } ], { want_inner_hits => 1 } );
     is_deeply(
         $with_ih->{nested}{inner_hits},
         {
@@ -713,9 +715,7 @@ subtest '_item_operand_to_filter() tests (Bug XXXXX)' => sub {
     );
 
     is_deeply(
-        $qb->_item_operand_to_filter(
-            { subfield => 'dateaccessioned', kind => 'range' }, '2020-01-01 - 2020-12-31'
-        ),
+        $qb->_item_operand_to_filter( { subfield => 'dateaccessioned', kind => 'range' }, '2020-01-01 - 2020-12-31' ),
         { field => 'dateaccessioned', range => { gte => '2020-01-01', lte => '2020-12-31' } },
         'a "from - to" value becomes a bounded range'
     );
@@ -746,7 +746,7 @@ subtest '_build_item_facet_aggregation() tests (Bug XXXXX)' => sub {
                     filter => { bool => { filter => [] } },
                     aggs   => {
                         homebranch => {
-                            terms => { field => 'items.homebranch', size => 30 },
+                            terms => { field        => 'items.homebranch', size => 30 },
                             aggs  => { record_count => { reverse_nested => {} } },
                         },
                     },
@@ -772,7 +772,7 @@ subtest '_build_item_facet_aggregation() tests (Bug XXXXX)' => sub {
                     filter => { bool => { filter => \@clauses } },
                     aggs   => {
                         homebranch => {
-                            terms => { field => 'items.homebranch', size => 30 },
+                            terms => { field        => 'items.homebranch', size => 30 },
                             aggs  => { record_count => { reverse_nested => {} } },
                         },
                     },

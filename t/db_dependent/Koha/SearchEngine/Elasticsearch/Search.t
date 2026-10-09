@@ -204,8 +204,8 @@ SKIP: {
         my %count_by_value =
             map { $_->{facet_link_value} => $_->{facet_count} } @{ $koha_facets->[0]->{facets} };
         is( scalar keys %count_by_value, 2, "Both nested buckets are converted to facets" );
-        is( $count_by_value{CPL}, 3, "CPL count comes from reverse_nested (records), not the item doc_count" );
-        is( $count_by_value{MPL}, 2, "MPL count comes from reverse_nested (records)" );
+        is( $count_by_value{CPL},        3, "CPL count comes from reverse_nested (records), not the item doc_count" );
+        is( $count_by_value{MPL},        2, "MPL count comes from reverse_nested (records)" );
 
         # Bug XXXXX: item facets link through the nested "items.<field>"
         # prefix so the limit reaches the same-item nested filter channel.

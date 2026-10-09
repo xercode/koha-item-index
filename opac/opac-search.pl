@@ -904,14 +904,15 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
             # toggle link can rebuild a clean URL without it (colon is escaped to
             # %3A in limit_cgi).
             my $limit_cgi_not_onrequest = $limit_cgi;
-            $limit_cgi_not_onrequest =~ s/&limit=items\.onrequest%3A(?:true|false)//g if defined $limit_cgi_not_onrequest;
+            $limit_cgi_not_onrequest =~ s/&limit=items\.onrequest%3A(?:true|false)//g
+                if defined $limit_cgi_not_onrequest;
             $template->param( limit_cgi_not_onrequest => $limit_cgi_not_onrequest );
             $template->param( limit_cgi               => $limit_cgi );
-            $template->param( countrss                  => $countRSS );
-            $template->param( query_cgi                 => $query_cgi );
-            $template->param( query_desc                => $query_desc );
-            $template->param( limit_desc                => $limit_desc );
-            $template->param( offset                    => $offset );
+            $template->param( countrss                => $countRSS );
+            $template->param( query_cgi               => $query_cgi );
+            $template->param( query_desc              => $query_desc );
+            $template->param( limit_desc              => $limit_desc );
+            $template->param( offset                  => $offset );
 
             if ( $query_desc || $limit_desc ) {
                 $template->param( searchdesc => 1 );

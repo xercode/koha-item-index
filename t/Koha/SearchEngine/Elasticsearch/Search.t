@@ -228,7 +228,7 @@ subtest 'matched_itemnumbers (Bug XXXXX)' => sub {
     is( $search->matched_itemnumbers( {} ), undef, 'no inner_hits => undef (do not filter)' );
 
     is_deeply(
-        $search->matched_itemnumbers( $hit->( 0 ) ),
+        $search->matched_itemnumbers( $hit->(0) ),
         [],
         'an empty match set is an empty arrayref (record has items but none match)'
     );
@@ -237,13 +237,17 @@ subtest 'matched_itemnumbers (Bug XXXXX)' => sub {
     is( $search->matched_itemnumbers( $hit->( 3, 1, 2 ) ), undef, 'truncated match set => undef (do not filter)' );
 
     # total reported as a plain scalar (older ES style) is honoured too.
-    my $scalar_total = {
-        inner_hits => { items => { hits => { total => 1, hits => [ { _source => { itemnumber => 9 } } ] } } } };
+    my $scalar_total =
+        { inner_hits => { items => { hits => { total => 1, hits => [ { _source => { itemnumber => 9 } } ] } } } };
     is_deeply( $search->matched_itemnumbers($scalar_total), [9], 'scalar total form is handled' );
 
     # A path-prefixed _source shape (items.itemnumber) is tolerated.
     my $prefixed = {
-        inner_hits => { items => { hits => { total => { value => 1 }, hits => [ { _source => { items => { itemnumber => 5 } } } ] } } } };
+        inner_hits => {
+            items =>
+                { hits => { total => { value => 1 }, hits => [ { _source => { items => { itemnumber => 5 } } } ] } }
+        }
+    };
     is_deeply( $search->matched_itemnumbers($prefixed), [5], 'path-prefixed _source shape is handled' );
 };
 

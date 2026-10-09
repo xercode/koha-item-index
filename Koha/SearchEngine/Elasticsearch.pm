@@ -983,7 +983,7 @@ sub _get_item_documents {
     my %intransit;
     my $transfers = Koha::Item::Transfers->search(
         {
-            itemnumber    => { -in => \@itemnumbers },
+            itemnumber    => { -in  => \@itemnumbers },
             datesent      => { '!=' => undef },
             datearrived   => undef,
             datecancelled => undef,
@@ -1023,34 +1023,35 @@ sub _get_item_documents {
     for my $item (@items) {
         my $itemnumber = $item->itemnumber;
         my $document   = {
-            itemnumber                    => $itemnumber + 0,
-            homebranch                    => $item->homebranch,
-            holdingbranch                 => $item->holdingbranch,
-            itype                         => $item->itype,
-            location                      => $item->location,
-            permanent_location            => $item->permanent_location,
-            ccode                         => $item->ccode,
-            callnumber                    => $item->itemcallnumber,
-            cn_sort                       => $item->cn_sort,
-            barcode                       => $item->barcode,
-            enumchron                     => $item->enumchron,
-            restricted                    => $item->restricted,
-            notforloan                    => $item->notforloan,
-            onloan                        => $item->onloan,
-            damaged                       => $item->damaged,
-            lost                          => $item->itemlost,
-            withdrawn                     => $item->withdrawn,
-            intransit                     => $intransit{$itemnumber} ? \1 : \0,
-            onhold                        => $onhold{$itemnumber}    ? \1 : \0,
-            onrequest                     => $onrequest{$itemnumber} ? \1 : \0,
-            available                     => ( !$item->onloan && !$item->itemlost ) ? \1 : \0,
-            available_for_patron          =>
+            itemnumber           => $itemnumber + 0,
+            homebranch           => $item->homebranch,
+            holdingbranch        => $item->holdingbranch,
+            itype                => $item->itype,
+            location             => $item->location,
+            permanent_location   => $item->permanent_location,
+            ccode                => $item->ccode,
+            callnumber           => $item->itemcallnumber,
+            cn_sort              => $item->cn_sort,
+            barcode              => $item->barcode,
+            enumchron            => $item->enumchron,
+            restricted           => $item->restricted,
+            notforloan           => $item->notforloan,
+            onloan               => $item->onloan,
+            damaged              => $item->damaged,
+            lost                 => $item->itemlost,
+            withdrawn            => $item->withdrawn,
+            intransit            => $intransit{$itemnumber}                ? \1 : \0,
+            onhold               => $onhold{$itemnumber}                   ? \1 : \0,
+            onrequest            => $onrequest{$itemnumber}                ? \1 : \0,
+            available            => ( !$item->onloan && !$item->itemlost ) ? \1 : \0,
+            available_for_patron =>
                 $self->_item_available_for_patron( $item, $intransit{$itemnumber}, $blocking_hold{$itemnumber} )
-                ? \1
-                : \0,
+            ? \1
+            : \0,
             hidden_in_opac_custom         => $self->_item_hidden_in_opac_custom($item) ? \1 : \0,
-            hidden_in_opac_by_preferences =>
-                $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } ) ? \1 : \0,
+            hidden_in_opac_by_preferences => $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } )
+            ? \1
+            : \0,
         };
 
         # date_of_acquisition (search field) lives on items.dateaccessioned. The
@@ -1093,8 +1094,7 @@ sub _item_hidden_in_opac_custom {
 
     return 0 unless C4::Context->config('enable_plugins');
 
-    my @plugins = grep { $_->can('item_hidden_in_opac') }
-        Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
+    my @plugins = grep { $_->can('item_hidden_in_opac') } Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
 
     for my $plugin (@plugins) {
         my $hidden = eval { $plugin->item_hidden_in_opac( { item => $item } ) };
@@ -1156,8 +1156,8 @@ sub _item_available_for_patron {
     my ( $self, $item, $intransit, $blocked_by_hold ) = @_;
 
     if ( C4::Context->config('enable_plugins') ) {
-        my @plugins = grep { $_->can('item_available_for_patron') }
-            Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
+        my @plugins =
+            grep { $_->can('item_available_for_patron') } Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
 
         my $saw_true = 0;
         for my $plugin (@plugins) {
@@ -1174,22 +1174,22 @@ sub _item_available_for_patron {
                 warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
                 next;
             }
-            next unless defined $value;    # abstention
-            return 0 unless $value;        # defined false: not available, short-circuit
+            next     unless defined $value;    # abstention
+            return 0 unless $value;            # defined false: not available, short-circuit
             $saw_true = 1;
         }
-        return 1 if $saw_true;             # some true, no false: available
+        return 1 if $saw_true;                 # some true, no false: available
     }
 
     # Default conditions (no plugin opinion): not available if any of these holds.
     # `onloan` is deliberately NOT a condition: a checked-out item can still be
     # placed on hold by a patron (see C4::Reserves::IsAvailableForItemLevelRequest,
     # which never excludes on-loan items).
-    return 0 if $item->itemlost;           # non-zero
-    return 0 if $item->withdrawn;          # truthy
-    return 0 if $item->damaged;            # truthy
-    return 0 if $intransit;                # derived from branchtransfers
-    return 0 if $blocked_by_hold;          # active hold found IN ('W','T','P')
+    return 0 if $item->itemlost;     # non-zero
+    return 0 if $item->withdrawn;    # truthy
+    return 0 if $item->damaged;      # truthy
+    return 0 if $intransit;          # derived from branchtransfers
+    return 0 if $blocked_by_hold;    # active hold found IN ('W','T','P')
 
     return 1;
 }
