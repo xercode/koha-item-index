@@ -209,7 +209,7 @@ subtest 'the hook receives intransit and blocked_by_hold' => sub {
     sub item_available_for_patron {
         my ( $self, $params ) = @_;
         $self->{params} = $params;
-        return undef;    # abstain
+        return;    # abstain
     }
 
     sub get_metadata { return { name => 'Koha::Test::SpyAvailPlugin' }; }

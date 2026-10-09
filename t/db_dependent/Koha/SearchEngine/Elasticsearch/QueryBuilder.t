@@ -1091,11 +1091,9 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
     # the flat query_string field, so they resolve on the same item. The raw
     # limit is still kept verbatim in limit_cgi for URL persistence.
     my $nested_leaf = sub {
-        my ($query) = @_;
-        for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
-            return $clause->{nested}{query}{bool}{filter}[0] if ref $clause eq 'HASH' && $clause->{nested};
-        }
-        return undef;
+        my ($query)  = @_;
+        my ($nested) = grep { ref $_ eq 'HASH' && $_->{nested} } @{ $query->{query}{bool}{filter} || [] };
+        return $nested ? $nested->{nested}{query}{bool}{filter}[0] : undef;
     };
 
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'both' );
@@ -1834,10 +1832,9 @@ subtest 'OPAC record suppression (Bug XXXXX)' => sub {
     # The suppression clause is a bool.should: nested(auto) OR items_count:0.
     my $suppression = sub {
         my ($query) = @_;
-        for my $clause ( @{ $filter_clauses->($query) } ) {
-            return $clause if ref $clause eq 'HASH' && $clause->{bool} && $clause->{bool}{should};
-        }
-        return undef;
+        my ($clause) =
+            grep { ref $_ eq 'HASH' && $_->{bool} && $_->{bool}{should} } @{ $filter_clauses->($query) };
+        return $clause;
     };
     my $has_items_count_zero = sub {
         my ($query) = @_;
@@ -1882,11 +1879,9 @@ subtest 'matched-item inner_hits (Bug XXXXX)' => sub {
 
     # Pull the same-item nested clause out of the assembled query.
     my $nested_of = sub {
-        my ($query) = @_;
-        for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
-            return $clause->{nested} if ref $clause eq 'HASH' && $clause->{nested};
-        }
-        return undef;
+        my ($query)  = @_;
+        my ($clause) = grep { ref $_ eq 'HASH' && $_->{nested} } @{ $query->{query}{bool}{filter} || [] };
+        return $clause ? $clause->{nested} : undef;
     };
 
     # want_matched_items on: the nested item filter carries inner_hits limited to
