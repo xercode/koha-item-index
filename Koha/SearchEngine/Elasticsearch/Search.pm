@@ -190,9 +190,9 @@ sub search_compat {
     my @matched_itemnumbers;
 
     foreach my $es_record ( @{ $hits->{'hits'} } ) {
-        $records[$index]              = $self->decode_record_from_result( $es_record->{'_source'} );
-        $matched_itemnumbers[$index]  = $self->matched_itemnumbers($es_record);
-        $scores[ $index++ ]           = $es_record->{'_score'};
+        $records[$index]             = $self->decode_record_from_result( $es_record->{'_source'} );
+        $matched_itemnumbers[$index] = $self->matched_itemnumbers($es_record);
+        $scores[ $index++ ]          = $es_record->{'_score'};
     }
 
     # consumers of this expect a name-spaced result, we provide the default

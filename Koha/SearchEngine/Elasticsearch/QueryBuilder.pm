@@ -430,8 +430,8 @@ sub _item_filter_clauses {
     # filters (term/terms) on the same field are accumulated into one slot so
     # they collapse to a single OR-ing terms clause; geo_distance and should
     # disjunctions are never merged and keep their own slot.
-    my @slots;          # ordered: { leaf => \%clause } or { field => $f, values => [], seen => {} }
-    my %field_slot;     # field name => index into @slots
+    my @slots;         # ordered: { leaf => \%clause } or { field => $f, values => [], seen => {} }
+    my %field_slot;    # field name => index into @slots
 
     for my $filter (@$item_filters) {
         if (   $filter->{should}
@@ -445,7 +445,7 @@ sub _item_filter_clauses {
             next;
         }
 
-        my $field = $filter->{field};
+        my $field  = $filter->{field};
         my @values = exists $filter->{values} ? @{ $filter->{values} } : ( $filter->{value} );
 
         unless ( defined $field_slot{$field} ) {
@@ -470,7 +470,7 @@ sub _item_filter_clauses {
         push @clauses,
             @$values > 1
             ? { terms => { "items.$slot->{field}" => $values } }
-            : { term => { "items.$slot->{field}" => $values->[0] } };
+            : { term  => { "items.$slot->{field}" => $values->[0] } };
     }
 
     return \@clauses;
@@ -698,7 +698,7 @@ sub _parse_item_date_range {
     if ( $value =~ /^(.*?) - (.*)$/ ) {
         my ( $from, $to ) = ( $1, $2 );
         $range{gte} = $from if defined $from && $from ne '' && $from ne '*';
-        $range{lte} = $to   if defined $to   && $to   ne '' && $to   ne '*';
+        $range{lte} = $to   if defined $to   && $to ne ''   && $to ne '*';
     } else {
         $range{gte} = $range{lte} = $value;
     }
@@ -812,7 +812,7 @@ sub _describe_item_filters {
     # availability-only or geo-only query.
     return ()
         unless grep {
-        ( $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} )
+               ( $_->{field} && $ITEM_FACET_FIELDS{ $_->{field} } && exists $_->{value} )
             || ( $_->{field} && $_->{field} eq 'onrequest'            && exists $_->{value} )
             || ( $_->{field} && $_->{field} eq 'available_for_patron' && exists $_->{value} )
             || ( $_->{field}
@@ -890,7 +890,7 @@ sub _describe_item_filters {
                     : ( defined $from && defined $to )                 ? "$from to $to"
                     : defined $from                                    ? "from $from"
                     : defined $to                                      ? "until $to"
-                    :                                                     '';
+                    :                                                    '';
                 push @descriptions, "$label: $desc" if $desc ne '';
             } elsif ( exists $filter->{wildcard} ) {
                 ( my $disp = $filter->{wildcard} ) =~ s/^\*(.*)\*$/$1/;
@@ -972,7 +972,7 @@ sub build_query_compat {
         my $ea       = each_array( @$operands, @$operators, @index_params );
         while ( my ( $oand, $otor, $index ) = $ea->() ) {
             next if ( !defined($oand) || $oand eq '' );
-            my $field = $index ? $index->{field} : undef;
+            my $field = $index                                   ? $index->{field}              : undef;
             my $spec  = ( $operands_pure_and && defined $field ) ? $ITEM_OPERAND_FIELDS{$field} : undef;
             if ($spec) {
 
@@ -1110,7 +1110,7 @@ sub build_query_compat {
         # the same-item descriptors are passed, never the OpacHiddenItemsHidesRecord
         # should/items_count:0 wrapper, so the counts track the visible items.
         $options{item_facet_filters} = [ @auto_item_filters, @$user_item_filters ];
-        $query                            = $self->build_query( $query_str, %options );
+        $query = $self->build_query( $query_str, %options );
     }
 
     # We roughly emulate the CGI parameters of the zebra query builder

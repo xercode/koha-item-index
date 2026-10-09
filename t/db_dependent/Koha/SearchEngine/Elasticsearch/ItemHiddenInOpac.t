@@ -103,8 +103,8 @@ subtest 'restrictive: stops at the first plugin returning true' => sub {
     my $es = Koha::SearchEngine::Elasticsearch->new( { index => 'biblios' } );
 
     is( $es->_item_hidden_in_opac_custom(undef), 1, 'hidden as soon as a plugin vetoes' );
-    is( $vetoes->{called}, 1, 'first (vetoing) plugin was called' );
-    is( $allows->{called}, 0, 'second plugin was NOT called (short-circuit)' );
+    is( $vetoes->{called},                       1, 'first (vetoing) plugin was called' );
+    is( $allows->{called},                       0, 'second plugin was NOT called (short-circuit)' );
 
     # When the first plugin allows, iteration continues to the next one.
     $vetoes->{called} = 0;

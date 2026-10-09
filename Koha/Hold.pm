@@ -1092,7 +1092,7 @@ sub fill {
     # item stops being onhold/onrequest. fill() bypasses store() (it uses set()
     # + delete), so reindex the biblio explicitly afterwards.
     my $reindex_biblionumber =
-        (      !$params->{skip_record_index}
+        (     !$params->{skip_record_index}
             && $self->itemnumber
             && C4::Context->preference('SearchEngine') eq 'Elasticsearch' )
         ? $self->biblionumber
@@ -1431,7 +1431,7 @@ sub _item_search_status_signature {
     my $onrequest       = ( defined $self->itemnumber && !$self->cancellationdate && !$self->suspend ) ? 1 : 0;
     my $found           = $self->found // '';
     my $onhold          = ( $onrequest && ( $found eq 'W' || $found eq 'T' ) ) ? 1 : 0;
-    my $blocked_by_hold = ( $onrequest && $self->is_found )                     ? 1 : 0;    # W/T/P
+    my $blocked_by_hold = ( $onrequest && $self->is_found )                    ? 1 : 0;    # W/T/P
 
     return {
         itemnumber      => $self->itemnumber,

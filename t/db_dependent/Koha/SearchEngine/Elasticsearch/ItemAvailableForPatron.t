@@ -135,7 +135,7 @@ subtest 'three-state priority: false > true, short-circuits at the first false' 
     my $t2 = Koha::Test::FakeAvailPlugin->new(1);
     $module->mock( 'get_enabled_plugins', sub { return ( $f2, $t2 ); } );
     is( $es->_item_available_for_patron( undef, 0, 0 ), 0, 'a first false makes it unavailable' );
-    is( $f2->{called}, 1, 'the false plugin was called' );
+    is( $f2->{called},                                  1, 'the false plugin was called' );
     is( $t2->{called}, 0, 'a later plugin is NOT called after a false (short-circuit)' );
 
     # [true, true] -> available.

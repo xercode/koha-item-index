@@ -53,7 +53,7 @@ $se->mock(
                 title                => { type => 'text' },
                 'local-number__sort' => { type => 'integer' },
                 items_count          => { type => 'integer' },
-                items       => {
+                items                => {
                     type       => 'nested',
                     properties => {
                         itemnumber                    => { type => 'integer' },
@@ -119,12 +119,12 @@ my %docs = (
             # acquisition date so the operand-routing tests can tell them apart.
             item(
                 itemnumber => 11,
-                homebranch => 'AAA', holdingbranch => 'AAA', available => JSON::true, onrequest => JSON::false,
-                barcode    => 'BC-A1', itype => 'BK', dateaccessioned => '2020-06-01'
+                homebranch => 'AAA',   holdingbranch => 'AAA', available       => JSON::true, onrequest => JSON::false,
+                barcode    => 'BC-A1', itype         => 'BK',  dateaccessioned => '2020-06-01'
             ),
             item(
-                itemnumber           => 12,
-                homebranch           => 'BBB', holdingbranch => 'BBB', available => JSON::false, onrequest => JSON::true,
+                itemnumber => 12,
+                homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::false, onrequest => JSON::true,
                 available_for_patron => JSON::false,
                 barcode              => 'BC-B1', itype => 'CD', dateaccessioned => '2019-06-01'
             ),
@@ -136,8 +136,8 @@ my %docs = (
         items       => [
             item(
                 itemnumber => 21,
-                homebranch => 'BBB', holdingbranch => 'BBB', available => JSON::true,
-                barcode    => 'BC-2', itype => 'BK', dateaccessioned => '2021-06-01'
+                homebranch => 'BBB',  holdingbranch => 'BBB', available       => JSON::true,
+                barcode    => 'BC-2', itype         => 'BK',  dateaccessioned => '2021-06-01'
             )
         ],
     },
@@ -149,14 +149,19 @@ my %docs = (
     4 => {
         title       => 'river',
         items_count => 1,
-        items       =>
-            [ item( itemnumber => 41, homebranch => 'CCC', holdingbranch => 'CCC', hidden_in_opac_custom => JSON::true ) ],
+        items       => [
+            item( itemnumber => 41, homebranch => 'CCC', holdingbranch => 'CCC', hidden_in_opac_custom => JSON::true )
+        ],
     },
     5 => {
         title       => 'river',
         items_count => 1,
-        items =>
-            [ item( itemnumber => 51, homebranch => 'CCC', holdingbranch => 'CCC', hidden_in_opac_by_preferences => JSON::true ) ],
+        items       => [
+            item(
+                itemnumber                    => 51, homebranch => 'CCC', holdingbranch => 'CCC',
+                hidden_in_opac_by_preferences => JSON::true
+            )
+        ],
     },
 );
 
@@ -212,21 +217,22 @@ subtest 'inner_hits reports the matching items (Bug XXXXX)' => sub {
 
     # Same-item filter: only record 1's AAA copy (11) matches, not its BBB copy (12).
     my $by_id = matched_map( [ 'items.available:true', 'items.homebranch:AAA' ] );
-    is_deeply( [ sort keys %$by_id ], [1], 'only record 1 matches the same-item filter' );
-    is_deeply( $by_id->{1}, [11], 'inner_hits reports just the matching AAA copy, not the BBB copy' );
+    is_deeply( [ sort keys %$by_id ], [1],  'only record 1 matches the same-item filter' );
+    is_deeply( $by_id->{1},           [11], 'inner_hits reports just the matching AAA copy, not the BBB copy' );
 
     # homebranch:BBB (intranet) matches records 1 and 2, each reporting only its
     # own BBB copy -- record 1 reports item 12 (its BBB copy), not item 11.
     $by_id = matched_map( ['items.homebranch:BBB'] );
     is_deeply( [ sort keys %$by_id ], [ 1, 2 ], 'homebranch:BBB matches records 1 and 2' );
-    is_deeply( $by_id->{1}, [12], 'record 1 reports only its BBB copy (12), not its AAA copy' );
-    is_deeply( $by_id->{2}, [21], 'record 2 reports its BBB copy (21)' );
+    is_deeply( $by_id->{1},           [12],     'record 1 reports only its BBB copy (12), not its AAA copy' );
+    is_deeply( $by_id->{2},           [21],     'record 2 reports its BBB copy (21)' );
 
     # Without want_matched_items there is no inner_hits, so matched_itemnumbers is
     # undef (the caller must not filter).
-    my ( undef, $query ) =
-        $builder->build_query_compat( undef, ['*'], undef, ['items.homebranch:AAA'], undef, undef, undef,
-        { skip_facets => 1 } );
+    my ( undef, $query ) = $builder->build_query_compat(
+        undef, ['*'], undef, ['items.homebranch:AAA'], undef, undef, undef,
+        { skip_facets => 1 }
+    );
     my $results = $searcher->search( $query, undef, 50 );
     my ($hit) = grep { $_->{_id} == 1 } @{ $results->{hits}{hits} };
     is( $searcher->matched_itemnumbers($hit), undef, 'no inner_hits without want_matched_items => undef' );

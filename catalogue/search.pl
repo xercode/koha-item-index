@@ -414,8 +414,8 @@ foreach my $limit (@limits) {
         $available = 1;
     }
 }
-$template->param( available             => $available );
-$template->param( available_for_patron  => $available_for_patron );
+$template->param( available            => $available );
+$template->param( available_for_patron => $available_for_patron );
 
 # Bug XXXXX: item on-request filter. The intranet exposes it as a three-way
 # choice (all / not on request / on request) whose selected option is driven by

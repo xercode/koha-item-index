@@ -1319,7 +1319,7 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
         $builder->build_object( { class => 'Koha::Libraries', value => { geolocation => undef } } );
     my $item = $builder->build_sample_item(
         {
-            biblionumber  => $biblio->biblionumber,
+            biblionumber    => $biblio->biblionumber,
             homebranch      => $library->branchcode,
             holdingbranch   => $library->branchcode,
             barcode         => 'NESTED-0001',
@@ -1329,11 +1329,11 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
 
     $docs = $see->marc_records_to_documents( [$record] );
     my $doc = $docs->[0]->{items}->[0];
-    is( scalar @{ $docs->[0]->{items} }, 1,                 'one item produces one nested item document' );
-    is( $doc->{itemnumber},              $item->itemnumber, 'itemnumber is mapped' );
+    is( scalar @{ $docs->[0]->{items} }, 1,                    'one item produces one nested item document' );
+    is( $doc->{itemnumber},              $item->itemnumber,    'itemnumber is mapped' );
     is( $doc->{homebranch},              $library->branchcode, 'homebranch is mapped' );
-    is( $doc->{barcode},                 'NESTED-0001',     'barcode is mapped' );
-    is( $doc->{dateaccessioned},         '2020-01-15',      'dateaccessioned (date_of_acquisition) is mapped' );
+    is( $doc->{barcode},                 'NESTED-0001',        'barcode is mapped' );
+    is( $doc->{dateaccessioned},         '2020-01-15',         'dateaccessioned (date_of_acquisition) is mapped' );
     is_deeply( $doc->{intransit},             \0, 'intransit is false by default' );
     is_deeply( $doc->{onhold},                \0, 'onhold is false by default' );
     is_deeply( $doc->{onrequest},             \0, 'onrequest is false by default' );
@@ -1345,8 +1345,11 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     # Library geolocation is indexed as the native "lat,lon" string
     $library->geolocation('40.4168,-3.7038')->store;
     $docs = $see->marc_records_to_documents( [$record] );
-    is( $docs->[0]->{items}->[0]->{home_geolocation},    '40.4168,-3.7038', 'home_geolocation is set from the library' );
-    is( $docs->[0]->{items}->[0]->{holding_geolocation}, '40.4168,-3.7038', 'holding_geolocation is set from the library' );
+    is( $docs->[0]->{items}->[0]->{home_geolocation}, '40.4168,-3.7038', 'home_geolocation is set from the library' );
+    is(
+        $docs->[0]->{items}->[0]->{holding_geolocation}, '40.4168,-3.7038',
+        'holding_geolocation is set from the library'
+    );
 
     # intransit: an active transfer (sent, not arrived, not cancelled)
     my $transfer = $builder->build_object(

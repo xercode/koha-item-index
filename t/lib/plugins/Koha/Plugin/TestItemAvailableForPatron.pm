@@ -35,8 +35,8 @@ sub item_available_for_patron {
     my ( $self, $params ) = @_;
     my $item = $params->{item};
     return unless $item && $item->itemcallnumber;
-    return 1     if $item->itemcallnumber eq 'PATRON-YES';
-    return 0     if $item->itemcallnumber eq 'PATRON-NO';
+    return 1 if $item->itemcallnumber eq 'PATRON-YES';
+    return 0 if $item->itemcallnumber eq 'PATRON-NO';
     return;
 }
 
