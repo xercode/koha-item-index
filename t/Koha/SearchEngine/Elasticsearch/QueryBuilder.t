@@ -686,7 +686,7 @@ subtest '_extract_item_filters() tests (Bug XXXXX)' => sub {
 };
 
 subtest '_item_operand_to_filter() tests (Bug XXXXX)' => sub {
-    plan tests => 7;
+    plan tests => 10;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -700,6 +700,23 @@ subtest '_item_operand_to_filter() tests (Bug XXXXX)' => sub {
         $qb->_item_operand_to_filter( { subfield => 'callnumber', kind => 'wildcard' }, 'ABC' ),
         { field => 'callnumber', wildcard => '*ABC*' },
         'a wildcard operand is wrapped with leading/trailing wildcards'
+    );
+
+    is_deeply(
+        $qb->_item_operand_to_filter( { subfield => 'callnumber', kind => 'wildcard' }, '"QA76.9 B45"' ),
+        { field => 'callnumber', wildcard => '*QA76.9 B45*' },
+        'double quotes wrapping a wildcard operand are removed'
+    );
+
+    is_deeply(
+        $qb->_item_operand_to_filter( { subfield => 'barcode', kind => 'term' }, '"12345"' ),
+        { field => 'barcode', value => '12345' },
+        'double quotes wrapping a term operand are removed'
+    );
+
+    is(
+        $qb->_item_operand_to_filter( { subfield => 'barcode', kind => 'term' }, '""' ), undef,
+        'an operand made only of quotes is empty'
     );
 
     is_deeply(
