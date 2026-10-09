@@ -25,6 +25,8 @@ use Koha::Database;
 use Koha::DateUtils qw( dt_from_string );
 use Koha::Item::Transfer;
 use Koha::Item;
+use Koha::SearchEngine;
+use Koha::SearchEngine::Indexer;
 use Koha::StockRotationStage;
 use Try::Tiny qw( catch try );
 
@@ -311,11 +313,17 @@ sub toggle_indemand {
                 $new_stage = $stage->previous_sibling;
             }
             $self->stage_id( $new_stage->stage_id )->store;              # Revert stage change
-            $item->homebranch( $new_stage->branchcode_id )->store;       # Revert update homebranch
+            $item->homebranch( $new_stage->branchcode_id )->store( { skip_record_index => 1 } )
+                ;                                                        # Revert update homebranch
             $new_indemand = 0;                                           # Reset indemand
             $transfer->tobranch( $new_stage->branchcode_id );            # Reset StockrotationAdvance
             $transfer->datearrived(dt_from_string);                      # Reset StockrotationAdvance
             $transfer->store;
+
+            # Reindex once both the homebranch and the transfer are reset, so
+            # the index never sees the item still in transit.
+            Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } )
+                ->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
         }
     }
 
