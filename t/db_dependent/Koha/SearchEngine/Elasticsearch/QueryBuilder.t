@@ -1341,7 +1341,7 @@ subtest "_convert_sort_fields() tests" => sub {
 };
 
 subtest "_sort_field() tests" => sub {
-    plan tests => 5;
+    plan tests => 9;
 
     my $qb;
 
@@ -1376,6 +1376,24 @@ subtest "_sort_field() tests" => sub {
         $f,
         'sortablenumber__sort',
         'sortablenumber sort mapped correctly'
+    );
+
+    is( $qb->_sort_field('mainentry'), undef, 'sortable field without a sort mapping is not sorted on' );
+    is( $qb->_sort_field('unknown'),   undef, 'field missing from the mappings is not sorted on' );
+
+    my $query;
+    warning_like {
+        $query = $qb->build_query(
+            'foo',
+            sort => [ { field => 'unknown', direction => 'asc' }, { field => 'title', direction => 'desc' } ]
+        );
+    }
+    qr/Ignoring sort on field 'unknown': it has no sort mapping/,
+        'build_query warns about the unmapped sort field';
+    is_deeply(
+        [ map { keys %$_ } @{ $query->{sort} } ],
+        [ 'title__sort', 'local-number__sort' ],
+        'build_query skips the unmapped sort field and keeps the others'
     );
 };
 

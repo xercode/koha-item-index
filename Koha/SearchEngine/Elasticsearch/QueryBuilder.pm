@@ -283,8 +283,15 @@ sub build_query {
                 if $d && ( $d ne 'asc' && $d ne 'desc' );
             $d = 'asc' unless $d;
 
-            $f = $self->_sort_field($f);
-            push @{ $res->{sort} }, { $f => { order => $d } };
+            my $sort_field = $self->_sort_field($f);
+            unless ($sort_field) {
+
+                # Sorting on a field that is not in the mappings makes
+                # Elasticsearch reject the whole query: skip it instead.
+                warn "Ignoring sort on field '$f': it has no sort mapping";
+                next;
+            }
+            push @{ $res->{sort} }, { $sort_field => { order => $d } };
         }
     }
 
@@ -2055,6 +2062,9 @@ on should be. A '__sort' suffix is added for fields with a sort version, and
 for text fields either '.phrase' (for sortable versions) or '.raw' is appended
 to avoid sorting on a tokenized value.
 
+Returns undef if the resulting field does not exist in the mappings, as
+Elasticsearch would reject a query sorting on it.
+
 =cut
 
 sub _sort_field {
@@ -2062,15 +2072,23 @@ sub _sort_field {
 
     my $mappings  = $self->get_elasticsearch_mappings();
     my $textField = defined $mappings->{properties}{$f}{type} && $mappings->{properties}{$f}{type} eq 'text';
+    my $sort_field;
     if ( !defined $self->sort_fields()->{$f} || $self->sort_fields()->{$f} ) {
-        $f .= '__sort';
+        $sort_field = $f . '__sort';
     } else {
+        $sort_field = $f;
 
         # We need to add '.raw' to text fields without a sort field,
         # otherwise it'll sort based on the tokenised form.
-        $f .= '.raw' if $textField;
+        $sort_field .= '.raw' if $textField;
     }
-    return $f;
+
+    # The '.raw' subfield belongs to the field itself, so checking the top
+    # level property is enough.
+    my ($property) = split /\./, $sort_field, 2;
+    return unless exists $mappings->{properties}{$property};
+
+    return $sort_field;
 }
 
 =head2 _truncate_terms
