@@ -25,7 +25,7 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 7;
+use Test::More tests => 8;
 use Test::MockModule;
 
 use Koha::Database;
@@ -165,6 +165,59 @@ subtest 'Koha::Hold->delete reindex (Bug XXXXX)' => sub {
     reset_calls();
     $hold->delete;
     is( scalar @index_calls, 0, 'deleting a record-level hold does not reindex' );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'Koha::Hold->move_hold reindex (Bug XXXXX)' => sub {
+    plan tests => 4;
+
+    $schema->storage->txn_begin;
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
+
+    my $library  = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $patron   = $builder->build_object( { class => 'Koha::Patrons' } );
+    my $biblio_1 = $builder->build_sample_biblio;
+    my $biblio_2 = $builder->build_sample_biblio;
+    my $item_1   = $builder->build_sample_item( { biblionumber => $biblio_1->biblionumber } );
+    my $item_2   = $builder->build_sample_item( { biblionumber => $biblio_2->biblionumber } );
+
+    my %hold_info = (
+        borrowernumber  => $patron->borrowernumber,
+        biblionumber    => $biblio_1->biblionumber,
+        itemnumber      => $item_1->itemnumber,
+        branchcode      => $library->branchcode,
+        reservedate     => dt_from_string->ymd,
+        item_level_hold => 1,
+        priority        => 1,
+    );
+
+    # Moving an item-level hold to an item of another record: both records
+    # change (the original item is no longer onrequest, the new one is).
+    my $reserves_module = Test::MockModule->new('C4::Reserves');
+    $reserves_module->mock( 'CanItemBeReserved', sub { return { status => 'OK' } } );
+    my $hold_module = Test::MockModule->new('Koha::Hold');
+    $hold_module->mock( '_pickup_valid_for_item', sub { return 1 } );
+
+    my $hold = Koha::Hold->new( {%hold_info} )->store;
+    reset_calls();
+    my $result = $hold->move_hold( { new_itemnumber => $item_2->itemnumber } );
+    ok( $result->{success}, 'the hold is moved' );
+    is_deeply(
+        [ sort { $a <=> $b } @index_calls ],
+        [ sort { $a <=> $b } ( $biblio_1->biblionumber, $biblio_2->biblionumber ) ],
+        'moving an item-level hold to another record reindexes both records'
+    );
+
+    # Moving a record-level hold does not affect the original items.
+    $hold = Koha::Hold->new( { %hold_info, itemnumber => undef, item_level_hold => 0 } )->store;
+    reset_calls();
+    $result = $hold->move_hold( { new_itemnumber => $item_2->itemnumber } );
+    ok( $result->{success}, 'the record-level hold is moved' );
+    ok(
+        !( grep { $_ == $biblio_1->biblionumber } @index_calls ),
+        'moving a record-level hold does not reindex the original record'
+    );
 
     $schema->storage->txn_rollback;
 };

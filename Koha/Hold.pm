@@ -200,6 +200,7 @@ sub move_hold {
 
     my $original              = $self->unblessed;
     my $original_biblionumber = $self->biblionumber;
+    my $affected_item_status  = $self->_affects_item_search_status;
 
     my $found = $self->found // '';
 
@@ -272,6 +273,10 @@ sub move_hold {
         }
     );
 
+    # store() reindexes the new biblio; the item the hold was on lives in the
+    # original one, which also needs its onrequest status refreshed (Bug XXXXX).
+    $self->_reindex_biblio_for_item_status($original_biblionumber)
+        if $affected_item_status && $original_biblionumber != $new_biblionumber;
 
     C4::Log::logaction( 'HOLDS', 'MODIFY', $self->reserve_id, $self, undef, $original )
         if C4::Context->preference('HoldsLog');
@@ -1487,17 +1492,19 @@ sub _item_search_status_changed {
 =head3 _reindex_biblio_for_item_status
 
     $hold->_reindex_biblio_for_item_status;
+    $hold->_reindex_biblio_for_item_status($biblionumber);
 
-Internal helper. Enqueues a reindex of this hold's biblio so its nested item
-documents pick up the new onhold/onrequest status (Bug XXXXX).
+Internal helper. Enqueues a reindex of this hold's biblio (or of the given
+biblionumber) so its nested item documents pick up the new onhold/onrequest
+status (Bug XXXXX).
 
 =cut
 
 sub _reindex_biblio_for_item_status {
-    my ($self) = @_;
+    my ( $self, $biblionumber ) = @_;
 
     my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
-    $indexer->index_records( $self->biblionumber, "specialUpdate", "biblioserver" );
+    $indexer->index_records( $biblionumber // $self->biblionumber, "specialUpdate", "biblioserver" );
 }
 
 =head3 _set_default_expirationdate
