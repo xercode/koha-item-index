@@ -1121,7 +1121,7 @@ subtest "CanBookBeRenewed tests" => sub {
         );
 
         my $ten_days_before = dt_from_string->add( days => -10 );
-        my $ten_days_ahead  = dt_from_string->add( days =>  10 );
+        my $ten_days_ahead  = dt_from_string->add( days => 10 );
         my $issue           = AddIssue(
             $renewing_borrower_obj, $item_to_auto_renew->barcode, $ten_days_ahead, undef, $ten_days_before,
             undef, { auto_renew => 1 }
@@ -1271,7 +1271,7 @@ subtest "CanBookBeRenewed tests" => sub {
         );
 
         my $ten_days_before = dt_from_string->add( days => -10 );
-        my $ten_days_ahead  = dt_from_string->add( days =>  10 );
+        my $ten_days_ahead  = dt_from_string->add( days => 10 );
         my $issue           = AddIssue(
             $renewing_borrower_obj, $item_to_auto_renew->barcode, $ten_days_ahead, undef, $ten_days_before,
             undef, { auto_renew => 1 }
@@ -1381,7 +1381,7 @@ subtest "CanBookBeRenewed tests" => sub {
         );
 
         my $ten_days_before = dt_from_string->add( days => -10 );
-        my $ten_days_ahead  = dt_from_string->add( days =>  10 );
+        my $ten_days_ahead  = dt_from_string->add( days => 10 );
 
         # Patron is expired and BlockExpiredPatronOpacActions=''
         # => auto renew is allowed
@@ -1433,7 +1433,7 @@ subtest "CanBookBeRenewed tests" => sub {
         );
 
         my $ten_days_before = dt_from_string->add( days => -10 );
-        my $ten_days_ahead  = dt_from_string->add( days =>  10 );
+        my $ten_days_ahead  = dt_from_string->add( days => 10 );
         my $issue           = AddIssue(
             $renewing_borrower_obj, $item_to_auto_renew->barcode, $ten_days_ahead, undef, $ten_days_before,
             undef, { auto_renew => 1 }
@@ -1554,7 +1554,7 @@ subtest "CanBookBeRenewed tests" => sub {
         );
 
         my $ten_days_before = dt_from_string->add( days => -10 );
-        my $ten_days_ahead  = dt_from_string->add( days =>  10 );
+        my $ten_days_ahead  = dt_from_string->add( days => 10 );
         my $issue           = AddIssue(
             $renewing_borrower_obj, $item_to_auto_renew->barcode, $ten_days_ahead, undef, $ten_days_before,
             undef, { auto_renew => 1 }
@@ -2103,7 +2103,7 @@ subtest "GetUpcomingDueIssues" => sub {
     my $a_borrower                = Koha::Patrons->find($a_borrower_borrowernumber);
 
     my $yesterday      = DateTime->today( time_zone => C4::Context->tz() )->add( days => -1 );
-    my $two_days_ahead = DateTime->today( time_zone => C4::Context->tz() )->add( days =>  2 );
+    my $two_days_ahead = DateTime->today( time_zone => C4::Context->tz() )->add( days => 2 );
     my $today          = DateTime->today( time_zone => C4::Context->tz() );
 
     my $issue    = AddIssue( $a_borrower, $item_1->barcode, $yesterday );
@@ -4241,7 +4241,7 @@ subtest 'AddReturn | is_overdue' => sub {
         is( $line->status,                'RETURNED', "Overdue fine is fixed" );
         $line = $lines->next;
         is( $line->amount + 0,            -2, "Original payment amount remains as 2" );
-        is( $line->amountoutstanding + 0,  0, "Original payment remains applied" );
+        is( $line->amountoutstanding + 0, 0,  "Original payment remains applied" );
         $line = $lines->next;
         is( $line->amount + 0,            -1, "Refund amount correctly set to 1" );
         is( $line->amountoutstanding + 0, -1, "Refund amount outstanding unspent" );
@@ -5195,7 +5195,7 @@ subtest '_FixOverduesOnReturn' => sub {
     my $credit = $offset->credit;
     is( ref $credit,                    "Koha::Account::Line", "Found matching credit for fine forgiveness" );
     is( $credit->amount + 0,            -99,                   "Credit amount is set correctly" );
-    is( $credit->amountoutstanding + 0,  0,                    "Credit amountoutstanding is correctly set to 0" );
+    is( $credit->amountoutstanding + 0, 0,                     "Credit amountoutstanding is correctly set to 0" );
 
     # Bug 25417 - Only forgive fines where there is an amount outstanding to forgive
     $accountline->set(
@@ -8060,7 +8060,7 @@ subtest "CanBookBeIssued + needsconfirmation message" => sub {
 
 subtest 'Tests for BlockReturnOfWithdrawnItems' => sub {
 
-    plan tests => 1;
+    plan tests => 6;
 
     t::lib::Mocks::mock_preference( 'BlockReturnOfWithdrawnItems', 1 );
     t::lib::Mocks::mock_preference( 'RecordLocalUseOnReturn',      0 );
@@ -8072,6 +8072,37 @@ subtest 'Tests for BlockReturnOfWithdrawnItems' => sub {
         [ 0, { NotIssued => $item->barcode, withdrawn => 1 }, undef, {} ],
         "Item returned as withdrawn, no other messages"
     );
+
+    # A blocked return that clears a stale onloan must reindex the record:
+    # the onloan change skips indexing and the return ends early (Bug XXXXX).
+    my @reindexed;
+    my $indexer_module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch::Indexer');
+    $indexer_module->mock( 'index_records', sub { push @reindexed, $_[1]; } );
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
+
+    $item->onloan( dt_from_string->ymd )->store( { skip_record_index => 1 } );
+    AddReturn( $item->barcode, $item->homebranch, 0, undef );
+    $item->discard_changes;
+    is( $item->onloan, undef, 'The stale onloan is cleared' );
+    is_deeply( \@reindexed, [ $item->biblionumber ], 'The record is reindexed once' );
+
+    t::lib::Mocks::mock_preference( 'RecordLocalUseOnReturn', 1 );
+    @reindexed = ();
+    $item->onloan( dt_from_string->ymd )->store( { skip_record_index => 1 } );
+    AddReturn( $item->barcode, $item->homebranch, 0, undef );
+    is_deeply(
+        \@reindexed, [ $item->biblionumber ],
+        'The record is reindexed once when the local use is recorded too'
+    );
+
+    @reindexed = ();
+    AddReturn( $item->barcode, $item->homebranch, 0, undef );
+    is_deeply( \@reindexed, [ $item->biblionumber ], 'Recording the local use alone still reindexes' );
+
+    t::lib::Mocks::mock_preference( 'RecordLocalUseOnReturn', 0 );
+    @reindexed = ();
+    AddReturn( $item->barcode, $item->homebranch, 0, undef );
+    is_deeply( \@reindexed, [], 'Nothing changed, nothing to reindex' );
 };
 
 subtest 'Tests for Wrongbranch blocker (AllowReturnToBranch)' => sub {
@@ -8435,7 +8466,7 @@ subtest 'NoRefundOnLostFinesPaidAge' => sub {
         {
             borrowernumber    => $patron->id,
             date              => '1970-01-01 14:00:01',
-            amountoutstanding =>  0,
+            amountoutstanding => 0,
             amount            => -5,
             interface         => 'commandline',
             credit_type_code  => 'PAYMENT'
@@ -8491,7 +8522,7 @@ subtest 'NoRefundOnLostFinesPaidAge' => sub {
             borrowernumber    => $patron2->id,
             date              => '1970-01-01 14:00:01',
             amount            => -5,
-            amountoutstanding =>  0,
+            amountoutstanding => 0,
             interface         => 'commandline',
             credit_type_code  => 'PAYMENT'
         }
