@@ -24,7 +24,9 @@ use DateTime::Duration;
 use Koha::Database;
 use Koha::DateUtils qw( dt_from_string );
 use Koha::Item::Transfer;
+use Koha::Item::Transfers;
 
+use Test::MockModule;
 use Test::Warn;
 use t::lib::TestBuilder;
 use t::lib::Mocks;
@@ -729,7 +731,7 @@ subtest "Tests for investigate (singular)." => sub {
 };
 
 subtest "Tests for toggle_indemand" => sub {
-    plan tests => 15;
+    plan tests => 16;
     $schema->storage->txn_begin;
 
     my $sritem = $builder->build(
@@ -777,7 +779,28 @@ subtest "Tests for toggle_indemand" => sub {
     is( $transfer->frombranch,  $firstbranch,           'Transfer from set correctly' );
     is( $transfer->tobranch,    $secondbranch,          'Transfer to set correctly' );
     is( $transfer->datearrived, undef,                  'Transfer datearrived not set' );
+
+    # The record must be reindexed once the transfer is reset, not before
+    # (Bug XXXXX): the index would otherwise keep the item in transit.
+    my @reindexed;
+    my $indexer_module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch::Indexer');
+    $indexer_module->mock(
+        'index_records',
+        sub {
+            my ( $self, $record_numbers ) = @_;
+            my $arrived = Koha::Item::Transfers->find( $transfer->id )->datearrived;
+            push @reindexed, { biblionumber => $record_numbers, transfer_arrived => defined $arrived ? 1 : 0 };
+        }
+    );
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
     $dbitem->toggle_indemand;
+    is_deeply(
+        \@reindexed,
+        [ { biblionumber => $dbitem->item->biblionumber, transfer_arrived => 1 } ],
+        'The record is reindexed once, after the transfer is reset'
+    );
+    $indexer_module->unmock_all;
+
     my $updated_transfer = $transfer->get_from_storage;
     is( $updated_transfer->frombranch, $firstbranch, 'Transfer from retained correctly' );
     is( $updated_transfer->tobranch,   $firstbranch, 'Transfer to updated correctly' );
