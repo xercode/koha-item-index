@@ -27,7 +27,7 @@ require C4::Context;
 use open ':std', ':encoding(utf8)';
 
 use Test::NoWarnings;
-use Test::More tests => 6;
+use Test::More tests => 7;
 use Test::MockModule;
 use Test::Warn;
 use t::lib::Mocks;
@@ -1379,6 +1379,42 @@ subtest 'MARC21 + DOM' => sub {
 subtest 'UNIMARC + DOM' => sub {
     plan tests => 14;
     run_unimarc_search_tests();
+};
+
+subtest 'buildQuery() limit on an unknown or empty library group' => sub {
+    plan tests => 4;
+
+    require C4::Search;
+    require Koha::Database;
+    require t::lib::TestBuilder;
+
+    my $schema = Koha::Database->schema;
+    $schema->storage->txn_begin;
+
+    my $builder = t::lib::TestBuilder->new;
+    my $group_value =
+        { ft_search_groups_opac => 1, ft_search_groups_staff => 1, parent_id => undef, branchcode => undef };
+    my $empty_group   = $builder->build_object( { class => 'Koha::Library::Groups', value => $group_value } );
+    my $deleted_group = $builder->build_object( { class => 'Koha::Library::Groups', value => $group_value } );
+    my $unknown_id    = $deleted_group->id;
+    $deleted_group->delete;
+
+    for my $case ( [ unknown => $unknown_id ], [ empty => $empty_group->id ] ) {
+        my ( $label, $group_id ) = @$case;
+        my $limit;
+        warning_like {
+            ( undef, undef, undef, undef, undef, $limit ) =
+                C4::Search::buildQuery( [], ['salud'], [], ["multibranchlimit:$group_id"], [], 0, 'en' );
+        }
+        qr/Library group '$group_id' does not exist or has no libraries/,
+            "buildQuery warns about the $label library group";
+        like(
+            $limit, qr/homebranch[:=] nolibrarygroupmatch/,
+            "a limit on an $label library group matches nothing instead of the whole catalogue"
+        );
+    }
+
+    $schema->storage->txn_rollback;
 };
 
 subtest 'FindDuplicate' => sub {

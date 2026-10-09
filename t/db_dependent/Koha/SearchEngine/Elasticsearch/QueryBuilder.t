@@ -1043,7 +1043,7 @@ subtest 'build_query with weighted fields tests' => sub {
 
 subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
 
-    plan tests => 14;
+    plan tests => 20;
 
     $schema->storage->txn_begin;
 
@@ -1177,6 +1177,46 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
         "Multibranch limit routed to items.holdingbranch terms"
     );
     is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "limit cgi is kept verbatim" );
+
+    # An unknown or empty library group must not widen the search to the whole
+    # catalogue: the limit matches no item.
+    my $empty_group = $builder->build_object(
+        {
+            class => 'Koha::Library::Groups',
+            value => {
+                ft_search_groups_opac  => 1,
+                ft_search_groups_staff => 1,
+                parent_id              => undef,
+                branchcode             => undef
+            }
+        }
+    );
+    my $deleted_group = $builder->build_object( { class => 'Koha::Library::Groups' } );
+    my $unknown_id    = $deleted_group->id;
+    $deleted_group->delete;
+    for my $case ( [ unknown => $unknown_id ], [ empty => $empty_group->id ] ) {
+        my ( $label, $group_id ) = @$case;
+        warning_like {
+            ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+                $query_builder->build_query_compat(
+                undef, undef, undef, ["multibranchlimit:$group_id"], undef, undef, undef,
+                undef
+                );
+        }
+        qr/Library group '$group_id' does not exist or has no libraries/,
+            "build_query_compat warns about the $label library group";
+        is_deeply(
+            $nested_leaf->($query), { match_none => {} },
+            "A limit on an $label library group matches no item"
+        );
+    }
+
+    # The flat (query_string) path behaves the same.
+    my $flat_limits;
+    warning_like { $flat_limits = $query_builder->_fix_limit_special_cases( ["multibranchlimit:$unknown_id"] ) }
+    qr/Library group '$unknown_id' does not exist or has no libraries/,
+        "_fix_limit_special_cases warns about the unknown library group";
+    is_deeply( $flat_limits, ['(NOT *:*)'], "_fix_limit_special_cases turns it into a limit that matches nothing" );
 
     $schema->storage->txn_rollback;
 };

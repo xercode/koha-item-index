@@ -1286,11 +1286,16 @@ sub buildQuery {
             $limit     .= " and " if $limit || $query;
             my $branchfield = C4::Context->preference('SearchLimitLibrary');
             my @branchcodes;
+            my $unknown_group;
             if ( $this_limit =~ '^multibranchlimit:' ) {
                 my ($group_id) = ( $this_limit =~ /^multibranchlimit:(.*)$/ );
                 my $search_group = Koha::Library::Groups->find($group_id);
-                @branchcodes = map  { $_->branchcode } $search_group->all_libraries;
-                @branchcodes = sort { $a cmp $b } @branchcodes;
+                @branchcodes = sort { $a cmp $b } map { $_->branchcode } $search_group->all_libraries
+                    if $search_group;
+                unless (@branchcodes) {
+                    warn "Library group '$group_id' does not exist or has no libraries: the limit matches nothing";
+                    $unknown_group = 1;
+                }
             } else {
                 @branchcodes = ( $this_limit =~ /^branch:(.*)$/ );
             }
@@ -1306,7 +1311,11 @@ sub buildQuery {
                         join( " or ", map { 'holdingbranch: ' . $_ } @branchcodes );
                 }
             }
-            $limit      .= "$this_limit";
+
+            # An unknown or empty library group must not widen the search to the
+            # whole catalogue: limit on a branchcode that cannot exist (longer
+            # than the 10 characters of branches.branchcode).
+            $limit      .= $unknown_group ? 'homebranch: nolibrarygroupmatch' : "$this_limit";
             $limit_desc .= " $this_limit";
         } elsif ( $this_limit =~ '^search_filter:' ) {
 

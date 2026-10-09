@@ -441,6 +441,10 @@ sub _item_filter_clauses {
     my %field_slot;    # field name => index into @slots
 
     for my $filter (@$item_filters) {
+        if ( $filter->{match_none} ) {
+            push @slots, { leaf => { match_none => {} } };
+            next;
+        }
         if (   $filter->{should}
             || defined $filter->{distance}
             || exists $filter->{wildcard}
@@ -719,9 +723,12 @@ sub _parse_item_date_range {
 Expands a C<branch:<code>> or C<multibranchlimit:<group_id>> limit
 (Bug XXXXX) into an item-filter descriptor on the nested items object. The target
 subfield follows C<SearchLimitLibrary>: C<homebranch>, C<holdingbranch> or, when
-set to both, a same-item disjunction of the two. Returns undef when the limit
-expands to no branchcode (e.g. an unknown or empty group), so the caller can
-leave it untouched.
+set to both, a same-item disjunction of the two.
+
+A group limit on an unknown or empty library group yields a C<match_none>
+descriptor: such a limit must not widen the search to the whole catalogue, so it
+matches no item. Returns undef when a C<branch:> limit has no branchcode, so the
+caller can leave it untouched.
 
 =cut
 
@@ -730,9 +737,14 @@ sub _library_limit_to_item_filter {
 
     my @branchcodes;
     if ( $limit =~ /^multibranchlimit:(.*)$/ ) {
-        my $search_group = Koha::Library::Groups->find($1);
-        return unless $search_group;
-        @branchcodes = sort { $a cmp $b } map { $_->branchcode } $search_group->all_libraries;
+        my $group_id     = $1;
+        my $search_group = Koha::Library::Groups->find($group_id);
+        @branchcodes = sort { $a cmp $b } map { $_->branchcode } $search_group->all_libraries
+            if $search_group;
+        unless (@branchcodes) {
+            warn "Library group '$group_id' does not exist or has no libraries: the limit matches nothing";
+            return { match_none => 1 };
+        }
     } else {
         @branchcodes = ( $limit =~ /^branch:(.*)$/ );
     }
@@ -855,6 +867,9 @@ sub _describe_item_filters {
 
     my @descriptions;
     for my $filter (@$item_filters) {
+
+        # A limit on an unknown or empty library group has nothing to describe.
+        next if $filter->{match_none};
 
         # Library limit: one line listing the branch names, whether it
         # targets homebranch, holdingbranch or both.
@@ -2007,8 +2022,16 @@ sub _fix_limit_special_cases {
             if ( $l =~ 'multibranchlimit' ) {
                 my ($group_id) = ( $l =~ /^multibranchlimit:(.*)$/ );
                 my $search_group = Koha::Library::Groups->find($group_id);
-                @branchcodes = map  { $_->branchcode } $search_group->all_libraries;
-                @branchcodes = sort { $a cmp $b } @branchcodes;
+                @branchcodes = sort { $a cmp $b } map { $_->branchcode } $search_group->all_libraries
+                    if $search_group;
+                unless (@branchcodes) {
+
+                    # An unknown or empty library group must not widen the
+                    # search to the whole catalogue: match nothing instead.
+                    warn "Library group '$group_id' does not exist or has no libraries: the limit matches nothing";
+                    push @new_lim, '(NOT *:*)';
+                    next;
+                }
             } else {
                 @branchcodes = ( $l =~ /^branch:(.*)$/ );
             }
