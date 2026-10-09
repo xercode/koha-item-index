@@ -33,6 +33,7 @@ use Koha::AuthorisedValueCategories;
 use C4::Heading;
 use C4::AuthoritiesMarc qw( GuessAuthTypeCode );
 use C4::Biblio;
+use Koha::Biblioitems;
 use Koha::Items;
 use Koha::Item::Transfers;
 use Koha::Holds;
@@ -1020,13 +1021,23 @@ sub _get_item_documents {
     # OpacHiddenItems rules, evaluated once for the whole batch.
     my $hidden_rules = C4::Context->yaml_preference('OpacHiddenItems') // {};
 
+    # Index the effective item type (Koha::Item->effective_itemtype): the item
+    # type of the record unless item-level_itypes is on and the item has its
+    # own. The record item types are loaded once for the whole batch.
+    my $item_level_itypes = C4::Context->preference('item-level_itypes');
+    my %itemtype_by_biblioitem =
+        map { $_->biblioitemnumber => $_->itemtype }
+        Koha::Biblioitems->search( { biblionumber => { -in => $biblionumbers } } )->as_list;
+
     for my $item (@items) {
         my $itemnumber = $item->itemnumber;
         my $document   = {
-            itemnumber           => $itemnumber + 0,
-            homebranch           => $item->homebranch,
-            holdingbranch        => $item->holdingbranch,
-            itype                => $item->itype,
+            itemnumber    => $itemnumber + 0,
+            homebranch    => $item->homebranch,
+            holdingbranch => $item->holdingbranch,
+            itype         => ( $item_level_itypes && $item->itype )
+            ? $item->itype
+            : $itemtype_by_biblioitem{ $item->biblioitemnumber },
             location             => $item->location,
             permanent_location   => $item->permanent_location,
             ccode                => $item->ccode,
