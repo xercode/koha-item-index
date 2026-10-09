@@ -1291,7 +1291,7 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
 };
 
 subtest 'marc_records_to_documents should build the nested "items" field' => sub {
-    plan tests => 27;
+    plan tests => 29;
 
     t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
     t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
@@ -1436,6 +1436,23 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
     $builder->build_sample_item( { biblionumber => $biblio->biblionumber } );
     $docs = $see->marc_records_to_documents( [$record] );
     is( scalar @{ $docs->[0]->{items} }, 2, 'two items produce two nested item documents' );
+
+    # The effective item type is indexed (Bug XXXXX): the record one unless
+    # item-level_itypes is on and the item has its own.
+    my $record_itype = $builder->build_object( { class => 'Koha::ItemTypes' } )->itemtype;
+    my $item_itype   = $builder->build_object( { class => 'Koha::ItemTypes' } )->itemtype;
+    my $itype_biblio = $builder->build_sample_biblio( { itemtype => $record_itype } );
+    $builder->build_sample_item( { biblionumber => $itype_biblio->biblionumber, itype => $item_itype } );
+    my $itype_record = $itype_biblio->metadata->record;
+
+    t::lib::Mocks::mock_preference( 'item-level_itypes', 1 );
+    $docs = $see->marc_records_to_documents( [$itype_record] );
+    is( $docs->[0]->{items}->[0]->{itype}, $item_itype, 'item-level_itypes on: the item type is indexed' );
+
+    t::lib::Mocks::mock_preference( 'item-level_itypes', 0 );
+    $docs = $see->marc_records_to_documents( [$itype_record] );
+    is( $docs->[0]->{items}->[0]->{itype}, $record_itype, 'item-level_itypes off: the record item type is indexed' );
+    t::lib::Mocks::mock_preference( 'item-level_itypes', 1 );
 };
 
 subtest 'marc_records_to_documents should compute the nested "available_for_patron" field' => sub {
