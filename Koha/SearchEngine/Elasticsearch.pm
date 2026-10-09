@@ -967,6 +967,17 @@ Item-level state that does not live in the C<items> table (transit and hold
 status) and the libraries' geolocation are resolved with grouped queries over
 the whole batch, to avoid N+1 lookups inside the indexing loop.
 
+Some fields are computed from settings that are not item data: the
+C<OpacHiddenItems> system preference (C<hidden_in_opac_by_preferences>) and the
+C<item_hidden_in_opac> and C<item_available_for_patron> plugin hooks
+(C<hidden_in_opac_custom>, C<available_for_patron>). They are evaluated when a
+record is indexed, and nothing reindexes the records when those settings change:
+whoever changes them (the administrator changing the preference, the developer or
+administrator of the plugin when it is installed, enabled, disabled or
+reconfigured, or when the data its hooks depend on changes) is responsible for
+reindexing the affected records, e.g. with
+C<misc/search_tools/rebuild_elasticsearch.pl>.
+
 =cut
 
 sub _get_item_documents {
@@ -1098,6 +1109,10 @@ Returns 0 (not hidden) when no plugin vetoes the item, when no plugin implements
 the hook, or when plugins are disabled. This hiding is unconditional (it is not
 lifted by C<OpacHiddenItemsExceptions>).
 
+The result is stored in the index when the record is indexed: a plugin whose
+answer changes (new rules, configuration, data) must have the affected records
+reindexed (see L</_get_item_documents>).
+
 =cut
 
 sub _item_hidden_in_opac_custom {
@@ -1160,6 +1175,10 @@ community C<available> flag, which does treat C<onloan> as unavailable.
 
 C<$intransit> and C<$blocked_by_hold> are the batch-computed booleans for this item
 (see L</_get_item_documents>).
+
+The result is stored in the index when the record is indexed: a plugin whose
+answer changes (new rules, configuration, data) must have the affected records
+reindexed (see L</_get_item_documents>).
 
 =cut
 
