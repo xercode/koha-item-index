@@ -169,15 +169,22 @@ sub resume {
 
 $hold->delete();
 
+Deleting an active item-level hold changes the onrequest/onhold status of its
+item, so the biblio is reindexed (Bug XXXXX).
+
 =cut
 
 sub delete {
     my ($self) = @_;
 
+    my $affects_item_status = $self->_affects_item_search_status;
+
     my $deleted = $self->SUPER::delete($self);
 
     logaction( 'HOLDS', 'DELETE', $self->reserve_id, $self )
         if C4::Context->preference('HoldsLog');
+
+    $self->_reindex_biblio_for_item_status if $deleted && $affects_item_status;
 
     return $deleted;
 }
@@ -264,6 +271,7 @@ sub move_hold {
             priority     => $new_priority,
         }
     );
+
 
     C4::Log::logaction( 'HOLDS', 'MODIFY', $self->reserve_id, $self, undef, $original )
         if C4::Context->preference('HoldsLog');

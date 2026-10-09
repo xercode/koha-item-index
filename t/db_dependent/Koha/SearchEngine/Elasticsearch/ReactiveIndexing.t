@@ -25,7 +25,7 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 6;
+use Test::More tests => 7;
 use Test::MockModule;
 
 use Koha::Database;
@@ -126,6 +126,45 @@ subtest 'Koha::Hold reactive reindex (Bug XXXXX)' => sub {
     reset_calls();
     Koha::Hold->new( {%hold_info} )->store;
     is( scalar @index_calls, 0, 'no reindex when SearchEngine is not Elasticsearch' );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'Koha::Hold->delete reindex (Bug XXXXX)' => sub {
+    plan tests => 2;
+
+    $schema->storage->txn_begin;
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
+
+    my $library  = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $patron   = $builder->build_object( { class => 'Koha::Patrons' } );
+    my $biblio_1 = $builder->build_sample_biblio;
+    my $biblio_2 = $builder->build_sample_biblio;
+    my $item_1   = $builder->build_sample_item( { biblionumber => $biblio_1->biblionumber } );
+    my $item_2   = $builder->build_sample_item( { biblionumber => $biblio_2->biblionumber } );
+
+    my %hold_info = (
+        borrowernumber  => $patron->borrowernumber,
+        biblionumber    => $biblio_1->biblionumber,
+        itemnumber      => $item_1->itemnumber,
+        branchcode      => $library->branchcode,
+        reservedate     => dt_from_string->ymd,
+        item_level_hold => 1,
+        priority        => 1,
+    );
+
+    # Deleting an active item-level hold (e.g. Koha::Patron->lock with
+    # remove) changes the onrequest status of its item.
+    my $hold = Koha::Hold->new( {%hold_info} )->store;
+    reset_calls();
+    $hold->delete;
+    is_deeply( \@index_calls, [ $biblio_1->biblionumber ], 'deleting an active item-level hold reindexes its biblio' );
+
+    # A record-level hold does not affect any item document.
+    $hold = Koha::Hold->new( { %hold_info, itemnumber => undef, item_level_hold => 0 } )->store;
+    reset_calls();
+    $hold->delete;
+    is( scalar @index_calls, 0, 'deleting a record-level hold does not reindex' );
 
     $schema->storage->txn_rollback;
 };
