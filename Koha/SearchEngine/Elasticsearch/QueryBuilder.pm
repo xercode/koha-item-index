@@ -722,6 +722,43 @@ sub _parse_item_date_range {
     return \%range;
 }
 
+=head2 _expand_search_filters
+
+    my ( $limits, $query_limits ) = $builder->_expand_search_filters(\@limits);
+
+Replaces every C<search_filter:E<lt>idE<gt>> limit with the limits of the saved
+search filter, recursively, so that they go through the same routing as the
+other limits (e.g. item limits to the nested items channel). The query part of
+each filter is returned separately in C<$query_limits>, to be added as a string
+limit. Unknown filters are dropped, and a filter is expanded only once.
+
+=cut
+
+sub _expand_search_filters {
+    my ( $self, $limits, $seen ) = @_;
+
+    $seen //= {};
+    my ( @limits, @query_limits );
+    for my $limit ( @{ $limits // [] } ) {
+        unless ( $limit =~ /^search_filter:(.*)$/ ) {
+            push @limits, $limit;
+            next;
+        }
+        my $filter_id = $1;
+        next if $seen->{$filter_id}++;
+        my $search_filter = Koha::SearchFilters->find($filter_id);
+        next unless $search_filter;
+
+        my ( $filter_limits, $filter_query )        = $search_filter->expand_filter;
+        my ( $nested_limits, $nested_query_limits ) = $self->_expand_search_filters( $filter_limits, $seen );
+        push @limits,       @$nested_limits;
+        push @query_limits, @$nested_query_limits;
+        push @query_limits, $filter_query if defined $filter_query && $filter_query ne '';
+    }
+
+    return ( \@limits, \@query_limits );
+}
+
 =head2 _library_limit_to_item_filter
 
     my $filter = $builder->_library_limit_to_item_filter('multibranchlimit:5');
@@ -1030,7 +1067,10 @@ sub build_query_compat {
         # $user_item_filters are the ones the user chose (facets, onrequest and
         # the routed item operands above); @auto_item_filters are the ones the
         # OPAC always enforces (hiding, lost).
-        my ( $user_item_filters, $remaining_limits ) = $self->_extract_item_filters($orig_limits);
+        # Saved search filters are expanded first, so that their item limits are
+        # routed like any other limit; their query part stays a string limit.
+        my ( $expanded_limits,   $filter_query_limits ) = $self->_expand_search_filters($orig_limits);
+        my ( $user_item_filters, $remaining_limits )    = $self->_extract_item_filters($expanded_limits);
         push @$user_item_filters, @operand_item_filters;
 
         # Describe the user-supplied item filters (not the automatic ones) so the
@@ -1097,6 +1137,7 @@ sub build_query_compat {
         # is shown.
 
         $limits = $self->_fix_limit_special_cases($remaining_limits);
+        push @$limits, map { $self->clean_search_term($_) } @$filter_query_limits;
         if ( $params->{suppress} ) { push @$limits, "suppress:false"; }
 
         # We build a string query from limits and the queries. An alternative

@@ -1330,7 +1330,7 @@ subtest 'library_limit_facet_tokens() tests (Bug XXXXX)' => sub {
 };
 
 subtest "Handle search filters" => sub {
-    plan tests => 7;
+    plan tests => 8;
 
     my $qb;
 
@@ -1348,17 +1348,25 @@ subtest "Handle search filters" => sub {
     )->store;
     my $filter_id = $filter->id;
 
-    my ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc ) =
+    my ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc ) =
         $qb->build_query_compat( undef, undef, undef, ["search_filter:$filter_id"] );
 
+    # The item type limits of the filter are routed to the nested items channel
+    # (Bug XXXXX), like any other item type limit; the rest stays a string limit.
     is(
-        $limit, q{(available:true) AND (((cat) AND title:(bat) OR author:(rat))) AND itype:(("BK") OR ("MU"))},
+        $limit, q{(available:true) AND (((cat) AND title:(bat) OR author:(rat)))},
         "Limit correctly formed"
     );
     is( $limit_cgi, "&limit=search_filter%3A$filter_id", "CGI limit is not expanded" );
-    is(
-        $limit_desc, q{(available:true) AND (((cat) AND title:(bat) OR author:(rat))) AND itype:(("BK") OR ("MU"))},
+    like(
+        $limit_desc, qr/^\Q(available:true) AND (((cat) AND title:(bat) OR author:(rat)))\E and /,
         "Limit description is correctly expanded"
+    );
+    my ($nested) = grep { $_->{nested} } @{ $query->{query}{bool}{filter} || [] };
+    is_deeply(
+        $nested->{nested}{query}{bool}{filter},
+        [ { terms => { 'items.itype' => [ 'BK', 'MU' ] } } ],
+        "Item type limits of the filter are routed to the nested items channel"
     );
 
     $filter = Koha::SearchFilter->new(
