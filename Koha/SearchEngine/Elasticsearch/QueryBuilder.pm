@@ -2339,23 +2339,26 @@ sub _is_safe_to_auto_truncate {
 
 Passed in a query, this function converts a geolocation query into the necessary format for Elasticsearch
 
+The geolocation filter is added to the query built by L</build_query>, which is
+kept as is: the user query string, the field match boosts and the item filters
+(including the OPAC hidden-item suppression) still apply.
+
 =cut
 
 sub _rebuild_to_es_advanced_query {
     my ($res) = @_;
-    my $query_string = $res->{query}->{query_string};
-    $query_string->{query} = '*' unless $query_string->{query};
-    delete $res->{query}->{query_string};
 
-    my %filter;
+    my @filters;
     for my $advanced_query (@$es_advanced_searches) {
         if ( $advanced_query->{field} eq 'geolocation' ) {
             my ( $lat, $lon, $distance ) = map { $_ =~ /:(.*)\*/ } split( '\s+', $advanced_query->{operand} );
-            $filter{geo_distance} = {
-                distance    => $distance,
-                geolocation => {
-                    lat => $lat,
-                    lon => $lon,
+            push @filters, {
+                geo_distance => {
+                    distance    => $distance,
+                    geolocation => {
+                        lat => $lat,
+                        lon => $lon,
+                    }
                 }
             };
         } else {
@@ -2363,12 +2366,14 @@ sub _rebuild_to_es_advanced_query {
         }
     }
 
-    $res->{query} = {
-        bool => {
-            must   => { query_string => $query_string },
-            filter => \%filter,
-        }
-    };
+    # The geolocation operand is taken out of the query string, which may be
+    # left empty when it was the only operand: search everything then.
+    for my $must ( @{ $res->{query}->{bool}->{must} || [] } ) {
+        my $query_string = $must->{query_string} or next;
+        $query_string->{query} = '*' unless defined $query_string->{query} && $query_string->{query} =~ /\S/;
+    }
+
+    push @{ $res->{query}->{bool}->{filter} }, @filters;
 
     return $res;
 }
