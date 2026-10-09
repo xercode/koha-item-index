@@ -667,6 +667,10 @@ C<$value> as a single date or a C<< from - to >> range.
 
 =back
 
+Double quotes wrapping the whole value (e.g. the C<q="..."> of the call number
+links in the search results) are removed first: the item subfields are keywords,
+so the quotes would otherwise be matched literally.
+
 Returns undef when the value is empty (or, for a range, parses to nothing).
 
 =cut
@@ -674,7 +678,9 @@ Returns undef when the value is empty (or, for a range, parses to nothing).
 sub _item_operand_to_filter {
     my ( $self, $spec, $value ) = @_;
 
-    return unless defined $value && $value ne '';
+    return unless defined $value;
+    $value =~ s/^\s*"(.*)"\s*$/$1/;
+    return if $value eq '';
     my $sub = $spec->{subfield};
 
     if ( $spec->{kind} eq 'range' ) {
