@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 16;
+use Test::More tests => 17;
 
 use List::Util qw( all );
 
@@ -1219,6 +1219,37 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
     is_deeply( $flat_limits, ['(NOT *:*)'], "_fix_limit_special_cases turns it into a limit that matches nothing" );
 
     $schema->storage->txn_rollback;
+};
+
+subtest 'build_query_compat() geolocation operand keeps the rest of the query (Bug XXXXX)' => sub {
+
+    plan tests => 6;
+
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'homebranch' );
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+    my $geo_operand = 'lat:48.25* lng:16.35* distance:100km*';
+
+    my ( undef, $query ) = $qb->build_query_compat(
+        ['AND'], [ 'perl', $geo_operand ], [ 'title', 'geolocation' ], ['branch:CPL'], undef, undef,
+        undef, { is_opac => 1 }
+    );
+    my $bool = $query->{query}{bool};
+    like( $bool->{must}[0]{query_string}{query}, qr/perl/, 'The query string of the other operands is kept' );
+    my @geo    = grep { $_->{geo_distance} } @{ $bool->{filter} };
+    my @nested = grep { $_->{nested} } @{ $bool->{filter} };
+    is( scalar @geo, 1, 'The geolocation filter is added' );
+    is_deeply(
+        $geo[0]{geo_distance},
+        { distance => '100km', geolocation => { lat => '48.25', lon => '16.35' } },
+        'The geolocation filter has the requested point and distance'
+    );
+    is( scalar @nested, 1, 'The item filter (library limit) is kept' );
+
+    ( undef, $query ) =
+        $qb->build_query_compat( ['AND'], [$geo_operand], ['geolocation'], undef, undef, undef, undef, {} );
+    $bool = $query->{query}{bool};
+    is( $bool->{must}[0]{query_string}{query}, '*', 'A geolocation-only search matches everything else' );
+    is( scalar( grep { $_->{geo_distance} } @{ $bool->{filter} } ), 1, 'and keeps the geolocation filter' );
 };
 
 subtest 'library_limit_facet_tokens() tests (Bug XXXXX)' => sub {
