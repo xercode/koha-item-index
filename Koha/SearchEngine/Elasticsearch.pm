@@ -33,6 +33,7 @@ use Koha::AuthorisedValueCategories;
 use C4::Heading;
 use C4::AuthoritiesMarc qw( GuessAuthTypeCode );
 use C4::Biblio;
+use Koha::Biblios;
 use Koha::Biblioitems;
 use Koha::Items;
 use Koha::Item::Transfers;
@@ -67,7 +68,9 @@ use JSON::PP  ();
 use YAML::XS;
 
 use List::Util qw( sum0 );
+use MARC::Field;
 use MARC::File::XML;
+use MARC::Record;
 use MIME::Base64 qw( encode_base64 );
 use Encode       qw( encode );
 use Business::ISBN;
@@ -79,6 +82,13 @@ __PACKAGE__->mk_accessors(qw( sort_fields ));
 # Constants to refer to the standard index names
 Readonly our $BIBLIOS_INDEX     => 'biblios';
 Readonly our $AUTHORITIES_INDEX => 'authorities';
+
+# Version of the nested items schema (Bug XXXXX), written to the
+# items_schema_version field of every catalogued record. It tells the documents
+# indexed before a change to the items schema apart, e.g. to fill a new item
+# subfield from items.marc in place, without reindexing. Version 1 introduces
+# items.marc.
+Readonly our $ITEMS_SCHEMA_VERSION => 1;
 
 =head1 NAME
 
@@ -285,6 +295,10 @@ sub get_elasticsearch_mappings {
         # mapping directly from the dedicated 'item' section of field_config.yaml.
         if ( $self->index eq $BIBLIOS_INDEX ) {
             $mappings->{properties}{items} = clone( _get_elasticsearch_field_config( 'item', '' ) );
+
+            # Mapped explicitly so that range queries on the version (see
+            # $ITEMS_SCHEMA_VERSION) do not depend on dynamic mapping.
+            $mappings->{properties}{items_schema_version} = { type => 'integer' };
         }
 
         # Disable date and numeric detection to prevent Elasticsearch from
@@ -657,6 +671,15 @@ Using mappings stored in database convert C<$marc_records> to Elasticsearch docu
 Returns array of hash references, representing Elasticsearch documents,
 acceptable as body payload in C<Search::Elasticsearch> requests.
 
+For the biblios index, a record in the catalogue is indexed with the item fields
+of its items in the database, whatever item fields it is passed with (Bug XXXXX):
+the mappings and the C<elasticsearch_to_document> plugin hook get the record with
+them, but the stored MARC (C<marc_data>, C<marc_data_array>) leaves them out.
+Each item keeps its own field in C<items.marc> instead, and
+C<Koha::SearchEngine::Elasticsearch::Search-E<gt>decode_record_from_result> adds
+them back. So the records do not need their items embedded. A record that is not
+in the catalogue is indexed as it is passed.
+
 =over 4
 
 =item C<$marc_documents>
@@ -687,19 +710,46 @@ sub marc_records_to_documents {
     # so transit/hold status and library geolocation are resolved with grouped
     # queries instead of one lookup per item inside the loop below.
     my $item_documents = {};
+    my ( $biblionumber_tag, $biblionumber_code, $item_tag );
     if ( $self->index eq $BIBLIOS_INDEX ) {
-        my ( $tag, $code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
+        ( $biblionumber_tag, $biblionumber_code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
+        ($item_tag) = C4::Biblio::GetMarcFromKohaField('items.itemnumber');
         my @biblionumbers;
         foreach my $record ( @{$records} ) {
-            my $field = $record->field($tag);
+            my $field = $record->field($biblionumber_tag);
             next unless $field;
-            push @biblionumbers, $field->is_control_field ? $field->data : $field->subfield($code);
+            push @biblionumbers, $field->is_control_field ? $field->data : $field->subfield($biblionumber_code);
         }
         $item_documents = $self->_get_item_documents( \@biblionumbers );
     }
 
-    foreach my $record ( @{$records} ) {
+    foreach my $source_record ( @{$records} ) {
+        my $record          = $source_record;
         my $record_document = {};
+
+        # A record in the catalogue is indexed with the item fields of its
+        # items in the database (Bug XXXXX), whatever item fields it comes
+        # with: the mappings and the elasticsearch_to_document hook get them,
+        # but the stored MARC leaves them out, as each item keeps its own in
+        # items.marc. A record that is not in the catalogue has no items in the
+        # database, and is indexed as it comes.
+        my ( $biblionumber_field, $biblionumber, $catalogued );
+        if ( $self->index eq $BIBLIOS_INDEX ) {
+            $biblionumber_field = $record->field($biblionumber_tag);
+            if ($biblionumber_field) {
+                $biblionumber =
+                      $biblionumber_field->is_control_field
+                    ? $biblionumber_field->data
+                    : $biblionumber_field->subfield($biblionumber_code);
+                $catalogued = defined $biblionumber && exists $item_documents->{$biblionumber};
+            }
+        }
+        if ($catalogued) {
+            $record = MARC::Record->new;
+            $record->leader( $source_record->leader );
+            $record->append_fields( grep { $_->tag ne $item_tag } $source_record->fields );
+            $self->_append_item_fields( $record, $item_documents->{$biblionumber} );
+        }
 
         if ( $self->index eq 'authorities' ) {
             my $authtypecode = GuessAuthTypeCode($record);
@@ -866,8 +916,14 @@ sub marc_records_to_documents {
 
         # TODO: Perhaps should check if $records_document non empty, but really should never be the case
         $record->encoding('UTF-8');
+        my $stored_record = $record;
+        if ($catalogued) {
+            $stored_record = MARC::Record->new;
+            $stored_record->leader( $record->leader );
+            $stored_record->append_fields( grep { $_->tag ne $item_tag } $record->fields );
+        }
         if ($use_array) {
-            $record_document->{'marc_data_array'} = $self->_marc_to_array($record);
+            $record_document->{'marc_data_array'} = $self->_marc_to_array($stored_record);
             $record_document->{'marc_format'}     = 'ARRAY';
         } else {
             my @warnings;
@@ -876,7 +932,7 @@ sub marc_records_to_documents {
                 local $SIG{__WARN__} = sub {
                     push @warnings, $_[0];
                 };
-                my $usmarc_record = $record->as_usmarc();
+                my $usmarc_record = $stored_record->as_usmarc();
 
                 #NOTE: Try to round-trip the record to prove it will work for retrieval after searching
                 my $decoded_usmarc_record;
@@ -895,12 +951,12 @@ sub marc_records_to_documents {
             if (@warnings) {
 
                 # Suppress warnings if record length exceeded
-                unless ( substr( $record->leader(), 0, 5 ) eq '99999' ) {
+                unless ( substr( $stored_record->leader(), 0, 5 ) eq '99999' ) {
                     foreach my $warning (@warnings) {
                         carp $warning;
                     }
                 }
-                $record_document->{'marc_data'}   = $record->as_xml_record($marcflavour);
+                $record_document->{'marc_data'}   = $stored_record->as_xml_record($marcflavour);
                 $record_document->{'marc_format'} = 'MARCXML';
             } else {
                 $record_document->{'marc_format'} = 'base64ISO2709';
@@ -919,27 +975,24 @@ sub marc_records_to_documents {
 
         # Check if there is at least one available item, and attach the nested
         # item documents (Bug XXXXX) built up front for this batch.
-        if ( $self->index eq $BIBLIOS_INDEX ) {
-            my ( $tag, $code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
-            my $field = $record->field($tag);
-            if ($field) {
-                my $biblionumber = $field->is_control_field ? $field->data : $field->subfield($code);
-                my $avail_items  = Koha::Items->search(
-                    {
-                        biblionumber => $biblionumber,
-                        onloan       => undef,
-                        itemlost     => 0,
-                    }
-                )->count;
+        if ($biblionumber_field) {
+            my $avail_items = Koha::Items->search(
+                {
+                    biblionumber => $biblionumber,
+                    onloan       => undef,
+                    itemlost     => 0,
+                }
+            )->count;
 
-                $record_document->{available} = $avail_items ? \1 : \0;
-                $record_document->{items}     = $item_documents->{$biblionumber} // [];
+            $record_document->{available} = $avail_items ? \1 : \0;
+            $record_document->{items}     = $item_documents->{$biblionumber} // [];
 
-                # Record-level item count (Bug XXXXX). Structural (patron
-                # independent): lets a query tell "record with no items" apart
-                # from "record whose items are all filtered out".
-                $record_document->{items_count} = scalar @{ $record_document->{items} };
-            }
+            # Record-level item count (Bug XXXXX). Structural (patron
+            # independent): lets a query tell "record with no items" apart
+            # from "record whose items are all filtered out".
+            $record_document->{items_count} = scalar @{ $record_document->{items} };
+
+            $record_document->{items_schema_version} = $ITEMS_SCHEMA_VERSION if $catalogued;
         }
 
         Koha::Plugins->call(
@@ -961,7 +1014,14 @@ sub marc_records_to_documents {
     my $items_by_biblio = $self->_get_item_documents(\@biblionumbers);
 
 Builds the C<items> nested objects (Bug XXXXX) for a batch of biblionumbers and
-returns a hashref mapping each biblionumber to an arrayref of item documents.
+returns a hashref mapping each biblionumber to an arrayref of item documents,
+sorted by C<itemnumber>. Every biblionumber of a record in the catalogue has an
+entry, empty if the record has no items, so a missing entry means that the
+record is not in the catalogue.
+
+Each item document carries the item's MARC field in C<marc> (see
+L</_item_field_to_marc>), built by C<Koha::Item-E<gt>as_marc_field> as when the
+items are embedded in the record, with the framework resolved once per record.
 
 Item-level state that does not live in the C<items> table (transit and hold
 status) and the libraries' geolocation are resolved with grouped queries over
@@ -986,7 +1046,17 @@ sub _get_item_documents {
     my %items_by_biblio;
     return \%items_by_biblio unless @{$biblionumbers};
 
-    my @items       = Koha::Items->search( { biblionumber => { -in => $biblionumbers } } )->as_list;
+    # The framework of each record, needed to build the item MARC fields. It
+    # also tells which records are in the catalogue.
+    my %frameworkcode_by_biblio =
+        map { $_->biblionumber => $_->frameworkcode }
+        Koha::Biblios->search( { biblionumber => { -in => $biblionumbers } } )->as_list;
+    $items_by_biblio{$_} = [] for keys %frameworkcode_by_biblio;
+
+    my @items = Koha::Items->search(
+        { biblionumber => { -in  => $biblionumbers } },
+        { order_by     => { -asc => 'itemnumber' } }
+    )->as_list;
     my @itemnumbers = map { $_->itemnumber } @items;
     return \%items_by_biblio unless @items;
 
@@ -1096,10 +1166,103 @@ sub _get_item_documents {
         $document->{home_geolocation}    = $home_geolocation    if defined $home_geolocation;
         $document->{holding_geolocation} = $holding_geolocation if defined $holding_geolocation;
 
+        # The item's MARC field, built as when the items are embedded in the
+        # record (Koha::Filter::MARC::EmbedItems), so that the record rebuilt
+        # from the index is the same.
+        my $marc_field = $item->as_marc_field( { frameworkcode => $frameworkcode_by_biblio{ $item->biblionumber } } );
+        $document->{marc} = $self->_item_field_to_marc($marc_field) if $marc_field;
+
         push @{ $items_by_biblio{ $item->biblionumber } }, $document;
     }
 
     return \%items_by_biblio;
+}
+
+=head2 _item_field_to_marc
+
+    my $marc = $self->_item_field_to_marc($field);
+
+Converts an item C<MARC::Field> into the string stored in C<items.marc>
+(Bug XXXXX): the field data as in ISO2709, without the field terminator. That is,
+the two indicators followed by every subfield, each one made of the subfield
+delimiter (C<0x1F>), the code and the value:
+
+    "  \x1faCPL\x1fbCPL\x1fp39000001"
+
+The tag is not stored: it is the item tag of the MARC flavour. A single string
+per item is smaller than a structure, and much faster to parse when a search
+result is decoded.
+
+A value cannot contain the subfield delimiter in a valid MARC record, but an item
+column could. It would split the subfield when the field is read back, so it is
+removed, with a warning.
+
+=cut
+
+sub _item_field_to_marc {
+    my ( $self, $field ) = @_;
+
+    my $marc = $field->indicator(1) . $field->indicator(2);
+    for my $subfield ( $field->subfields ) {
+        my ( $code, $value ) = @{$subfield};
+        if ( $value =~ tr/\x1f//d ) {
+            carp sprintf(
+                'Removed the subfield delimiter (0x1F) from the value of subfield %s of item field %s',
+                $code, $field->tag
+            );
+        }
+        $marc .= "\x1f$code$value";
+    }
+
+    return $marc;
+}
+
+=head2 _item_marc_to_field
+
+    my $field = $self->_item_marc_to_field( $tag, $marc );
+
+Converts the C<items.marc> string of an item back into a C<MARC::Field> with the
+given tag. The reverse of L</_item_field_to_marc>.
+
+=cut
+
+sub _item_marc_to_field {
+    my ( $self, $tag, $marc ) = @_;
+
+    my ( $indicators, @subfields ) = split /\x1f/, $marc;
+
+    return MARC::Field->new(
+        $tag,
+        substr( $indicators, 0, 1 ),
+        substr( $indicators, 1, 1 ),
+        map { ( substr( $_, 0, 1 ), substr( $_, 1 ) ) } @subfields
+    );
+}
+
+=head2 _append_item_fields
+
+    $self->_append_item_fields( $record, $item_documents );
+
+Appends to C<$record> the item fields stored in the C<marc> subfield of the
+given item documents (Bug XXXXX), in C<itemnumber> order, which is the order in
+which they are embedded in the record. Item documents without C<marc>, such as
+the ones indexed before it existed, are skipped.
+
+=cut
+
+sub _append_item_fields {
+    my ( $self, $record, $item_documents ) = @_;
+
+    my @marcs =
+        map  { $_->{marc} }
+        sort { $a->{itemnumber} <=> $b->{itemnumber} }
+        grep { $_->{marc} } @{ $item_documents // [] };
+    return unless @marcs;
+
+    my ($item_tag) = C4::Biblio::GetMarcFromKohaField('items.itemnumber');
+    $record->append_fields( map { $self->_item_marc_to_field( $item_tag, $_ ) } @marcs );
+
+    return;
 }
 
 =head2 _item_hook_plugins

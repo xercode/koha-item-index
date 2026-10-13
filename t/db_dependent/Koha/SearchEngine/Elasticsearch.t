@@ -18,7 +18,7 @@
 use Modern::Perl;
 use Encode;
 
-use Test::More tests => 12;
+use Test::More tests => 13;
 use Test::NoWarnings;
 use Test::Warn;
 use Test::Exception;
@@ -30,11 +30,16 @@ use Test::MockModule;
 
 use JSON::PP ();
 use MARC::Record;
+use MIME::Base64 qw( decode_base64 encode_base64 );
 use Try::Tiny;
 use List::Util qw( any );
 
 use C4::AuthoritiesMarc qw( AddAuthority );
 use C4::Biblio;
+use C4::Items;
+
+use Koha::Caches;
+use Koha::Cache::Memory::Lite;
 
 use Koha::SearchEngine::Elasticsearch;
 use Koha::SearchEngine::Elasticsearch::Search;
@@ -1626,6 +1631,211 @@ subtest '_get_item_documents resolves the item hook plugins once per batch' => s
     $es->_get_item_documents( \@biblionumbers );
     is( $enabled_plugins_cnt, 0, 'no plugin lookup when plugins are disabled' );
 };
+
+subtest 'marc_records_to_documents stores the item fields in items.marc (Bug XXXXX)' => sub {
+    plan tests => 4;
+
+    my $see = Koha::SearchEngine::Elasticsearch::Search->new(
+        { index => $Koha::SearchEngine::Elasticsearch::BIBLIOS_INDEX } );
+    my $mappings = $see->get_elasticsearch_mappings();
+
+    subtest 'the item field as a string' => sub {
+        plan tests => 4;
+
+        my $field = MARC::Field->new( '952', '1', ' ', a => 'CPL', p => 39000001, z => 'A note' );
+        my $marc  = $see->_item_field_to_marc($field);
+        is( $marc, "1 \x1faCPL\x1fp39000001\x1fzA note", 'the string is the field data as in ISO2709' );
+        is_deeply(
+            [ map { $_->as_usmarc } $see->_item_marc_to_field( '952', $marc ) ],
+            [ $field->as_usmarc ], 'the string is converted back into the same field'
+        );
+
+        my $broken = MARC::Field->new( '952', ' ', ' ', a => 'CPL', z => "Two\x1fparts" );
+        warning_like { $marc = $see->_item_field_to_marc($broken) }
+        qr/Removed the subfield delimiter \(0x1F\) from the value of subfield z of item field 952/,
+            'a subfield delimiter in a value is reported';
+        is_deeply(
+            [ $see->_item_marc_to_field( '952', $marc )->subfields ],
+            [ [ a => 'CPL' ], [ z => 'Twoparts' ] ],
+            'and removed, so that it does not split the subfield'
+        );
+    };
+
+    subtest 'mappings' => sub {
+        plan tests => 2;
+
+        my $marc_mapping = $mappings->{properties}{items}{properties}{marc};
+        ok(
+            $marc_mapping->{type} eq 'keyword' && !$marc_mapping->{index} && !$marc_mapping->{doc_values},
+            'items.marc is a string stored but not indexed'
+        );
+        is_deeply(
+            $mappings->{properties}{items_schema_version}, { type => 'integer' },
+            'items_schema_version is mapped as an integer'
+        );
+    };
+
+    for my $marcflavour (qw( MARC21 UNIMARC )) {
+        subtest $marcflavour => sub {
+            plan tests => 15;
+
+            $schema->storage->txn_begin;
+
+            t::lib::Mocks::mock_preference( 'marcflavour',             $marcflavour );
+            t::lib::Mocks::mock_preference( 'ElasticsearchMARCFormat', 'base64ISO2709' );
+            simulate_unimarc_framework() if $marcflavour eq 'UNIMARC';
+
+            my ($item_tag) = C4::Biblio::GetMarcFromKohaField('items.itemnumber');
+            is( $item_tag, $marcflavour eq 'UNIMARC' ? '995' : '952', "the item tag is $item_tag" );
+
+            # An unlinked item subfield, kept in more_subfields_xml
+            $schema->resultset('MarcSubfieldStructure')
+                ->update_or_create(
+                { frameworkcode => '', tagfield => $item_tag, tagsubfield => 'X', kohafield => '', tab => 10 } );
+            clear_framework_caches();
+
+            my $builder = t::lib::TestBuilder->new;
+            my $biblio  = $builder->build_sample_biblio;
+            my @items   = map { $builder->build_sample_item( { biblionumber => $biblio->biblionumber } ) } 1 .. 3;
+            $items[1]->more_subfields_xml( C4::Items::_get_unlinked_subfields_xml( [ X => 'Unlinked' ] ) )->store;
+            $_->discard_changes for @items;
+
+            my $embedded = $biblio->metadata_record( { embed_items => 1 } );
+            my $plain    = $biblio->metadata->record;
+            my $stale    = $biblio->metadata->record;
+            $stale->append_fields( MARC::Field->new( $item_tag, ' ', ' ', p => 'STALE' ) );
+
+            my @hook_records;
+            my $plugins = Test::MockModule->new('Koha::Plugins');
+            $plugins->mock(
+                'call',
+                sub {
+                    my ( $class, $method, $params ) = @_;
+                    push @hook_records, $params->{record} if $method eq 'elasticsearch_to_document';
+                    return;
+                }
+            );
+            my ( $embedded_doc, $plain_doc, $stale_doc ) =
+                @{ $see->marc_records_to_documents( [ $embedded, $plain, $stale ] ) };
+
+            my $stored = MARC::Record->new_from_usmarc( decode_base64( $embedded_doc->{marc_data} ) );
+            is(
+                scalar( my @stored_item_fields = $stored->field($item_tag) ), 0,
+                'the stored MARC leaves the item fields out'
+            );
+            is_deeply(
+                [ $plain_doc->{marc_data},    $stale_doc->{marc_data} ],
+                [ $embedded_doc->{marc_data}, $embedded_doc->{marc_data} ],
+                'the stored MARC does not depend on the item fields the record comes with'
+            );
+
+            is_deeply(
+                [ map { $_->{marc} } @{ $embedded_doc->{items} } ],
+                [ map { $see->_item_field_to_marc( $_->as_marc_field ) } @items ],
+                'items.marc holds the MARC field of each item, in itemnumber order'
+            );
+            like(
+                $embedded_doc->{items}[1]{marc}, qr/\x1fXUnlinked(?:\x1f|$)/,
+                'items.marc includes the unlinked subfields of more_subfields_xml'
+            );
+            ok( !( grep { ref $_->{marc} } @{ $embedded_doc->{items} } ), 'items.marc is a string' );
+            is( $embedded_doc->{items_schema_version}, 1, 'items_schema_version is set' );
+
+            my $item_fields = sub {
+                [ map { $_->as_formatted } $_[0]->field($item_tag) ]
+            };
+            is_deeply(
+                [ map { $_->as_formatted } $see->decode_record_from_result($embedded_doc)->fields ],
+                [ map { $_->as_formatted } $embedded->fields ],
+                'the decoded record is the record with its items embedded'
+            );
+            is_deeply(
+                [ map { $item_fields->($_) } @hook_records ],
+                [ ( $item_fields->($embedded) ) x 3 ],
+                'the elasticsearch_to_document hook gets the item fields of the items in the database'
+            );
+
+            t::lib::Mocks::mock_preference( 'ElasticsearchMARCFormat', 'ARRAY' );
+            my ($array_doc) = @{ $see->marc_records_to_documents( [$plain] ) };
+            ok(
+                !( grep { exists $_->{$item_tag} } @{ $array_doc->{marc_data_array}{fields} } ),
+                'the stored ARRAY leaves the item fields out'
+            );
+            is_deeply(
+                [ map { $_->as_formatted } $see->decode_record_from_result($array_doc)->fields ],
+                [ map { $_->as_formatted } $embedded->fields ],
+                'the decoded record is the same with the ARRAY format'
+            );
+            t::lib::Mocks::mock_preference( 'ElasticsearchMARCFormat', 'base64ISO2709' );
+
+            # A document indexed before items.marc existed is decoded as stored
+            my $legacy_doc = {
+                %{$embedded_doc},
+                marc_data => encode_base64( Encode::encode( 'UTF-8', $embedded->as_usmarc ) ),
+                items     => [
+                    map {
+                        { %{$_}, marc => undef }
+                    } @{ $embedded_doc->{items} }
+                ],
+            };
+            is_deeply(
+                $item_fields->( $see->decode_record_from_result($legacy_doc) ),
+                $item_fields->($embedded),
+                'a document without items.marc keeps the item fields of its stored MARC'
+            );
+
+            # A record that is not in the catalogue is indexed as it comes
+            my $not_catalogued = MARC::Record->new;
+            $not_catalogued->append_fields(
+                $marcflavour eq 'UNIMARC'
+                ? MARC::Field->new( '001', '999999999' )
+                : MARC::Field->new( '999', ' ', ' ', c => '999999999' ),
+                MARC::Field->new( $item_tag, ' ', ' ', p => 'NOT-CATALOGUED' ),
+            );
+            my ($not_catalogued_doc) = @{ $see->marc_records_to_documents( [$not_catalogued] ) };
+            is_deeply(
+                $item_fields->( $see->decode_record_from_result($not_catalogued_doc) ),
+                $item_fields->($not_catalogued),
+                'a record not in the catalogue keeps its item fields'
+            );
+            ok( !exists $not_catalogued_doc->{items_schema_version}, 'and has no items_schema_version' );
+
+            my $empty_biblio = $builder->build_sample_biblio;
+            my ($empty_doc) = @{ $see->marc_records_to_documents( [ $empty_biblio->metadata->record ] ) };
+            is_deeply(
+                [ $empty_doc->{items}, $empty_doc->{items_schema_version} ], [ [], 1 ],
+                'a record without items has no items and items_schema_version'
+            );
+
+            $schema->storage->txn_rollback;
+            clear_framework_caches();
+        };
+    }
+    t::lib::Mocks::mock_preference( 'marcflavour', 'MARC21' );
+};
+
+# Turn the default framework into a UNIMARC one for the item and record number
+# fields: the items in 995 and the record number in 001.
+sub simulate_unimarc_framework {
+    my $subfields = $schema->resultset('MarcSubfieldStructure')->search( { frameworkcode => '' } );
+    my $tags      = $schema->resultset('MarcTagStructure')->search( { frameworkcode => '' } );
+    $subfields->search( { tagfield => '995' } )->delete;
+    $tags->search( { tagfield => '995' } )->delete;
+    $tags->search( { tagfield => '952' } )->update( { tagfield => '995' } );
+    $subfields->search( { tagfield => '952' } )->update( { tagfield => '995' } );
+    $subfields->search( { kohafield => 'biblio.biblionumber' } )->update( { kohafield => '' } );
+    $subfields->update_or_create(
+        { frameworkcode => '', tagfield => '001', tagsubfield => '@', kohafield => 'biblio.biblionumber', tab => 0 } );
+    clear_framework_caches();
+    return;
+}
+
+sub clear_framework_caches {
+    my $cache = Koha::Caches->get_instance;
+    $cache->clear_from_cache($_) for qw( MarcStructure-0- MarcStructure-1- MarcSubfieldStructure- );
+    Koha::Cache::Memory::Lite->flush;
+    return;
+}
 
 $schema->storage->txn_rollback;
 
