@@ -33,6 +33,8 @@ use JSON;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 
+use Koha::Database;
+
 use Koha::SearchEngine::Elasticsearch::QueryBuilder;
 use Koha::SearchEngine::Elasticsearch::Indexer;
 use Koha::SearchEngine::Elasticsearch::Search;
@@ -53,6 +55,7 @@ $se->mock(
                 title                => { type => 'text' },
                 'local-number__sort' => { type => 'integer' },
                 items_count          => { type => 'integer' },
+                items_schema_version => { type => 'integer' },
                 items                => {
                     type       => 'nested',
                     properties => {
@@ -69,6 +72,7 @@ $se->mock(
                         itype                         => { type => 'keyword' },
                         callnumber                    => { type => 'keyword' },
                         dateaccessioned               => { type => 'date' },
+                        marc => { type => 'keyword', index => JSON::false, doc_values => JSON::false },
                     },
                 },
             },
@@ -441,6 +445,45 @@ subtest 'advanced-search item operands routed to nested' => sub {
         [1],
         'an empty q with an mc-itype limit still matches via the * fallback'
     );
+};
+
+subtest 'the record read from the index has its item fields (Bug XXXXX)' => sub {
+    plan tests => 3;
+
+    my $schema = Koha::Database->new->schema;
+    $schema->storage->txn_begin;
+
+    # Do not reach the (absent) message broker when storing the items
+    my $indexer_module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch::Indexer');
+    $indexer_module->mock( 'index_records', sub { } );
+
+    my $test_builder = t::lib::TestBuilder->new;
+    my $biblio       = $test_builder->build_sample_biblio;
+    $test_builder->build_sample_item( { biblionumber => $biblio->biblionumber } ) for 1 .. 3;
+    $indexer_module->unmock('index_records');
+
+    # Build the document as for the biblios index, and store it in the
+    # throwaway one.
+    my ($document) =
+        @{ Koha::SearchEngine::Elasticsearch->new( { index => 'biblios' } )
+            ->marc_records_to_documents( [ $biblio->metadata->record ] ) };
+    $es->index( index => $searcher->index_name, id => $biblio->biblionumber, body => $document );
+    $es->indices->refresh( index => $searcher->index_name );
+
+    my $results = $searcher->search( { query => { ids => { values => [ $biblio->biblionumber ] } } }, undef, 1 );
+    my $source  = $results->{hits}{hits}[0]{_source};
+    is( $source->{items_schema_version},                     1, 'the document has items_schema_version' );
+    is( scalar( grep { $_->{marc} } @{ $source->{items} } ), 3, 'every item has its MARC field' );
+
+    my $embedded = $biblio->metadata_record( { embed_items => 1 } );
+    is_deeply(
+        [ map { $_->as_formatted } $searcher->decode_record_from_result($source)->fields ],
+        [ map { $_->as_formatted } $embedded->fields ],
+        'the decoded record is the record with its items embedded'
+    );
+
+    $es->delete( index => $searcher->index_name, id => $biblio->biblionumber );
+    $schema->storage->txn_rollback;
 };
 
 eval { $indexer->drop_index; };

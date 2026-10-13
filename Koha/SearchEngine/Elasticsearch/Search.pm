@@ -479,6 +479,10 @@ sub extract_biblionumber {
 
 Extracts marc data from Elasticsearch result and decodes to MARC::Record object
 
+The stored MARC of a record leaves its item fields out, and each nested item
+keeps its own in C<items.marc> (Bug XXXXX): they are added back at the end of
+the record, in C<itemnumber> order, as when the items are embedded in it.
+
 =cut
 
 sub decode_record_from_result {
@@ -486,15 +490,21 @@ sub decode_record_from_result {
     # Result is passed in as array, will get flattened
     # and first element will be $result
     my ( $self, $result ) = @_;
+    my $record;
     if ( $result->{marc_format} eq 'base64ISO2709' ) {
-        return MARC::Record->new_from_usmarc( decode_base64( $result->{marc_data} ) );
+        $record = MARC::Record->new_from_usmarc( decode_base64( $result->{marc_data} ) );
     } elsif ( $result->{marc_format} eq 'MARCXML' ) {
-        return MARC::Record->new_from_xml( $result->{marc_data}, 'UTF-8', uc C4::Context->preference('marcflavour') );
+        $record =
+            MARC::Record->new_from_xml( $result->{marc_data}, 'UTF-8', uc C4::Context->preference('marcflavour') );
     } elsif ( $result->{marc_format} eq 'ARRAY' ) {
-        return $self->_array_to_marc( $result->{marc_data_array} );
+        $record = $self->_array_to_marc( $result->{marc_data_array} );
     } else {
         Koha::Exceptions::Elasticsearch->throw("Missing marc_format field in Elasticsearch result");
     }
+
+    $self->_append_item_fields( $record, $result->{items} );
+
+    return $record;
 }
 
 =head2 max_result_window

@@ -99,7 +99,16 @@ sort:
 #   - boolean            derived/computed status flags
 #   - geo_point          library coordinates for geo_distance proximity search
 #   - date               item dates usable in range queries (date_of_acquisition)
-# All five subfield types are common to Elasticsearch 7 and 8.
+#   - keyword, not indexed  the item's MARC field (marc), stored in _source only
+# All these subfield types are common to Elasticsearch 7 and 8.
+#
+# `marc` holds the item field (952 in MARC21, 995 in UNIMARC) of each item as a
+# string: the field data as in ISO2709, without the field terminator, i.e. the
+# two indicators followed by each subfield code and value, every subfield
+# preceded by the 0x1F delimiter. The MARC stored in marc_data leaves the item
+# fields out, and they are added back from here when a search result is
+# decoded. It is neither indexed nor kept in doc values, so it is not
+# searchable: the item subfields above are the ones to search on.
 item:
   type: nested
   properties:
@@ -157,3 +166,7 @@ item:
       type: geo_point
     holding_geolocation:
       type: geo_point
+    marc:
+      type: keyword
+      index: false
+      doc_values: false
