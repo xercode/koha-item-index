@@ -18,7 +18,7 @@
 use Modern::Perl;
 use Encode;
 
-use Test::More tests => 11;
+use Test::More tests => 12;
 use Test::NoWarnings;
 use Test::Warn;
 use Test::Exception;
@@ -1546,4 +1546,106 @@ subtest 'marc_records_to_documents should compute the nested "available_for_patr
     is_deeply( $afp->(), \1, 'available_for_patron is true for a non-found (pending) hold' );
 };
 
+subtest '_get_item_documents resolves the item hook plugins once per batch' => sub {
+    plan tests => 8;
+
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+
+    my $builder = t::lib::TestBuilder->new;
+    my @biblios = map { $builder->build_sample_biblio } 1 .. 2;
+    my @items   = map {
+        my $biblio = $_;
+        map { $builder->build_sample_item( { biblionumber => $biblio->biblionumber } ) } 1 .. 3
+    } @biblios;
+    my ( $intransit_item, $held_item ) = @items[ 0, 4 ];
+
+    $builder->build_object(
+        {
+            class => 'Koha::Item::Transfers',
+            value => {
+                itemnumber    => $intransit_item->itemnumber,
+                datesent      => '2024-01-01 00:00:00',
+                datearrived   => undef,
+                datecancelled => undef,
+            }
+        }
+    );
+    $builder->build_object(
+        {
+            class => 'Koha::Holds',
+            value => {
+                biblionumber     => $held_item->biblionumber,
+                itemnumber       => $held_item->itemnumber,
+                found            => 'W',
+                cancellationdate => undef,
+                suspend          => 0,
+            }
+        }
+    );
+
+    my $spy                 = Koha::Test::SpyItemHooksPlugin->new;
+    my $enabled_plugins_cnt = 0;
+    my $plugins             = Test::MockModule->new('Koha::Plugins');
+    $plugins->mock( 'get_enabled_plugins', sub { $enabled_plugins_cnt++; return ($spy); } );
+
+    my $es            = Koha::SearchEngine::Elasticsearch->new( { index => 'biblios' } );
+    my @biblionumbers = map { $_->biblionumber } @biblios;
+
+    t::lib::Mocks::mock_config( 'enable_plugins', 1 );
+    my $documents = $es->_get_item_documents( \@biblionumbers );
+
+    is( scalar( map { @{$_} } values %{$documents} ), 6, 'one document per item' );
+    is( $enabled_plugins_cnt,                         1, 'the enabled plugins are looked up once for the whole batch' );
+    is( scalar @{ $spy->{available} },                6, 'item_available_for_patron is called once per item' );
+    is( scalar @{ $spy->{hidden} },                   6, 'item_hidden_in_opac is called once per item' );
+
+    # The hooks get the same arguments as when each item looked its plugins up.
+    my %expected = map { $_->itemnumber => [ 0, 0 ] } @items;
+    $expected{ $intransit_item->itemnumber }->[0] = 1;
+    $expected{ $held_item->itemnumber }->[1]      = 1;
+    is_deeply(
+        {
+            map { $_->{item}->itemnumber => [ $_->{intransit} ? 1 : 0, $_->{blocked_by_hold} ? 1 : 0 ] }
+                @{ $spy->{available} }
+        },
+        \%expected,
+        'item_available_for_patron gets the item, intransit and blocked_by_hold'
+    );
+    is_deeply(
+        [ sort { $a <=> $b } map { $_->{item}->itemnumber } @{ $spy->{hidden} } ],
+        [ sort { $a <=> $b } map { $_->itemnumber } @items ],
+        'item_hidden_in_opac gets the item'
+    );
+
+    # The batch-resolved plugins drive the fields as before.
+    my ($held_document) = grep { $_->{itemnumber} == $held_item->itemnumber } map { @{$_} } values %{$documents};
+    is_deeply( $held_document->{available_for_patron}, \0, 'default conditions apply when the plugin abstains' );
+
+    t::lib::Mocks::mock_config( 'enable_plugins', 0 );
+    $enabled_plugins_cnt = 0;
+    $es->_get_item_documents( \@biblionumbers );
+    is( $enabled_plugins_cnt, 0, 'no plugin lookup when plugins are disabled' );
+};
+
 $schema->storage->txn_rollback;
+
+{
+
+    package Koha::Test::SpyItemHooksPlugin;
+
+    sub new { return bless { available => [], hidden => [] }, shift; }
+
+    sub item_available_for_patron {
+        my ( $self, $params ) = @_;
+        push @{ $self->{available} }, $params;
+        return;    # abstain
+    }
+
+    sub item_hidden_in_opac {
+        my ( $self, $params ) = @_;
+        push @{ $self->{hidden} }, $params;
+        return 0;
+    }
+
+    sub get_metadata { return { name => 'Koha::Test::SpyItemHooksPlugin' }; }
+}
