@@ -1032,6 +1032,12 @@ sub _get_item_documents {
     # OpacHiddenItems rules, evaluated once for the whole batch.
     my $hidden_rules = C4::Context->yaml_preference('OpacHiddenItems') // {};
 
+    # The plugins implementing the item hooks, resolved once for the whole
+    # batch: looking them up for every item was most of the cost of building
+    # the item documents.
+    my ( $hidden_in_opac_plugins, $available_for_patron_plugins ) =
+        $self->_item_hook_plugins( 'item_hidden_in_opac', 'item_available_for_patron' );
+
     # Index the effective item type (Koha::Item->effective_itemtype): the item
     # type of the record unless item-level_itypes is on and the item has its
     # own. The record item types are loaded once for the whole batch.
@@ -1066,11 +1072,11 @@ sub _get_item_documents {
             onhold               => $onhold{$itemnumber}                   ? \1 : \0,
             onrequest            => $onrequest{$itemnumber}                ? \1 : \0,
             available            => ( !$item->onloan && !$item->itemlost ) ? \1 : \0,
-            available_for_patron =>
-                $self->_item_available_for_patron( $item, $intransit{$itemnumber}, $blocking_hold{$itemnumber} )
-            ? \1
-            : \0,
-            hidden_in_opac_custom         => $self->_item_hidden_in_opac_custom($item) ? \1 : \0,
+            available_for_patron => $self->_item_available_for_patron(
+                $item, $intransit{$itemnumber}, $blocking_hold{$itemnumber},
+                $available_for_patron_plugins
+            ) ? \1 : \0,
+            hidden_in_opac_custom => $self->_item_hidden_in_opac_custom( $item, $hidden_in_opac_plugins ) ? \1 : \0,
             hidden_in_opac_by_preferences => $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } )
             ? \1
             : \0,
@@ -1096,14 +1102,42 @@ sub _get_item_documents {
     return \%items_by_biblio;
 }
 
+=head2 _item_hook_plugins
+
+    my ( $hidden_in_opac_plugins, $available_for_patron_plugins ) =
+        $self->_item_hook_plugins( 'item_hidden_in_opac', 'item_available_for_patron' );
+
+Returns, for each hook name passed, an arrayref with the enabled plugins that
+implement it, in the order of C<Koha::Plugins-E<gt>get_enabled_plugins>. The
+enabled plugins are looked up once, whatever the number of hooks. The arrayrefs
+are empty when plugins are disabled.
+
+=cut
+
+sub _item_hook_plugins {
+    my ( $self, @hooks ) = @_;
+
+    my @plugins =
+        C4::Context->config('enable_plugins') ? Koha::Plugins->get_enabled_plugins( { verbose => 0 } ) : ();
+
+    return map {
+        my $hook = $_;
+        [ grep { $_->can($hook) } @plugins ]
+    } @hooks;
+}
+
 =head2 _item_hidden_in_opac_custom
 
-    my $bool = $self->_item_hidden_in_opac_custom($item);
+    my $bool = $self->_item_hidden_in_opac_custom( $item, $plugins );
 
 Custom OPAC item-hiding rules (Bug XXXXX). Feeds the C<item.hidden_in_opac_custom>
 field. Delegates to the C<item_hidden_in_opac> plugin hook, passing the item, and
 is B<restrictive>: it stops and hides the item as soon as the first plugin returns
 a true value, without calling the remaining plugins.
+
+C<$plugins> is an optional arrayref with the plugins implementing the hook, as
+returned by L</_item_hook_plugins>, so that a batch resolves them only once (see
+L</_get_item_documents>). When it is not passed, they are looked up here.
 
 Returns 0 (not hidden) when no plugin vetoes the item, when no plugin implements
 the hook, or when plugins are disabled. This hiding is unconditional (it is not
@@ -1116,13 +1150,11 @@ reindexed (see L</_get_item_documents>).
 =cut
 
 sub _item_hidden_in_opac_custom {
-    my ( $self, $item ) = @_;
+    my ( $self, $item, $plugins ) = @_;
 
-    return 0 unless C4::Context->config('enable_plugins');
+    ($plugins) = $self->_item_hook_plugins('item_hidden_in_opac') unless $plugins;
 
-    my @plugins = grep { $_->can('item_hidden_in_opac') } Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
-
-    for my $plugin (@plugins) {
+    for my $plugin ( @{$plugins} ) {
         my $hidden = eval { $plugin->item_hidden_in_opac( { item => $item } ) };
         if ($@) {
             warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
@@ -1136,7 +1168,7 @@ sub _item_hidden_in_opac_custom {
 
 =head2 _item_available_for_patron
 
-    my $bool = $self->_item_available_for_patron( $item, $intransit, $blocked_by_hold );
+    my $bool = $self->_item_available_for_patron( $item, $intransit, $blocked_by_hold, $plugins );
 
 Patron-facing availability (Bug XXXXX). Feeds the C<item.available_for_patron>
 field: whether a patron could request the loan or consultation of this item. This
@@ -1174,7 +1206,9 @@ never excludes on-loan items). This is what makes the field diverge from the
 community C<available> flag, which does treat C<onloan> as unavailable.
 
 C<$intransit> and C<$blocked_by_hold> are the batch-computed booleans for this item
-(see L</_get_item_documents>).
+(see L</_get_item_documents>). C<$plugins> is an optional arrayref with the plugins
+implementing the hook, as returned by L</_item_hook_plugins>, so that a batch
+resolves them only once. When it is not passed, they are looked up here.
 
 The result is stored in the index when the record is indexed: a plugin whose
 answer changes (new rules, configuration, data) must have the affected records
@@ -1183,33 +1217,30 @@ reindexed (see L</_get_item_documents>).
 =cut
 
 sub _item_available_for_patron {
-    my ( $self, $item, $intransit, $blocked_by_hold ) = @_;
+    my ( $self, $item, $intransit, $blocked_by_hold, $plugins ) = @_;
 
-    if ( C4::Context->config('enable_plugins') ) {
-        my @plugins =
-            grep { $_->can('item_available_for_patron') } Koha::Plugins->get_enabled_plugins( { verbose => 0 } );
+    ($plugins) = $self->_item_hook_plugins('item_available_for_patron') unless $plugins;
 
-        my $saw_true = 0;
-        for my $plugin (@plugins) {
-            my $value = eval {
-                $plugin->item_available_for_patron(
-                    {
-                        item            => $item,
-                        intransit       => $intransit,
-                        blocked_by_hold => $blocked_by_hold,
-                    }
-                );
-            };
-            if ($@) {
-                warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
-                next;
-            }
-            next     unless defined $value;    # abstention
-            return 0 unless $value;            # defined false: not available, short-circuit
-            $saw_true = 1;
+    my $saw_true = 0;
+    for my $plugin ( @{$plugins} ) {
+        my $value = eval {
+            $plugin->item_available_for_patron(
+                {
+                    item            => $item,
+                    intransit       => $intransit,
+                    blocked_by_hold => $blocked_by_hold,
+                }
+            );
+        };
+        if ($@) {
+            warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
+            next;
         }
-        return 1 if $saw_true;                 # some true, no false: available
+        next     unless defined $value;    # abstention
+        return 0 unless $value;            # defined false: not available, short-circuit
+        $saw_true = 1;
     }
+    return 1 if $saw_true;                 # some true, no false: available
 
     # Default conditions (no plugin opinion): not available if any of these holds.
     # `onloan` is deliberately NOT a condition: a checked-out item can still be
