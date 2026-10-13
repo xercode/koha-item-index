@@ -348,8 +348,11 @@ sub _get_record {
     my $record;
 
     if ( $self->index eq $Koha::SearchEngine::BIBLIOS_INDEX ) {
+
+        # Without the items: the indexing adds the item fields of the items
+        # in the database (Bug XXXXX, see marc_records_to_documents).
         my $biblio = Koha::Biblios->find($record_id);
-        $record = $biblio->metadata_record( { embed_items => 1 } )
+        $record = $biblio->metadata_record
             if $biblio;
     } else {
         $record = C4::AuthoritiesMarc::GetAuthority($record_id);

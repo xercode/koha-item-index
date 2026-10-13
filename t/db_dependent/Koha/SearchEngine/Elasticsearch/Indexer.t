@@ -20,13 +20,15 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 6;
+use Test::More tests => 7;
 use Test::MockModule;
 use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 
 use MARC::Record;
+
+use C4::Biblio;
 
 use Koha::Database;
 use Koha::Biblios;
@@ -240,3 +242,23 @@ SKIP: {
     };
 
 }
+
+subtest '_get_record() reads the record without its items (Bug XXXXX)' => sub {
+    plan tests => 2;
+
+    $schema->storage->txn_begin;
+
+    my $indexer_module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch::Indexer');
+    $indexer_module->mock( 'index_records', sub { } );
+
+    my $builder    = t::lib::TestBuilder->new;
+    my $item       = $builder->build_sample_item;
+    my ($item_tag) = C4::Biblio::GetMarcFromKohaField('items.itemnumber');
+
+    my $indexer = Koha::SearchEngine::Elasticsearch::Indexer->new( { index => 'biblios' } );
+    my $record  = $indexer->_get_record( $item->biblionumber );
+    isa_ok( $record, 'MARC::Record' );
+    is( scalar( my @item_fields = $record->field($item_tag) ), 0, 'the item fields are not embedded' );
+
+    $schema->storage->txn_rollback;
+};

@@ -99,7 +99,7 @@ sub get_from_biblionumber {
     my $it = Koha::BiblioUtils->get_all_biblios_iterator(%options);
 
 This will provide an iterator object that will, one by one, provide the
-Koha::BiblioUtils of each biblio. This will include the item data.
+Koha::BiblioUtils of each biblio. By default, this will include the item data.
 
 The iterator is a Koha::MetadataIterator object.
 
@@ -113,6 +113,10 @@ slice may be defined as a hash of two values: index and count. index
 is the slice number to process and count is total number of slices.
 With this information the iterator returns just the given slice of
 records instead of all.
+
+=item C<item_data>
+
+If false, the item data is not embedded in the records. Default is to embed it.
 
 =back
 
@@ -152,7 +156,7 @@ sub get_all_biblios_iterator {
             my $row = $rs->next();
             return if !$row;
             my $next = eval {
-                my $marc = $row->metadata_record( { embed_items => 1 } );
+                my $marc = $row->metadata_record( { embed_items => $options{item_data} // 1 } );
                 $class->new( $marc, $row->biblionumber );
             };
             if ($@) {
