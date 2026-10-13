@@ -1508,18 +1508,24 @@ sub has_pending_recall {
 =head3 as_marc_field
 
     my $field = $item->as_marc_field;
+    my $field = $item->as_marc_field( { frameworkcode => $frameworkcode } );
 
 This method returns a MARC::Field object representing the Koha::Item object
 with the current mappings configuration.
 
+The optional I<frameworkcode> parameter is the framework of the item's record.
+Callers that build the field for many items of a record already know it, and
+passing it saves fetching the record for every item.
+
 =cut
 
 sub as_marc_field {
-    my ($self) = @_;
+    my ( $self, $params ) = @_;
 
     my ( $itemtag, $itemtagsubfield ) = C4::Biblio::GetMarcFromKohaField("items.itemnumber");
 
-    my $tagslib = C4::Biblio::GetMarcStructure( 1, $self->biblio->frameworkcode, { unsafe => 1 } );
+    my $frameworkcode = $params->{frameworkcode} // $self->biblio->frameworkcode;
+    my $tagslib       = C4::Biblio::GetMarcStructure( 1, $frameworkcode, { unsafe => 1 } );
 
     my @subfields;
 
