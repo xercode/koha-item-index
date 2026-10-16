@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 10;
+use Test::More tests => 17;
 
 use List::Util qw( all );
 
@@ -270,7 +270,7 @@ subtest 'build_authorities_query_compat() tests' => sub {
 };
 
 subtest 'build_query tests' => sub {
-    plan tests => 72;
+    plan tests => 73;
 
     my $qb;
 
@@ -294,14 +294,26 @@ subtest 'build_query tests' => sub {
     t::lib::Mocks::mock_preference( 'FacetMaxCount',        '37' );
     t::lib::Mocks::mock_preference( 'DisplayLibraryFacets', 'both' );
     $query = $qb->build_query( 'test', %options );
-    ok( defined $query->{aggregations}{ccode}{terms}{size}, 'we need to ask for a size or we get only 5 facet' );
-    is( $query->{aggregations}{ccode}{terms}{size}, 37, 'we ask for the size as defined by the syspref FacetMaxCount' );
+
+    # ccode, homebranch and holdingbranch are item facets (Bug XXXXX): they
+    # aggregate over the nested items object and, so their bucket counts respect
+    # the active item filters (own fork fix), the terms aggregation is wrapped in
+    # an item_filter sub-aggregation. The terms size therefore lives two levels
+    # down: under item_filter, then under the aggregation named after the facet.
+    ok(
+        defined $query->{aggregations}{ccode}{aggs}{item_filter}{aggs}{ccode}{terms}{size},
+        'we need to ask for a size or we get only 5 facet'
+    );
     is(
-        $query->{aggregations}{homebranch}{terms}{size}, 37,
+        $query->{aggregations}{ccode}{aggs}{item_filter}{aggs}{ccode}{terms}{size}, 37,
+        'we ask for the size as defined by the syspref FacetMaxCount'
+    );
+    is(
+        $query->{aggregations}{homebranch}{aggs}{item_filter}{aggs}{homebranch}{terms}{size}, 37,
         'we ask for the size as defined by the syspref FacetMaxCount for homebranch'
     );
     is(
-        $query->{aggregations}{holdingbranch}{terms}{size}, 37,
+        $query->{aggregations}{holdingbranch}{aggs}{item_filter}{aggs}{holdingbranch}{terms}{size}, 37,
         'we ask for the size as defined by the syspref FacetMaxCount for holdingbranch'
     );
 
@@ -716,10 +728,18 @@ subtest 'build_query tests' => sub {
         ['AND'], ['title:"donald duck"'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
     );
+
+    # Bug XXXXX: the mc-itype,phr item-type limits are routed to the nested
+    # channel, so they leave the flat query_string (the author limit stays flat).
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(title:"donald duck") AND (author:("Dillinger Escaplan")) AND itype:(("BOOK") OR ("CD"))',
-        "Limits quoted correctly when passed as phrase"
+        '(title:"donald duck") AND author:("Dillinger Escaplan")',
+        "Limits quoted correctly when passed as phrase (item type routed to nested)"
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { terms => { 'items.itype' => [ 'BOOK', 'CD' ] } } ],
+        "mc-itype,phr limits become a same-item terms clause on items.itype"
     );
 
     ( undef, $query ) = $qb->build_query_compat(
@@ -784,56 +804,59 @@ subtest 'build_query tests' => sub {
         ['AND'], ['kw:""'], undef,
         [ 'author:Dillinger Escaplan', 'mc-itype,phr:BOOK', 'mc-itype,phr:CD' ]
         );
+
+    # Bug XXXXX: only the flat author limit remains in $limit; the routed
+    # item-type limits are described in limit_desc instead.
     is(
-        $limit, '(author:("Dillinger Escaplan")) AND itype:(("BOOK") OR ("CD"))',
-        "Limit formed correctly when no search terms"
+        $limit, 'author:("Dillinger Escaplan")',
+        "Limit formed correctly when no search terms (item type routed to nested)"
     );
     is(
         $limit_cgi, '&limit=author%3ADillinger%20Escaplan&limit=mc-itype%2Cphr%3ABOOK&limit=mc-itype%2Cphr%3ACD',
         "Limit CGI formed correctly when no search terms"
     );
     is(
-        $limit_desc, '(author:("Dillinger Escaplan")) AND itype:(("BOOK") OR ("CD"))',
-        "Limit desc formed correctly when no search terms"
+        $limit_desc, 'author:("Dillinger Escaplan") and Item types: BOOK and Item types: CD',
+        "Limit desc formed correctly when no search terms (item types described from the nested channel)"
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized= - ']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[* TO *]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[* TO *]',
         'If no date all date-of-acquisition are selected'
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized=2024-08-01 - ']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[2024-08-01 TO *]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[2024-08-01 TO *]',
         'Open start date in date range of an st-date-normalized search is handled properly'
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized= - 2024-08-30']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[* TO 2024-08-30]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[* TO 2024-08-30]',
         'Open end date in date range of an st-date-normalized search is handled properly'
     );
 
     ( undef, $query ) = $qb->build_query_compat(
-        undef, ['barcode123123'], ['bc'],
+        undef, ['barcode123123'], ['ti'],
         ['acqdate,st-date-normalized=2024-08-01 - 2024-08-30']
     );
     is(
         $query->{query}{bool}{must}[0]{query_string}{query},
-        '(barcode:barcode123123) AND date-of-acquisition.raw:[2024-08-01 TO 2024-08-30]',
+        '(title:barcode123123*) AND date-of-acquisition.raw:[2024-08-01 TO 2024-08-30]',
         'Date range in an st-date-normalized search is handled properly'
     );
 };
@@ -1020,7 +1043,7 @@ subtest 'build_query with weighted fields tests' => sub {
 
 subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
 
-    plan tests => 18;
+    plan tests => 20;
 
     $schema->storage->txn_begin;
 
@@ -1062,72 +1085,250 @@ subtest 'build_query_compat() SearchLimitLibrary tests' => sub {
 
     my $query_builder =
         Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+
+    # Bug XXXXX: branch / multibranchlimit limits are routed to the nested
+    # items channel on items.homebranch / items.holdingbranch (terms), instead of
+    # the flat query_string field, so they resolve on the same item. The raw
+    # limit is still kept verbatim in limit_cgi for URL persistence.
+    my $nested_leaf = sub {
+        my ($query)  = @_;
+        my ($nested) = grep { ref $_ eq 'HASH' && $_->{nested} } @{ $query->{query}{bool}{filter} || [] };
+        return $nested ? $nested->{nested}{query}{bool}{filter}[0] : undef;
+    };
+
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'both' );
-    my ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+    my ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
         $query_builder->build_query_compat( undef, undef, undef, ["branch:CPL"], undef, undef, undef, undef );
-    is( $limit,      '(homebranch: "CPL" OR holdingbranch: "CPL")', "Branch limit expanded to home/holding branch" );
-    is( $limit_desc, '(homebranch: "CPL" OR holdingbranch: "CPL")', "Limit description correctly expanded" );
-    is( $limit_cgi,  '&limit=branch%3ACPL',                         "Limit cgi does not get expanded" );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) = $query_builder->build_query_compat(
+    is_deeply(
+        $nested_leaf->($query),
+        {
+            bool => {
+                should => [
+                    { terms => { 'items.homebranch'    => ['CPL'] } },
+                    { terms => { 'items.holdingbranch' => ['CPL'] } },
+                ],
+                minimum_should_match => 1,
+            }
+        },
+        "Branch limit routed to a same-item home/holding disjunction"
+    );
+    is( $limit_cgi, '&limit=branch%3ACPL', "Branch limit cgi is kept verbatim" );
+
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+        $query_builder->build_query_compat(
         undef, undef, undef, ["multibranchlimit:$groupid"], undef, undef, undef,
         undef
+        );
+    is_deeply(
+        $nested_leaf->($query),
+        {
+            bool => {
+                should => [
+                    { terms => { 'items.homebranch'    => \@branchcodes } },
+                    { terms => { 'items.holdingbranch' => \@branchcodes } },
+                ],
+                minimum_should_match => 1,
+            }
+        },
+        "Multibranch limit expanded to the group branches on home/holding"
     );
-    is(
-        $limit,
-        "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\" OR holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "Multibranch limit expanded to home/holding branches"
-    );
-    is(
-        $limit_desc,
-        "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\" OR holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "Multibranch limit description correctly expanded"
-    );
-    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Multibranch limit cgi does not get expanded" );
+    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Multibranch limit cgi is kept verbatim" );
+    like( $limit_desc, qr/\Q@{[ $branch_1->branchname ]}\E/, "Multibranch limit_desc lists the branch names" );
+    like( $limit_desc, qr/\Q@{[ $branch_2->branchname ]}\E/, "Multibranch limit_desc lists the branch names" );
 
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'homebranch' );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
         $query_builder->build_query_compat( undef, undef, undef, ["branch:CPL"], undef, undef, undef, undef );
-    is( $limit,      "(homebranch: \"CPL\")", "branch limit expanded to home branch" );
-    is( $limit_desc, "(homebranch: \"CPL\")", "limit description correctly expanded" );
-    is( $limit_cgi,  "&limit=branch%3ACPL",   "limit cgi does not get expanded" );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) = $query_builder->build_query_compat(
+    is_deeply(
+        $nested_leaf->($query), { term => { 'items.homebranch' => 'CPL' } },
+        "Single-library branch limit routed to an items.homebranch term"
+    );
+    is( $limit_cgi, "&limit=branch%3ACPL", "limit cgi is kept verbatim" );
+
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+        $query_builder->build_query_compat(
         undef, undef, undef, ["multibranchlimit:$groupid"], undef, undef, undef,
         undef
+        );
+    is_deeply(
+        $nested_leaf->($query), { terms => { 'items.homebranch' => \@branchcodes } },
+        "Multibranch limit routed to items.homebranch terms"
     );
-    is(
-        $limit, "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\")",
-        "branch limit expanded to home branch"
-    );
-    is(
-        $limit_desc, "(homebranch: \"$branchcodes[0]\" OR homebranch: \"$branchcodes[1]\")",
-        "limit description correctly expanded"
-    );
-    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Limit cgi does not get expanded" );
+    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "limit cgi is kept verbatim" );
 
     t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'holdingbranch' );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
         $query_builder->build_query_compat( undef, undef, undef, ["branch:CPL"], undef, undef, undef, undef );
-    is( $limit,      "(holdingbranch: \"CPL\")", "branch limit expanded to holding branch" );
-    is( $limit_desc, "(holdingbranch: \"CPL\")", "Limit description correctly expanded" );
-    is( $limit_cgi,  "&limit=branch%3ACPL",      "Limit cgi does not get expanded" );
-    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) = $query_builder->build_query_compat(
+    is_deeply(
+        $nested_leaf->($query), { term => { 'items.holdingbranch' => 'CPL' } },
+        "Single-library branch limit routed to an items.holdingbranch term"
+    );
+    is( $limit_cgi, "&limit=branch%3ACPL", "limit cgi is kept verbatim" );
+
+    ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+        $query_builder->build_query_compat(
         undef, undef, undef, ["multibranchlimit:$groupid"], undef, undef, undef,
         undef
+        );
+    is_deeply(
+        $nested_leaf->($query), { terms => { 'items.holdingbranch' => \@branchcodes } },
+        "Multibranch limit routed to items.holdingbranch terms"
     );
-    is(
-        $limit, "(holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "branch limit expanded to holding branch"
-    );
-    is(
-        $limit_desc, "(holdingbranch: \"$branchcodes[0]\" OR holdingbranch: \"$branchcodes[1]\")",
-        "Limit description correctly expanded"
-    );
-    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "Limit cgi does not get expanded" );
+    is( $limit_cgi, "&limit=multibranchlimit%3A$groupid", "limit cgi is kept verbatim" );
 
+    # An unknown or empty library group must not widen the search to the whole
+    # catalogue: the limit matches no item.
+    my $empty_group = $builder->build_object(
+        {
+            class => 'Koha::Library::Groups',
+            value => {
+                ft_search_groups_opac  => 1,
+                ft_search_groups_staff => 1,
+                parent_id              => undef,
+                branchcode             => undef
+            }
+        }
+    );
+    my $deleted_group = $builder->build_object( { class => 'Koha::Library::Groups' } );
+    my $unknown_id    = $deleted_group->id;
+    $deleted_group->delete;
+    for my $case ( [ unknown => $unknown_id ], [ empty => $empty_group->id ] ) {
+        my ( $label, $group_id ) = @$case;
+        warning_like {
+            ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc, undef ) =
+                $query_builder->build_query_compat(
+                undef, undef, undef, ["multibranchlimit:$group_id"], undef, undef, undef,
+                undef
+                );
+        }
+        qr/Library group '$group_id' does not exist or has no libraries/,
+            "build_query_compat warns about the $label library group";
+        is_deeply(
+            $nested_leaf->($query), { match_none => {} },
+            "A limit on an $label library group matches no item"
+        );
+    }
+
+    # The flat (query_string) path behaves the same.
+    my $flat_limits;
+    warning_like { $flat_limits = $query_builder->_fix_limit_special_cases( ["multibranchlimit:$unknown_id"] ) }
+    qr/Library group '$unknown_id' does not exist or has no libraries/,
+        "_fix_limit_special_cases warns about the unknown library group";
+    is_deeply( $flat_limits, ['(NOT *:*)'], "_fix_limit_special_cases turns it into a limit that matches nothing" );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'build_query_compat() geolocation operand keeps the rest of the query (Bug XXXXX)' => sub {
+
+    plan tests => 6;
+
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'homebranch' );
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+    my $geo_operand = 'lat:48.25* lng:16.35* distance:100km*';
+
+    my ( undef, $query ) = $qb->build_query_compat(
+        ['AND'], [ 'perl', $geo_operand ], [ 'title', 'geolocation' ], ['branch:CPL'], undef, undef,
+        undef, { is_opac => 1 }
+    );
+    my $bool = $query->{query}{bool};
+    like( $bool->{must}[0]{query_string}{query}, qr/perl/, 'The query string of the other operands is kept' );
+    my @geo    = grep { $_->{geo_distance} } @{ $bool->{filter} };
+    my @nested = grep { $_->{nested} } @{ $bool->{filter} };
+    is( scalar @geo, 1, 'The geolocation filter is added' );
+    is_deeply(
+        $geo[0]{geo_distance},
+        { distance => '100km', geolocation => { lat => '48.25', lon => '16.35' } },
+        'The geolocation filter has the requested point and distance'
+    );
+    is( scalar @nested, 1, 'The item filter (library limit) is kept' );
+
+    ( undef, $query ) =
+        $qb->build_query_compat( ['AND'], [$geo_operand], ['geolocation'], undef, undef, undef, undef, {} );
+    $bool = $query->{query}{bool};
+    is( $bool->{must}[0]{query_string}{query}, '*', 'A geolocation-only search matches everything else' );
+    is( scalar( grep { $_->{geo_distance} } @{ $bool->{filter} } ), 1, 'and keeps the geolocation filter' );
+};
+
+subtest 'library_limit_facet_tokens() tests (Bug XXXXX)' => sub {
+
+    plan tests => 8;
+
+    $schema->storage->txn_begin;
+
+    my $builder  = t::lib::TestBuilder->new;
+    my $branch_1 = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $branch_2 = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $group    = $builder->build_object(
+        {
+            class => 'Koha::Library::Groups',
+            value => {
+                ft_search_groups_opac  => 1,
+                ft_search_groups_staff => 1,
+                parent_id              => undef,
+                branchcode             => undef
+            }
+        }
+    );
+    $builder->build_object(
+        { class => 'Koha::Library::Groups', value => { parent_id => $group->id, branchcode => $branch_1->id } } );
+    $builder->build_object(
+        { class => 'Koha::Library::Groups', value => { parent_id => $group->id, branchcode => $branch_2->id } } );
+    my $groupid = $group->id;
+
+    my $query_builder =
+        Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+
+    # The tokens let the UI mark a single-library facet selected even though the
+    # URL keeps the raw branch: limit. They must follow SearchLimitLibrary just
+    # like the query routing does. Group limits intentionally yield no tokens.
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'homebranch' );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('branch:CPL') ],
+        ['items.homebranch:CPL'],
+        "branch limit maps to the items.homebranch facet token"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens("multibranchlimit:$groupid") ],
+        [], "a group limit yields no tokens (members are not highlighted individually)"
+    );
+
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'holdingbranch' );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('branch:CPL') ],
+        ['items.holdingbranch:CPL'],
+        "branch limit maps to the items.holdingbranch facet token"
+    );
+
+    t::lib::Mocks::mock_preference( 'SearchLimitLibrary', 'both' );
+    is_deeply(
+        [ sort $query_builder->library_limit_facet_tokens('branch:CPL') ],
+        [ 'items.holdingbranch:CPL', 'items.homebranch:CPL' ],
+        "branch limit maps to both home and holding facet tokens"
+    );
+
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('itype:BK') ],
+        [], "a non-library limit yields no tokens"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('available') ],
+        [], "the availability limit yields no tokens"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens(undef) ],
+        [], "an undefined limit yields no tokens"
+    );
+    is_deeply(
+        [ $query_builder->library_limit_facet_tokens('multibranchlimit:999999') ],
+        [], "an unknown group yields no tokens"
+    );
+
+    $schema->storage->txn_rollback;
 };
 
 subtest "Handle search filters" => sub {
-    plan tests => 7;
+    plan tests => 8;
 
     my $qb;
 
@@ -1145,17 +1346,25 @@ subtest "Handle search filters" => sub {
     )->store;
     my $filter_id = $filter->id;
 
-    my ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc ) =
+    my ( undef, $query, undef, undef, undef, $limit, $limit_cgi, $limit_desc ) =
         $qb->build_query_compat( undef, undef, undef, ["search_filter:$filter_id"] );
 
+    # The item type limits of the filter are routed to the nested items channel
+    # (Bug XXXXX), like any other item type limit; the rest stays a string limit.
     is(
-        $limit, q{(available:true) AND (((cat) AND title:(bat) OR author:(rat))) AND itype:(("BK") OR ("MU"))},
+        $limit, q{(available:true) AND (((cat) AND title:(bat) OR author:(rat)))},
         "Limit correctly formed"
     );
     is( $limit_cgi, "&limit=search_filter%3A$filter_id", "CGI limit is not expanded" );
-    is(
-        $limit_desc, q{(available:true) AND (((cat) AND title:(bat) OR author:(rat))) AND itype:(("BK") OR ("MU"))},
+    like(
+        $limit_desc, qr/^\Q(available:true) AND (((cat) AND title:(bat) OR author:(rat)))\E and /,
         "Limit description is correctly expanded"
+    );
+    my ($nested) = grep { $_->{nested} } @{ $query->{query}{bool}{filter} || [] };
+    is_deeply(
+        $nested->{nested}{query}{bool}{filter},
+        [ { terms => { 'items.itype' => [ 'BK', 'MU' ] } } ],
+        "Item type limits of the filter are routed to the nested items channel"
     );
 
     $filter = Koha::SearchFilter->new(
@@ -1209,7 +1418,7 @@ subtest "_convert_sort_fields() tests" => sub {
 };
 
 subtest "_sort_field() tests" => sub {
-    plan tests => 5;
+    plan tests => 9;
 
     my $qb;
 
@@ -1244,6 +1453,24 @@ subtest "_sort_field() tests" => sub {
         $f,
         'sortablenumber__sort',
         'sortablenumber sort mapped correctly'
+    );
+
+    is( $qb->_sort_field('mainentry'), undef, 'sortable field without a sort mapping is not sorted on' );
+    is( $qb->_sort_field('unknown'),   undef, 'field missing from the mappings is not sorted on' );
+
+    my $query;
+    warning_like {
+        $query = $qb->build_query(
+            'foo',
+            sort => [ { field => 'unknown', direction => 'asc' }, { field => 'title', direction => 'desc' } ]
+        );
+    }
+    qr/Ignoring sort on field 'unknown': it has no sort mapping/,
+        'build_query warns about the unmapped sort field';
+    is_deeply(
+        [ map { keys %$_ } @{ $query->{sort} } ],
+        [ 'title__sort', 'local-number__sort' ],
+        'build_query skips the unmapped sort field and keeps the others'
     );
 };
 
@@ -1351,6 +1578,337 @@ subtest "_build_field_match_boost_query() tests" => sub {
         'SHould query is correctly added'
     );
 
+};
+
+subtest 'item filters in limit_desc and limit_cgi (Bug XXXXX)' => sub {
+    plan tests => 10;
+
+    my $builder = t::lib::TestBuilder->new;
+    my $library = $builder->build_object(
+        {
+            class => 'Koha::Libraries',
+            value => { branchname => 'My Item Filter Library' },
+        }
+    );
+    my $itemtype = $builder->build_object(
+        {
+            class => 'Koha::ItemTypes',
+            value => { description => 'My Item Filter Type' },
+        }
+    );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    my ( undef, undef, undef, undef, undef, undef, $limit_cgi, $limit_desc ) = $qb->build_query_compat(
+        undef, ['*'], undef,
+        [ 'items.homebranch:' . $library->branchcode, 'items.itype:' . $itemtype->itemtype ],
+    );
+
+    # the raw items.* limits stay in limit_cgi so the facet stays active and
+    # survives pagination / sorting.
+    like(
+        $limit_cgi, qr/limit=items\.homebranch%3A\Q@{[ $library->branchcode ]}\E/,
+        'items.homebranch limit is preserved in limit_cgi'
+    );
+    like(
+        $limit_cgi, qr/limit=items\.itype%3A\Q@{[ $itemtype->itemtype ]}\E/,
+        'items.itype limit is preserved in limit_cgi'
+    );
+
+    # limit_desc shows the resolved names, not the raw codes.
+    like( $limit_desc, qr/\QMy Item Filter Library\E/, 'limit_desc resolves the library code to its name' );
+    like( $limit_desc, qr/\QMy Item Filter Type\E/,    'limit_desc resolves the item type code to its description' );
+    unlike(
+        $limit_desc, qr/items\.homebranch/,
+        'limit_desc does not leak the raw items.<field> syntax'
+    );
+
+    # Availability-only filters are not part of the readable breadcrumb.
+    ( undef, undef, undef, undef, undef, undef, undef, my $avail_desc ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.available:true'] );
+    unlike( $avail_desc // '', qr/available/i, 'availability item filter is not described in limit_desc' );
+
+    # the on-request user filter persists in limit_cgi and is described
+    # readably in limit_desc.
+    ( undef, undef, undef, undef, undef, undef, my $onreq_cgi, my $onreq_desc ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.onrequest:false'] );
+    like(
+        $onreq_cgi, qr/limit=items\.onrequest%3Afalse/,
+        'items.onrequest limit is preserved in limit_cgi'
+    );
+    like( $onreq_desc // '', qr/On request: No/, 'limit_desc describes the on-request filter readably' );
+
+    # the patron-availability user filter persists in limit_cgi and IS
+    # described readably in limit_desc (unlike the staff items.available above).
+    ( undef, undef, undef, undef, undef, undef, my $afp_cgi, my $afp_desc ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.available_for_patron:true'] );
+    like(
+        $afp_cgi, qr/limit=items\.available_for_patron%3Atrue/,
+        'items.available_for_patron limit is preserved in limit_cgi'
+    );
+    like(
+        $afp_desc // '', qr/Available for hold or reference: Yes/,
+        'limit_desc describes the patron-availability filter readably'
+    );
+};
+
+subtest 'advanced-search item operands and limits routed to nested (Bug XXXXX)' => sub {
+    plan tests => 15;
+
+    my $builder = t::lib::TestBuilder->new;
+    my $itemtype =
+        $builder->build_object( { class => 'Koha::ItemTypes', value => { description => 'Operand Test Type' } } );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    # a barcode operand (item field) AND a title operand. The barcode is
+    # pulled out to the nested channel; the title stays in the query_string.
+    my ( undef, $query, undef, $query_cgi, undef, undef, undef, $limit_desc ) = $qb->build_query_compat(
+        ['AND'], [ '12345', 'foo' ], [ 'bc', 'ti' ],
+        undef, undef, undef, undef, { skip_facets => 1 }
+    );
+    my $qstr = $query->{query}{bool}{must}[0]{query_string}{query};
+    like( $qstr, qr/foo/, 'the title operand stays in the query_string' );
+    unlike( $qstr, qr/12345/, 'the barcode operand is removed from the query_string' );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { term => { 'items.barcode' => '12345' } } ],
+        'the barcode operand becomes a same-item nested term'
+    );
+    like( $limit_desc // '', qr/Barcode: 12345/, 'the routed barcode operand is described in limit_desc' );
+    like( $query_cgi,        qr/idx=bc/,         'the barcode operand round-trips in query_cgi' );
+
+    # with an OR joining the rows, nothing is routed; the barcode stays
+    # flat in the query_string and there is no nested item filter.
+    ( undef, $query ) = $qb->build_query_compat(
+        ['OR'], [ '12345', 'foo' ], [ 'bc', 'ti' ],
+        undef,  undef, undef, undef, { skip_facets => 1 }
+    );
+    like(
+        $query->{query}{bool}{must}[0]{query_string}{query}, qr/barcode/,
+        'with OR, the barcode operand stays in the flat query_string'
+    );
+    is_deeply( _first_nested_item_leaves($query), [], 'with OR, no nested item filter is built' );
+
+    # an acquisition-date operand becomes a same-item range. As it is the
+    # only operand, the text query falls back to "*".
+    ( undef, $query, undef, undef, undef, undef, undef, $limit_desc ) = $qb->build_query_compat(
+        undef, ['2020-01-01 - 2020-12-31'], ['acqdate,st-date-normalized'],
+        undef, undef, undef, undef, { skip_facets => 1 }
+    );
+    is(
+        $query->{query}{bool}{must}[0]{query_string}{query}, '*',
+        'with only an item operand, the query_string falls back to *'
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { range => { 'items.dateaccessioned' => { gte => '2020-01-01', lte => '2020-12-31' } } } ],
+        'the acqdate operand becomes a same-item range on items.dateaccessioned'
+    );
+    like(
+        $limit_desc // '', qr/\QAcquisition date: 2020-01-01 to 2020-12-31\E/,
+        'the routed acqdate operand is described in limit_desc'
+    );
+
+    # the mc-itype advanced-search limit is routed to items.itype.
+    ( undef, $query, undef, undef, undef, undef, my $limit_cgi, $limit_desc ) = $qb->build_query_compat(
+        undef, ['*'], undef, [ 'mc-itype:' . $itemtype->itemtype ],
+        undef, undef, undef, { skip_facets => 1 }
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { term => { 'items.itype' => $itemtype->itemtype } } ],
+        'mc-itype limit becomes a same-item nested term on items.itype'
+    );
+    like(
+        $limit_cgi, qr/limit=mc-itype%3A\Q@{[ $itemtype->itemtype ]}\E/,
+        'the raw mc-itype limit is preserved in limit_cgi'
+    );
+    like( $limit_desc // '', qr/\QOperand Test Type\E/, 'mc-itype limit resolves to the item type description' );
+
+    # Empty q with only item filters: the query_string must fall back to "*" so
+    # the nested filter (not an empty text query, which matches nothing) drives
+    # the results -- e.g. "every item of a type in a library" without a keyword.
+    ( undef, $query ) = $qb->build_query_compat(
+        undef, [''],  undef, [ 'mc-itype:' . $itemtype->itemtype ],
+        undef, undef, undef, { skip_facets => 1 }
+    );
+    is(
+        $query->{query}{bool}{must}[0]{query_string}{query}, '*',
+        'an empty q with only item limits falls back to * so the nested filter applies'
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [ { term => { 'items.itype' => $itemtype->itemtype } } ],
+        'the item limit is still applied as a nested term with an empty q'
+    );
+};
+
+# Return the leaf clauses of the first hard nested item filter in the query
+# (any kind: term/terms/wildcard/range/...). Used by the operand-routing tests.
+sub _first_nested_item_leaves {
+    my ($query) = @_;
+    for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
+        return $clause->{nested}{query}{bool}{filter}
+            if ref $clause eq 'HASH' && $clause->{nested};
+    }
+    return [];
+}
+
+# Collect the term clauses of the hard nested item filter, keyed by field. Used
+# when a user filter is present, in which case the auto hiding filters are
+# combined with it in a single nested bool (same-item coherence).
+sub _nested_item_term_filters {
+    my ($query) = @_;
+    my %found;
+    for my $clause ( @{ $query->{query}{bool}{filter} || [] } ) {
+        next unless ref $clause eq 'HASH' && $clause->{nested};
+        for my $leaf ( @{ $clause->{nested}{query}{bool}{filter} || [] } ) {
+            next unless $leaf->{term};
+            my ($field) = keys %{ $leaf->{term} };
+            $found{$field} = $leaf->{term}{$field};
+        }
+    }
+    return \%found;
+}
+
+subtest 'OPAC item hiding filters (Bug XXXXX)' => sub {
+    plan tests => 7;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems',              0 );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 0 );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    # A user facet filter is present, so the hiding filters are combined with it
+    # in the same nested bool: a hidden item cannot satisfy the facet either.
+    my @user_limit = ('items.homebranch:CPL');
+
+    # Intranet (no is_opac): only the user filter, no hiding filters.
+    my ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, [@user_limit] );
+    my $found = _nested_item_term_filters($query);
+    is( "$found->{'items.homebranch'}", 'CPL', 'user facet filter applies on the intranet' );
+    ok( !exists $found->{'items.hidden_in_opac_custom'},         'no custom-hiding filter outside the OPAC' );
+    ok( !exists $found->{'items.hidden_in_opac_by_preferences'}, 'no preferences-hiding filter outside the OPAC' );
+
+    # OPAC, regular patron: user filter plus both hiding filters (false), same nested.
+    ( undef, $query ) =
+        $qb->build_query_compat( undef, ['*'], undef, [@user_limit], undef, 0, undef, { is_opac => 1 } );
+    $found = _nested_item_term_filters($query);
+    ok(
+        exists $found->{'items.hidden_in_opac_custom'} && !$found->{'items.hidden_in_opac_custom'},
+        'custom-hiding filter (false) combined with the user filter in the OPAC'
+    );
+    ok(
+        exists $found->{'items.hidden_in_opac_by_preferences'} && !$found->{'items.hidden_in_opac_by_preferences'},
+        'preferences-hiding filter (false) combined with the user filter in the OPAC'
+    );
+
+    # OPAC, patron whose category overrides: custom stays, preferences lifted.
+    ( undef, $query ) = $qb->build_query_compat(
+        undef, ['*'], undef, [@user_limit], undef, 0, undef,
+        { is_opac => 1, override_hidden_items => 1 }
+    );
+    $found = _nested_item_term_filters($query);
+    ok(
+        exists $found->{'items.hidden_in_opac_custom'} && !$found->{'items.hidden_in_opac_custom'},
+        'custom-hiding filter still applied for an overriding category'
+    );
+    ok(
+        !exists $found->{'items.hidden_in_opac_by_preferences'},
+        'preferences-hiding filter lifted for an overriding category'
+    );
+};
+
+subtest 'OPAC record suppression (Bug XXXXX)' => sub {
+    plan tests => 8;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    my $filter_clauses = sub { return $_[0]->{query}{bool}{filter} || []; };
+
+    # The suppression clause is a bool.should: nested(auto) OR items_count:0.
+    my $suppression = sub {
+        my ($query) = @_;
+        my ($clause) =
+            grep { ref $_ eq 'HASH' && $_->{bool} && $_->{bool}{should} } @{ $filter_clauses->($query) };
+        return $clause;
+    };
+    my $has_items_count_zero = sub {
+        my ($query) = @_;
+        my $sup = $suppression->($query) or return 0;
+        return scalar grep { $_->{term} && exists $_->{term}{items_count} } @{ $sup->{bool}{should} };
+    };
+    my $has_hard_nested = sub {
+        my ($query) = @_;
+        return scalar grep { ref $_ eq 'HASH' && $_->{nested} } @{ $filter_clauses->($query) };
+    };
+
+    # OPAC, no user filter, H on: nested(auto) OR items_count:0.
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 1 );
+    my ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
+    my $sup = $suppression->($query);
+    ok( $sup, 'a suppression bool.should clause is added (OPAC, no user filter, H on)' );
+    is( $sup->{bool}{minimum_should_match}, 1, 'minimum_should_match is 1' );
+    ok( $has_items_count_zero->($query), 'items_count:0 is one should clause, so item-less records still show' );
+    ok(
+        ( scalar grep { $_->{nested} } @{ $sup->{bool}{should} } ),
+        'the auto hiding filters are the other should clause (nested)'
+    );
+
+    # OPAC, no user filter, H off: no suppression and no hard nested filter.
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 0 );
+    ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
+    ok( !$suppression->($query),     'no suppression clause when H is off' );
+    ok( !$has_hard_nested->($query), 'no hard nested item filter without a user filter when H is off' );
+
+    # OPAC, user filter present, H on: hard nested filter, no items_count OR.
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 1 );
+    ( undef, $query ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.homebranch:CPL'], undef, 0, undef, { is_opac => 1 } );
+    ok( $has_hard_nested->($query),       'a hard nested item filter is used when the user filters' );
+    ok( !$has_items_count_zero->($query), 'no items_count:0 OR when the user filters (item-less records hidden)' );
+};
+
+subtest 'matched-item inner_hits (Bug XXXXX)' => sub {
+    plan tests => 4;
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    # Pull the same-item nested clause out of the assembled query.
+    my $nested_of = sub {
+        my ($query)  = @_;
+        my ($clause) = grep { ref $_ eq 'HASH' && $_->{nested} } @{ $query->{query}{bool}{filter} || [] };
+        return $clause ? $clause->{nested} : undef;
+    };
+
+    # want_matched_items on: the nested item filter carries inner_hits limited to
+    # items.itemnumber, so search_compat can report the matching items.
+    my ( undef, $query ) = $qb->build_query_compat(
+        undef, ['*'], undef, ['items.homebranch:CPL'], undef, 0, undef,
+        { want_matched_items => 1 }
+    );
+    my $nested = $nested_of->($query);
+    ok( $nested, 'a nested item filter is assembled when the user filters' );
+    is_deeply(
+        $nested->{inner_hits},
+        { _source => ['items.itemnumber'], size => 50000 },
+        'inner_hits requested over items.itemnumber when want_matched_items is on'
+    );
+
+    # want_matched_items off: no inner_hits (default behaviour).
+    ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, ['items.homebranch:CPL'] );
+    $nested = $nested_of->($query);
+    ok( $nested && !exists $nested->{inner_hits}, 'no inner_hits when want_matched_items is off' );
+
+    # want_matched_items on but no item filter: no nested, hence no inner_hits.
+    ( undef, $query ) = $qb->build_query_compat(
+        undef, ['donald duck'], undef, undef, undef, 0, undef,
+        { want_matched_items => 1 }
+    );
+    ok( !$nested_of->($query), 'no nested (and no inner_hits) without item filters' );
 };
 
 $schema->storage->txn_rollback;

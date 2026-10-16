@@ -691,7 +691,7 @@ subtest "as_marc_field() tests" => sub {
     my @schema_columns = $schema->resultset('Item')->result_source->columns;
     my @mapped_columns = grep { exists $mss->{ 'items.' . $_ } } @schema_columns;
 
-    plan tests => scalar @mapped_columns + 5;
+    plan tests => scalar @mapped_columns + 8;
 
     $schema->storage->txn_begin;
 
@@ -756,6 +756,18 @@ subtest "as_marc_field() tests" => sub {
         'more_subfield_xml is considered when kohafield is NULL'
     );
     is( scalar $marc_field->subfield('Y'), 'Something else', 'more_subfield_xml is considered when kohafield = ""' );
+
+    # The framework can be passed, to avoid fetching the record for every item
+    my $item_module  = Test::MockModule->new('Koha::Item');
+    my $biblio_calls = 0;
+    $item_module->mock( 'biblio', sub { $biblio_calls++; return $item_module->original('biblio')->(@_); } );
+    my $field_with_framework = $item->as_marc_field( { frameworkcode => '' } );
+    is( $biblio_calls, 0, 'The record is not fetched when the framework is passed' );
+    is_deeply(
+        [ $field_with_framework->subfields ], [ $item->as_marc_field->subfields ],
+        'The field built with the framework passed is the same'
+    );
+    is( $biblio_calls, 1, 'The record is fetched when the framework is not passed' );
 
     $schema->storage->txn_rollback;
     Koha::Caches->get_instance->clear_from_cache("MarcStructure-1-");

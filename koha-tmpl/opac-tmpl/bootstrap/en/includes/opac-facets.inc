@@ -34,17 +34,33 @@
                 <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#availability_collapse" id="filter_facets">Availability</a>
                 <div class="facet-collapse collapse show" id="availability_collapse">
                     <ul>
+                        [%# Bug XXXXX: OPAC shows a single, patron-facing availability control (items.available_for_patron), replacing the staff-facing items.available toggle. %]
                         [% IF ( available ) %]
-                            <li><strong>Showing only records with available items</strong></li
+                            <li><strong>Showing only records with items available for hold or reference</strong></li
                             ><li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_availablity | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
                         [% ELSE %]
                             <li
-                                ><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=available"
-                                    >Limit to records with available items</a
+                                ><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.available_for_patron:true"
+                                    >Limit to records with items available for hold or reference</a
                                 ></li
                             >
                         [% END %]
                         [% IF ( related ) %]<li>(related searches: [% FOREACH relate IN related %][% relate.related_search | html %][% END %])</li>[% END %]
+                    </ul>
+                </div>
+            </li>
+
+            [%# Bug XXXXX: exclude items that are requested in a hold (items.onrequest). %]
+            <li id="onrequest_facet">
+                <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#onrequest_collapse" id="filter_onrequest">Requests</a>
+                <div class="facet-collapse collapse show" id="onrequest_collapse">
+                    <ul>
+                        [% IF ( exclude_onrequest ) %]
+                            <li><strong>Excluding records whose items are all requested</strong></li
+                            ><li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_onrequest | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
+                        [% ELSE %]
+                            <li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.onrequest:false">Exclude requested items</a></li>
+                        [% END %]
                     </ul>
                 </div>
             </li>
@@ -58,6 +74,7 @@
                             [% attrs = "class='facet-toggle' aria-expanded='true' data-bs-toggle='collapse' data-bs-target='#" _ facets_loo.type_id _ "_collapse'" %]
                         [% END %]
                         [% SWITCH facets_loo.label %]
+
                         [% CASE 'Authors' %]
                             <a [% attrs | $raw %] id="facet-authors">Authors</a>
                         [% CASE 'Titles' %]
@@ -103,7 +120,12 @@
                                     [% END %]
                                     <li class="[% li_class | html %]" style="[% li_style | html %]">
                                         [% IF facet.active %]
-                                            [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _  facet.type_link_value _ ":" _ facet.facet_link_value | url %][% END %]
+                                            [%# Bug XXXXX: a library limit kept as branch:/multibranchlimit: in the URL marks the facet active; its remove link must drop that raw token, not the items.<field> one %]
+                                            [% IF facet.remove_limit_value %]
+                                                [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _ facet.remove_limit_value | url %][% END %]
+                                            [% ELSE %]
+                                                [% local_url = BLOCK %][% url | $raw %][% "&nolimit=" _  facet.type_link_value _ ":" _ facet.facet_link_value | url %][% END %]
+                                            [% END %]
                                             [% FILTER collapse %]
                                                 <span class="facet-label facet-label-selected">
                                                     [% facet.facet_label_value | html %]
@@ -126,6 +148,7 @@
                                     <li class="moretoggle">
                                         [% SET aria_label = t("Show more") %]
                                         [% SWITCH facets_loo.label %]
+
                                         [% CASE 'Authors' %]
                                             [% aria_label = t("Show more authors") %]
                                         [% CASE 'Titles' %]
@@ -155,6 +178,7 @@
                                     <li class="moretoggle" style="display:none">
                                         [% SET aria_label = t("Show more") %]
                                         [% SWITCH facets_loo.label %]
+
                                         [% CASE 'Authors' %]
                                             [% aria_label = t("Show fewer authors") %]
                                         [% CASE 'Titles' %]

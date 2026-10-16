@@ -948,7 +948,7 @@ sub request_transfer {
     Koha::Exceptions::Item::Transfer::InQueue->throw( transfer => $request )
         if ( $request && !$params->{enqueue} && !$params->{replace} );
 
-    $request->cancel( { reason => $params->{replace}, force => 1 } )
+    $request->cancel( { reason => $params->{replace}, force => 1, skip_record_index => $params->{skip_record_index} } )
         if ( defined($request) && $params->{replace} );
 
     my $transfer = Koha::Item::Transfer->new(
@@ -1161,7 +1161,9 @@ Returns false otherwise.
 
 Takes HASHref that can have the following parameters:
     OPTIONAL PARAMETERS:
-    $rules : { <field> => [ value_1, ... ], ... }
+    $rules           : { <field> => [ value_1, ... ], ... }
+    $skip_lost_check : if true, ignore the I<hidelostitems> preference and only
+                       evaluate the I<OpacHiddenItems> rules
 
 Note: $rules inherits its structure from the parsed YAML from reading
 the I<OpacHiddenItems> system preference.
@@ -1174,7 +1176,8 @@ sub hidden_in_opac {
     my $rules = $params->{rules} // {};
 
     return 1
-        if C4::Context->preference('hidelostitems')
+        if !$params->{skip_lost_check}
+        and C4::Context->preference('hidelostitems')
         and $self->itemlost > 0;
 
     my $hidden_in_opac = 0;
@@ -1501,18 +1504,24 @@ sub has_pending_recall {
 =head3 as_marc_field
 
     my $field = $item->as_marc_field;
+    my $field = $item->as_marc_field( { frameworkcode => $frameworkcode } );
 
 This method returns a MARC::Field object representing the Koha::Item object
 with the current mappings configuration.
 
+The optional I<frameworkcode> parameter is the framework of the item's record.
+Callers that build the field for many items of a record already know it, and
+passing it saves fetching the record for every item.
+
 =cut
 
 sub as_marc_field {
-    my ($self) = @_;
+    my ( $self, $params ) = @_;
 
     my ( $itemtag, $itemtagsubfield ) = C4::Biblio::GetMarcFromKohaField("items.itemnumber");
 
-    my $tagslib = C4::Biblio::GetMarcStructure( 1, $self->biblio->frameworkcode, { unsafe => 1 } );
+    my $frameworkcode = $params->{frameworkcode} // $self->biblio->frameworkcode;
+    my $tagslib       = C4::Biblio::GetMarcStructure( 1, $frameworkcode, { unsafe => 1 } );
 
     my @subfields;
 

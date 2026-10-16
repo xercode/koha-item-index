@@ -1286,11 +1286,16 @@ sub buildQuery {
             $limit     .= " and " if $limit || $query;
             my $branchfield = C4::Context->preference('SearchLimitLibrary');
             my @branchcodes;
+            my $unknown_group;
             if ( $this_limit =~ '^multibranchlimit:' ) {
                 my ($group_id) = ( $this_limit =~ /^multibranchlimit:(.*)$/ );
                 my $search_group = Koha::Library::Groups->find($group_id);
-                @branchcodes = map  { $_->branchcode } $search_group->all_libraries;
-                @branchcodes = sort { $a cmp $b } @branchcodes;
+                @branchcodes = sort { $a cmp $b } map { $_->branchcode } $search_group->all_libraries
+                    if $search_group;
+                unless (@branchcodes) {
+                    warn "Library group '$group_id' does not exist or has no libraries: the limit matches nothing";
+                    $unknown_group = 1;
+                }
             } else {
                 @branchcodes = ( $this_limit =~ /^branch:(.*)$/ );
             }
@@ -1306,7 +1311,11 @@ sub buildQuery {
                         join( " or ", map { 'holdingbranch: ' . $_ } @branchcodes );
                 }
             }
-            $limit      .= "$this_limit";
+
+            # An unknown or empty library group must not widen the search to the
+            # whole catalogue: limit on a branchcode that cannot exist (longer
+            # than the 10 characters of branches.branchcode).
+            $limit      .= $unknown_group ? 'homebranch: nolibrarygroupmatch' : "$this_limit";
             $limit_desc .= " $this_limit";
         } elsif ( $this_limit =~ '^search_filter:' ) {
 
@@ -1648,18 +1657,30 @@ sub _build_initial_query {
 
 =head2 searchResults
 
-  my @search_results = searchResults($search_context, $searchdesc, $hits, 
-                                     $results_per_page, $offset, $scan, 
+  my @search_results = searchResults($search_context, $searchdesc, $hits,
+                                     $results_per_page, $offset, $scan,
                                      @marcresults);
 
 Format results in a form suitable for passing to the template
+
+The optional C<$matched_itemnumbers> (Bug XXXXX) is an arrayref, aligned by
+result index (offset-based, same as C<$marcresults>), of per-record arrayrefs of
+the itemnumbers that matched the query's item filters (from Elasticsearch
+C<inner_hits>). When an entry is defined, only the record's own items whose
+itemnumber is in that set are kept for display and counting; host analytical
+items (C<EasyAnalyticalRecords>) are always kept. An undef entry (no item
+filter, or a truncated match set) leaves the record unfiltered. Omitting the
+argument keeps the previous behaviour (all items shown).
 
 =cut
 
 # IMO this subroutine is pretty messy still -- it's responsible for
 # building the HTML output for the template
 sub searchResults {
-    my ( $search_context, $searchdesc, $hits, $results_per_page, $offset, $scan, $marcresults, $xslt_variables ) = @_;
+    my (
+        $search_context, $searchdesc, $hits, $results_per_page, $offset, $scan, $marcresults, $xslt_variables,
+        $matched_itemnumbers
+    ) = @_;
     my @newresults;
 
     require C4::Items;
@@ -1796,6 +1817,21 @@ sub searchResults {
         my @fields = $marcrecord->field($itemtag);
         $marcrecord->delete_fields(@fields) unless C4::Context->preference('PassItemMarcToXSLT');
         my $marcflavor = C4::Context->preference("marcflavour");
+
+        # Bug XXXXX: when the search carried item filters, keep only the
+        # record's own items that matched (from inner_hits). All the counters and
+        # the item loops below derive from @fields, so they recompute over the
+        # matching subset with no further change. An undef entry (no item filter
+        # for this record, or a truncated match set) leaves @fields untouched.
+        # Applied to the own 952s only; host analytical items are added afterwards
+        # and are never filtered.
+        if ( defined $matched_itemnumbers && defined $matched_itemnumbers->[$i] ) {
+            my %keep = map { $_ => 1 } @{ $matched_itemnumbers->[$i] };
+            @fields = grep {
+                my $in = $_->subfield( $subfieldstosearch{itemnumber} );
+                defined $in && $keep{$in};
+            } @fields;
+        }
 
         # adding linked items that belong to host records
         if ( C4::Context->preference('EasyAnalyticalRecords') ) {

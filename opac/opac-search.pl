@@ -475,6 +475,16 @@ foreach my $limit (@limits) {
 }
 $template->param( available => $available );
 
+# Bug XXXXX: "Exclude on-request items" toggle. Like the availability
+# toggle, its active state is driven by the presence of the nested-channel limit
+# items.onrequest:false among the URL limits; the limit itself is added by the
+# facet link in the template.
+my $exclude_onrequest;
+foreach my $limit (@limits) {
+    $exclude_onrequest = 1 if $limit eq 'items.onrequest:false';
+}
+$template->param( exclude_onrequest => $exclude_onrequest );
+
 # append year limits if they exist
 if ( $params->{'limit-yr'} ) {
     if ( $params->{'limit-yr'} =~ /\d{4}/ ) {
@@ -504,6 +514,11 @@ my ( $error, $query, $simple_query, $query_cgi, $query_desc, $limit, $limit_cgi,
 
 my $suppress = C4::Context->is_opac_suppressed;
 
+# Patrons whose category is listed in OpacHiddenItemsExceptions can see items
+# hidden by the OpacHiddenItems preferences (Bug XXXXX); the custom hiding is
+# never lifted. Used to decide which item-hiding filters build_query_compat adds.
+my $override_hidden_items = ( $patron && $patron->category->override_hidden_items ) ? 1 : 0;
+
 ## I. BUILD THE QUERY
 ( $error, $query, $simple_query, $query_cgi, $query_desc, $limit, $limit_cgi, $limit_desc, $query_type ) =
     $builder->build_query_compat(
@@ -517,6 +532,7 @@ my $suppress = C4::Context->is_opac_suppressed;
     {
         suppress                => $suppress,
         is_opac                 => 1,
+        override_hidden_items   => $override_hidden_items,
         weighted_fields         => $weight_search,
         weight_search_submitted => $cgi->param('weight_search_submitted') // undef
     }
@@ -640,6 +656,7 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
                 {
                     suppress                => $suppress,
                     is_opac                 => 1,
+                    override_hidden_items   => $override_hidden_items,
                     weighted_fields         => $weight_search,
                     weight_search_submitted => $cgi->param('weight_search_submitted')
                 }
@@ -873,14 +890,29 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
             }
             $template->param( total => $hits );
             my $limit_cgi_not_availablity = $limit_cgi;
-            $limit_cgi_not_availablity =~ s/&limit=available//g if defined $limit_cgi_not_availablity;
+
+            # Bug XXXXX: the OPAC availability control now emits the
+            # patron-facing items.available_for_patron:true limit; the staff
+            # items.available:true and the legacy flat "available" forms are still
+            # stripped for backward compatibility with bookmarked URLs.
+            $limit_cgi_not_availablity =~
+                s/&limit=(?:items\.available_for_patron%3Atrue|items\.available%3Atrue|available)//g
+                if defined $limit_cgi_not_availablity;
             $template->param( limit_cgi_not_availablity => $limit_cgi_not_availablity );
-            $template->param( limit_cgi                 => $limit_cgi );
-            $template->param( countrss                  => $countRSS );
-            $template->param( query_cgi                 => $query_cgi );
-            $template->param( query_desc                => $query_desc );
-            $template->param( limit_desc                => $limit_desc );
-            $template->param( offset                    => $offset );
+
+            # Bug XXXXX: limit_cgi stripped of the on-request limit, so the
+            # toggle link can rebuild a clean URL without it (colon is escaped to
+            # %3A in limit_cgi).
+            my $limit_cgi_not_onrequest = $limit_cgi;
+            $limit_cgi_not_onrequest =~ s/&limit=items\.onrequest%3A(?:true|false)//g
+                if defined $limit_cgi_not_onrequest;
+            $template->param( limit_cgi_not_onrequest => $limit_cgi_not_onrequest );
+            $template->param( limit_cgi               => $limit_cgi );
+            $template->param( countrss                => $countRSS );
+            $template->param( query_cgi               => $query_cgi );
+            $template->param( query_desc              => $query_desc );
+            $template->param( limit_desc              => $limit_desc );
+            $template->param( offset                  => $offset );
 
             if ( $query_desc || $limit_desc ) {
                 $template->param( searchdesc => 1 );
@@ -965,11 +997,30 @@ for ( my $i = 0 ; $i < @servers ; $i++ ) {
     $template->param( outer_sup_results_loop => \@sup_results_array );
 }    #/end of the for loop
 
+# Bug XXXXX: a library limit (branch:/multibranchlimit:) is routed to the
+# nested items.homebranch/holdingbranch channel but kept verbatim in the URL, so
+# the matching library facets would not look selected. Map each such limit to the
+# item facet tokens it covers, remembering the raw limit so the facet remove link
+# can drop the real token rather than a non-existent items.<field> one.
+my %library_facet_remove;
+if ( $builder->can('library_limit_facet_tokens') ) {
+    for my $limit (@limits) {
+        for my $token ( $builder->library_limit_facet_tokens($limit) ) {
+            $library_facet_remove{$token} //= $limit;
+        }
+    }
+}
+
 for my $facet (@$facets) {
     for my $entry ( @{ $facet->{facets} } ) {
         my $index = $entry->{type_link_value};
         my $value = $entry->{facet_link_value};
-        $entry->{active} = grep { $_->{input_value} eq qq{$index:$value} } @limit_inputs;
+        if ( grep { $_->{input_value} eq qq{$index:$value} } @limit_inputs ) {
+            $entry->{active} = 1;
+        } elsif ( my $remove = $library_facet_remove{qq{$index:$value}} ) {
+            $entry->{active}             = 1;
+            $entry->{remove_limit_value} = $remove;
+        }
     }
 }
 

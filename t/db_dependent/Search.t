@@ -27,7 +27,7 @@ require C4::Context;
 use open ':std', ':encoding(utf8)';
 
 use Test::NoWarnings;
-use Test::More tests => 5;
+use Test::More tests => 7;
 use Test::MockModule;
 use Test::Warn;
 use t::lib::Mocks;
@@ -327,6 +327,76 @@ subtest 'searchResults branch-specific counts for Bug 37883' => sub {
 
     # Test that global counts still include all items from all branches
     is( $results[0]->{availablecount}, 2, 'Global available count: 2 items available at all branches' );
+};
+
+subtest 'searchResults matching-item filter (Bug XXXXX)' => sub {
+    plan tests => 8;
+
+    use C4::Search qw( searchResults );
+
+    # One record, three items: two available (CPL, MPL) and one withdrawn (CPL).
+    my $record = MARC::Record->new();
+    $record->add_fields(
+        [ '001', '456' ],
+        [ '245', ' ', ' ', a => 'Test record for matching-item filter' ],
+        [ '999', ' ', ' ', c => '456', d => '456' ],
+        [
+            '952', ' ', ' ',
+            a   => 'CPL',  b   => 'CPL', p   => 'F3D001', y => 'BK',
+            '9' => '3001', '0' => '0',   '1' => '0', '4' => '0', '7' => '0', q => '',
+        ],
+        [
+            '952', ' ', ' ',
+            a   => 'CPL',  b   => 'CPL', p   => 'F3D002', y => 'BK',
+            '9' => '3002', '0' => '1',   '1' => '0', '4' => '0', '7' => '0', q => '',    # withdrawn
+        ],
+        [
+            '952', ' ', ' ',
+            a   => 'MPL',  b   => 'MPL', p   => 'F3D003', y => 'BK',
+            '9' => '3003', '0' => '0',   '1' => '0', '4' => '0', '7' => '0', q => '',
+        ],
+    );
+    my $xml = $record->as_xml();
+
+    my $run = sub {
+        my ($matched) = @_;
+        my @r = searchResults(
+            { interface => 'intranet' },
+            'test query',
+            1, 10, 0, 0,
+            [$xml],
+            undef,       # $xslt_variables
+            $matched,    # $matched_itemnumbers (arrayref by result index) or undef
+        );
+        return $r[0];
+    };
+
+    # No filter argument at all: current behaviour, all items shown/counted.
+    my $all = $run->(undef);
+    is( $all->{items_count},    3, 'no filter: all 3 items counted' );
+    is( $all->{availablecount}, 2, 'no filter: 2 available items counted' );
+
+    # Filter argument present but this record's entry is undef (record had no
+    # item filter, or a truncated match set): leave it unfiltered.
+    my $undef_entry = $run->( [undef] );
+    is( $undef_entry->{items_count}, 3, 'undef entry: record left unfiltered' );
+
+    # Only the first (available, CPL) item matches.
+    my $one = $run->( [ [3001] ] );
+    is( $one->{items_count},    1, 'filter [3001]: only the matching item is counted' );
+    is( $one->{availablecount}, 1, 'filter [3001]: available count recomputed over the subset' );
+
+    # Two available items match.
+    my $two = $run->( [ [ 3001, 3003 ] ] );
+    is( $two->{availablecount}, 2, 'filter [3001,3003]: both available items counted' );
+
+    # Only the withdrawn item matches: no available items in the subset.
+    my $withdrawn = $run->( [ [3002] ] );
+    is( $withdrawn->{availablecount}, 0, 'filter [3002]: withdrawn-only subset has no available items' );
+
+    # Empty match set: the record matched at record level but no item is kept.
+    my $none = $run->( [ [] ] );
+    is( $none->{items_count}, 0, 'empty filter: no items counted' );
 };
 
 sub run_marc21_search_tests {
@@ -1309,6 +1379,42 @@ subtest 'MARC21 + DOM' => sub {
 subtest 'UNIMARC + DOM' => sub {
     plan tests => 14;
     run_unimarc_search_tests();
+};
+
+subtest 'buildQuery() limit on an unknown or empty library group' => sub {
+    plan tests => 4;
+
+    require C4::Search;
+    require Koha::Database;
+    require t::lib::TestBuilder;
+
+    my $schema = Koha::Database->schema;
+    $schema->storage->txn_begin;
+
+    my $builder = t::lib::TestBuilder->new;
+    my $group_value =
+        { ft_search_groups_opac => 1, ft_search_groups_staff => 1, parent_id => undef, branchcode => undef };
+    my $empty_group   = $builder->build_object( { class => 'Koha::Library::Groups', value => $group_value } );
+    my $deleted_group = $builder->build_object( { class => 'Koha::Library::Groups', value => $group_value } );
+    my $unknown_id    = $deleted_group->id;
+    $deleted_group->delete;
+
+    for my $case ( [ unknown => $unknown_id ], [ empty => $empty_group->id ] ) {
+        my ( $label, $group_id ) = @$case;
+        my $limit;
+        warning_like {
+            ( undef, undef, undef, undef, undef, $limit ) =
+                C4::Search::buildQuery( [], ['salud'], [], ["multibranchlimit:$group_id"], [], 0, 'en' );
+        }
+        qr/Library group '$group_id' does not exist or has no libraries/,
+            "buildQuery warns about the $label library group";
+        like(
+            $limit, qr/homebranch[:=] nolibrarygroupmatch/,
+            "a limit on an $label library group matches nothing instead of the whole catalogue"
+        );
+    }
+
+    $schema->storage->txn_rollback;
 };
 
 subtest 'FindDuplicate' => sub {

@@ -37,9 +37,10 @@ use t::lib::Mocks;
 use t::lib::TestBuilder;
 
 use Test::NoWarnings;
-use Test::More tests => 15;
+use Test::More tests => 16;
 
 use Test::Warn;
+use Test::MockModule;
 
 my $schema   = Koha::Database->new->schema;
 my $location = 'My Location';
@@ -251,6 +252,44 @@ subtest 'ModItemTransfer tests' => sub {
     is( $stock_transfer->datesent,      undef, "StockrotationAdvance transfer no longer in transit" );
     $transfers = $item->get_transfers;
     is( $transfers->count, 2, "There are now 2 live transfers in the queue" );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'ModItemTransfer reindexes a checked out item whose transit is reset (Bug XXXXX)' => sub {
+    plan tests => 3;
+
+    $schema->storage->txn_begin;
+
+    my $builder  = t::lib::TestBuilder->new;
+    my $item     = $builder->build_sample_item();
+    my $library1 = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $library2 = $builder->build_object( { class => 'Koha::Libraries' } );
+
+    # An in-transit StockrotationAdvance transfer on a checked out item
+    my $stock_transfer = $item->request_transfer( { to => $library2, reason => 'StockrotationAdvance' } );
+    $stock_transfer->datesent(dt_from_string)->store;
+    $builder->build_object( { class => 'Koha::Checkouts', value => { itemnumber => $item->itemnumber } } );
+
+    my @reindexed;
+    my $indexer_module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch::Indexer');
+    $indexer_module->mock( 'index_records', sub { push @reindexed, $_[1]; } );
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
+
+    # ModItemTransfer leaves the StockrotationAdvance transfer in the queue but
+    # resets its transit; as the item is checked out, no ->transit follows.
+    ModItemTransfer( $item->itemnumber, $library1->branchcode, $library2->branchcode, 'Manual' );
+    $stock_transfer->discard_changes;
+    is( $stock_transfer->datesent, undef, 'The StockrotationAdvance transfer is no longer in transit' );
+    is_deeply( \@reindexed, [ $item->biblionumber ], 'The record is reindexed' );
+
+    @reindexed = ();
+    $stock_transfer->datesent(dt_from_string)->store;
+    ModItemTransfer(
+        $item->itemnumber, $library1->branchcode, $library2->branchcode, 'Manual',
+        { skip_record_index => 1 }
+    );
+    is_deeply( \@reindexed, [], 'No reindex with skip_record_index' );
 
     $schema->storage->txn_rollback;
 };
