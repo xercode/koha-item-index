@@ -18,7 +18,8 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 13;
+use Test::More tests => 14;
+use Test::Warn;
 use t::lib::Mocks;
 use JSON;
 
@@ -683,6 +684,54 @@ subtest '_extract_item_filters() tests (Bug XXXXX)' => sub {
         $afp, [ { field => 'available_for_patron', value => JSON::true } ],
         'the items.available_for_patron limit is parsed into the nested channel'
     );
+};
+
+subtest '_extract_item_filters() OPAC whitelist (Bug XXXXX)' => sub {
+    plan tests => 7;
+
+    my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
+
+    my @allowed = (
+        'items.homebranch:CPL',            'items.holdingbranch:CPL',
+        'items.itype:BK',                  'items.location:SHELF',
+        'items.ccode:FIC',                 'items.available:true',
+        'items.available_for_patron:true', 'items.onrequest:false',
+        'items.barcode:12345',             'items.callnumber:ABC',
+        'items.dateaccessioned:2020-01-01',
+        'items.home_geolocation,geo_distance:40.4168,-3.7038,10km',
+        'items.holding_geolocation,geo_distance:40.4168,-3.7038,10km',
+    );
+    my ($opac_filters) = $qb->_extract_item_filters( \@allowed, { is_opac => 1 } );
+    is( scalar @$opac_filters, scalar @allowed, 'the whitelisted item limits are kept in the OPAC' );
+
+    my @hidden_probes = (
+        'items.lost:1',
+        'items.withdrawn:1',
+        'items.hidden_in_opac_by_preferences:true',
+        'items.hidden_in_opac_custom:true',
+    );
+    my ( $probe_filters, $probe_remaining );
+    warnings_like {
+        ( $probe_filters, $probe_remaining ) =
+            $qb->_extract_item_filters( [ @hidden_probes, 'itype:BK' ], { is_opac => 1 } );
+    }
+    [ map { qr/Ignoring OPAC limit '\Q$_\E'/ } @hidden_probes ],
+        'a warning is issued for each dropped limit';
+    is_deeply( $probe_filters,   [],           'item limits outside the whitelist are dropped in the OPAC' );
+    is_deeply( $probe_remaining, ['itype:BK'], 'and do not fall through to the flat limits' );
+
+    my $geo_filters;
+    warning_like {
+        ($geo_filters) = $qb->_extract_item_filters(
+            ['items.itype,geo_distance:40.4168,-3.7038,10km'],
+            { is_opac => 1 }
+        );
+    }
+    qr/Ignoring OPAC limit/, 'a geo_distance limit on a non-geo field is dropped with a warning';
+    is_deeply( $geo_filters, [], 'and is not turned into a filter' );
+
+    my ($staff_filters) = $qb->_extract_item_filters( \@hidden_probes );
+    is( scalar @$staff_filters, scalar @hidden_probes, 'the staff interface accepts any item field' );
 };
 
 subtest '_item_operand_to_filter() tests (Bug XXXXX)' => sub {

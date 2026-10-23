@@ -177,6 +177,21 @@ my %ITEM_OPERAND_FIELDS = (
     'date-of-acquisition'  => { subfield => 'dateaccessioned', kind => 'range' },
 );
 
+# Item subfields an items.* limit may filter on in the OPAC (Bug XXXXX): the
+# item facets, the availability and on-request controls, and the subfields of
+# the routed advanced-search operands. The nested items also hold the subfields
+# the OPAC hides by (lost, withdrawn, hidden_in_opac_*...), so any other
+# items.* limit is dropped there: it would let a patron probe for hidden items.
+# The staff interface accepts any subfield.
+our %OPAC_ITEM_LIMIT_FIELDS = map { $_ => 1 } (
+    keys %ITEM_FACET_FIELDS,
+    qw( available available_for_patron onrequest ),
+    map { $_->{subfield} } values %ITEM_OPERAND_FIELDS,
+);
+
+# Item subfields a geo_distance limit may filter on in the OPAC (Bug XXXXX).
+our %OPAC_ITEM_GEO_FIELDS = map { $_ => 1 } qw( home_geolocation holding_geolocation );
+
 # Readable labels for the routed item operands that are not facet fields, so the
 # breadcrumb (limit_desc) can still show what the user searched for.
 my %ITEM_OPERAND_LABEL = (
@@ -577,10 +592,17 @@ sub _build_item_facet_aggregation {
 =head2 _extract_item_filters
 
     my ( $item_filters, $remaining_limits ) = $builder->_extract_item_filters(\@limits);
+    my ( $item_filters, $remaining_limits ) = $builder->_extract_item_filters(\@limits, { is_opac => 1 });
 
 Partitions a list of limit strings (Bug XXXXX) into item-level filters, which
 must be turned into a nested query, and the remaining limits, which keep flowing
-through the regular query_string machinery. Recognised forms:
+through the regular query_string machinery.
+
+With C<is_opac>, an C<items.*> limit on a subfield missing from
+C<%OPAC_ITEM_LIMIT_FIELDS> (or, for C<geo_distance>, from
+C<%OPAC_ITEM_GEO_FIELDS>) is dropped with a warning.
+
+Recognised forms:
 
 =over 4
 
@@ -609,16 +631,26 @@ Anything else is returned untouched in the remaining-limits list.
 =cut
 
 sub _extract_item_filters {
-    my ( $self, $limits ) = @_;
+    my ( $self, $limits, $options ) = @_;
 
     my @item_filters;
     my @remaining;
 
+    my $is_opac = $options && $options->{is_opac};
+    my $allowed = sub {
+        my ( $field, $allowed_fields, $limit ) = @_;
+        return 1 if !$is_opac || $allowed_fields->{$field};
+        warn "Ignoring OPAC limit '$limit': item field '$field' cannot be filtered on in the OPAC";
+        return 0;
+    };
+
     for my $limit ( @{ $limits // [] } ) {
         if ( $limit =~ /^items\.(\w+),geo_distance:([^,]+),([^,]+),(.+)$/ ) {
+            next unless $allowed->( $1, \%OPAC_ITEM_GEO_FIELDS, $limit );
             push @item_filters, { field => $1, lat => $2 + 0, lon => $3 + 0, distance => $4 };
         } elsif ( $limit =~ /^items\.(\w+):(.+)$/ ) {
             my ( $field, $value ) = ( $1, $2 );
+            next unless $allowed->( $field, \%OPAC_ITEM_LIMIT_FIELDS, $limit );
             $value =~ s/^"(.*)"$/$1/;
             if    ( $value eq 'true' )  { $value = JSON::true; }
             elsif ( $value eq 'false' ) { $value = JSON::false; }
@@ -1069,8 +1101,9 @@ sub build_query_compat {
         # OPAC always enforces (hiding, lost).
         # Saved search filters are expanded first, so that their item limits are
         # routed like any other limit; their query part stays a string limit.
-        my ( $expanded_limits,   $filter_query_limits ) = $self->_expand_search_filters($orig_limits);
-        my ( $user_item_filters, $remaining_limits )    = $self->_extract_item_filters($expanded_limits);
+        my ( $expanded_limits, $filter_query_limits ) = $self->_expand_search_filters($orig_limits);
+        my ( $user_item_filters, $remaining_limits ) =
+            $self->_extract_item_filters( $expanded_limits, { is_opac => $params->{is_opac} } );
         push @$user_item_filters, @operand_item_filters;
 
         # Describe the user-supplied item filters (not the automatic ones) so the
