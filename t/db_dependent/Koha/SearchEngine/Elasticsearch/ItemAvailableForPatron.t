@@ -19,13 +19,14 @@
 
 use Modern::Perl;
 
-use Test::More tests => 7;
+use Test::More tests => 8;
 use Test::NoWarnings;
 use Test::MockModule;
 
 use File::Basename qw( dirname );
 
 use t::lib::Mocks;
+use t::lib::Mocks::Logger;
 
 BEGIN {
     # Mock pluginsdir and load Koha::Plugins *before* anything else can pull it
@@ -182,6 +183,52 @@ subtest 'the hook receives intransit and blocked_by_hold' => sub {
     $schema->storage->txn_rollback;
 };
 
+subtest 'fails closed when a plugin dies' => sub {
+    plan tests => 6;
+
+    $schema->storage->txn_begin;
+
+    t::lib::Mocks::mock_config( 'enable_plugins', 1 );
+
+    my $logger = t::lib::Mocks::Logger->new;
+    my $es     = Koha::SearchEngine::Elasticsearch->new( { index => 'biblios' } );
+    my $item   = $builder->build_sample_item;
+    my $module = Test::MockModule->new('Koha::Plugins');
+
+    # A plugin that dies makes the item unavailable, even if a later plugin
+    # would make it available and the default conditions are met.
+    my $dies   = Koha::Test::FakeAvailPlugin->new('die');
+    my $allows = Koha::Test::FakeAvailPlugin->new(1);
+    $module->mock( 'get_enabled_plugins', sub { return ( $dies, $allows ); } );
+    is( $es->_item_available_for_patron( $item, 0, 0 ), 0, 'the item is not available when a plugin dies' );
+    is( $allows->{called},                              0, 'the remaining plugins are not called' );
+    $logger->error_like(
+        qr/^Plugin error \(Koha::Test::FakeAvailPlugin\) in item_available_for_patron, the item is not available for patrons: Broken availability rules/,
+        'the error is logged with the plugin name'
+    );
+    $logger->clear;
+
+    # The same after a plugin that makes it available.
+    my $allows_first = Koha::Test::FakeAvailPlugin->new(1);
+    $module->mock( 'get_enabled_plugins', sub { return ( $allows_first, $dies ); } );
+    is( $es->_item_available_for_patron( $item, 0, 0 ), 0, 'a plugin dying after a true still fails closed' );
+    $logger->clear;
+
+    # A plugin whose metadata cannot be read either: the plugin class is logged.
+    my $broken = Koha::Test::BrokenAvailPlugin->new;
+    $module->mock( 'get_enabled_plugins', sub { return ($broken); } );
+    is(
+        $es->_item_available_for_patron( $item, 0, 0 ), 0,
+        'the item is not available when a plugin and its metadata die'
+    );
+    $logger->error_like(
+        qr/^Plugin error \(Koha::Test::BrokenAvailPlugin\) in item_available_for_patron/,
+        'the error is logged with the plugin class'
+    );
+
+    $schema->storage->txn_rollback;
+};
+
 {
 
     package Koha::Test::FakeAvailPlugin;
@@ -194,10 +241,22 @@ subtest 'the hook receives intransit and blocked_by_hold' => sub {
     sub item_available_for_patron {
         my ( $self, $params ) = @_;
         $self->{called}++;
+        die "Broken availability rules\n" if defined $self->{value} && $self->{value} eq 'die';
         return $self->{value};
     }
 
     sub get_metadata { return { name => 'Koha::Test::FakeAvailPlugin' }; }
+}
+
+{
+
+    package Koha::Test::BrokenAvailPlugin;
+
+    sub new { return bless {}, shift; }
+
+    sub item_available_for_patron { die "Broken availability rules\n"; }
+
+    sub get_metadata { die "Broken metadata\n"; }
 }
 
 {

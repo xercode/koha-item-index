@@ -39,6 +39,7 @@ use Koha::Items;
 use Koha::Item::Transfers;
 use Koha::Holds;
 use Koha::Libraries;
+use Koha::Logger;
 
 use Carp  qw( carp croak );
 use Clone qw( clone );
@@ -1306,6 +1307,9 @@ Returns 0 (not hidden) when no plugin vetoes the item, when no plugin implements
 the hook, or when plugins are disabled. This hiding is unconditional (it is not
 lifted by C<OpacHiddenItemsExceptions>).
 
+A plugin that dies fails closed: the item is hidden, without calling the
+remaining plugins, and the error is logged (see L</_log_item_hook_error>).
+
 The result is stored in the index when the record is indexed: a plugin whose
 answer changes (new rules, configuration, data) must have the affected records
 reindexed (see L</_get_item_documents>).
@@ -1318,10 +1322,10 @@ sub _item_hidden_in_opac_custom {
     ($plugins) = $self->_item_hook_plugins('item_hidden_in_opac') unless $plugins;
 
     for my $plugin ( @{$plugins} ) {
-        my $hidden = eval { $plugin->item_hidden_in_opac( { item => $item } ) };
-        if ($@) {
-            warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
-            next;
+        my $hidden;
+        unless ( eval { $hidden = $plugin->item_hidden_in_opac( { item => $item } ); 1 } ) {
+            $self->_log_item_hook_error( $plugin, 'item_hidden_in_opac', $@, 'the item is hidden in the OPAC' );
+            return 1;
         }
         return 1 if $hidden;
     }
@@ -1358,6 +1362,9 @@ available;
 
 =back
 
+A plugin that dies fails closed: the item is not available, without calling the
+remaining plugins, and the error is logged (see L</_log_item_hook_error>).
+
 Default conditions: the item is B<not> available if any of these holds:
 C<itemlost> is non-zero, C<withdrawn> is truthy, C<damaged> is truthy, the item is
 C<$intransit>, or it is C<$blocked_by_hold> (an active hold found in 'W'/'T'/'P').
@@ -1386,18 +1393,23 @@ sub _item_available_for_patron {
 
     my $saw_true = 0;
     for my $plugin ( @{$plugins} ) {
-        my $value = eval {
-            $plugin->item_available_for_patron(
+        my $value;
+        my $ok = eval {
+            $value = $plugin->item_available_for_patron(
                 {
                     item            => $item,
                     intransit       => $intransit,
                     blocked_by_hold => $blocked_by_hold,
                 }
             );
+            1;
         };
-        if ($@) {
-            warn sprintf( "Plugin error (%s): %s", $plugin->get_metadata->{name}, $@ );
-            next;
+        unless ($ok) {
+            $self->_log_item_hook_error(
+                $plugin, 'item_available_for_patron', $@,
+                'the item is not available for patrons'
+            );
+            return 0;
         }
         next     unless defined $value;    # abstention
         return 0 unless $value;            # defined false: not available, short-circuit
@@ -1416,6 +1428,27 @@ sub _item_available_for_patron {
     return 0 if $blocked_by_hold;    # active hold found IN ('W','T','P')
 
     return 1;
+}
+
+=head2 _log_item_hook_error
+
+    $self->_log_item_hook_error( $plugin, $hook, $error, $outcome );
+
+Logs, at error level, that C<$plugin> died in the item hook C<$hook> with
+C<$error>, and the C<$outcome> applied to the item instead (Bug XXXXX). The
+plugin name is read within an C<eval>, so that a broken plugin cannot make the
+logging die too; the plugin class is used when it cannot be read.
+
+=cut
+
+sub _log_item_hook_error {
+    my ( $self, $plugin, $hook, $error, $outcome ) = @_;
+
+    my $name = eval { $plugin->get_metadata->{name} } || ref $plugin;
+    chomp $error;
+    Koha::Logger->get->error( sprintf( "Plugin error (%s) in %s, %s: %s", $name, $hook, $outcome, $error ) );
+
+    return;
 }
 
 =head2 _process_data_field_rules($rules, $field, $record_document, $altscript, $exclude_target_fields_regexp)

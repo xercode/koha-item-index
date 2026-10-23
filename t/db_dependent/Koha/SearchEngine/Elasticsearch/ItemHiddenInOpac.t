@@ -19,13 +19,14 @@
 
 use Modern::Perl;
 
-use Test::More tests => 6;
+use Test::More tests => 7;
 use Test::NoWarnings;
 use Test::MockModule;
 
 use File::Basename qw( dirname );
 
 use t::lib::Mocks;
+use t::lib::Mocks::Logger;
 
 BEGIN {
     # Mock pluginsdir and load Koha::Plugins *before* anything else can pull it
@@ -113,6 +114,45 @@ subtest 'restrictive: stops at the first plugin returning true' => sub {
     is( $es->_item_hidden_in_opac_custom(undef), 1, 'still hidden when a later plugin vetoes' );
 };
 
+subtest 'fails closed when a plugin dies' => sub {
+    plan tests => 7;
+
+    t::lib::Mocks::mock_config( 'enable_plugins', 1 );
+
+    my $logger = t::lib::Mocks::Logger->new;
+    my $dies   = Koha::Test::FakeHidePlugin->new('die');
+    my $allows = Koha::Test::FakeHidePlugin->new(0);
+
+    my $module = Test::MockModule->new('Koha::Plugins');
+    $module->mock( 'get_enabled_plugins', sub { return ( $dies, $allows ); } );
+
+    my $es = Koha::SearchEngine::Elasticsearch->new( { index => 'biblios' } );
+
+    is( $es->_item_hidden_in_opac_custom(undef), 1, 'the item is hidden when a plugin dies' );
+    is( $allows->{called},                       0, 'the remaining plugins are not called' );
+    $logger->error_like(
+        qr/^Plugin error \(Koha::Test::FakeHidePlugin\) in item_hidden_in_opac, the item is hidden in the OPAC: Broken hiding rules/,
+        'the error is logged with the plugin name'
+    );
+    $logger->clear;
+
+    # A plugin whose metadata cannot be read either: the plugin class is logged.
+    my $broken = Koha::Test::BrokenHidePlugin->new;
+    $module->mock( 'get_enabled_plugins', sub { return ($broken); } );
+    is( $es->_item_hidden_in_opac_custom(undef), 1, 'the item is hidden when a plugin and its metadata die' );
+    $logger->error_like(
+        qr/^Plugin error \(Koha::Test::BrokenHidePlugin\) in item_hidden_in_opac/,
+        'the error is logged with the plugin class'
+    );
+    $logger->clear;
+
+    # A plugin that hides before the broken one: the broken one is not reached.
+    my $vetoes = Koha::Test::FakeHidePlugin->new(1);
+    $module->mock( 'get_enabled_plugins', sub { return ( $vetoes, $dies ); } );
+    is( $es->_item_hidden_in_opac_custom(undef), 1, 'the item is hidden by the first plugin' );
+    is( $logger->count('error'),                 0, 'and nothing is logged' );
+};
+
 {
 
     package Koha::Test::FakeHidePlugin;
@@ -125,8 +165,20 @@ subtest 'restrictive: stops at the first plugin returning true' => sub {
     sub item_hidden_in_opac {
         my ( $self, $params ) = @_;
         $self->{called}++;
+        die "Broken hiding rules\n" if $self->{hidden} eq 'die';
         return $self->{hidden};
     }
 
     sub get_metadata { return { name => 'Koha::Test::FakeHidePlugin' }; }
+}
+
+{
+
+    package Koha::Test::BrokenHidePlugin;
+
+    sub new { return bless {}, shift; }
+
+    sub item_hidden_in_opac { die "Broken hiding rules\n"; }
+
+    sub get_metadata { die "Broken metadata\n"; }
 }
