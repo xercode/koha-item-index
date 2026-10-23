@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 17;
+use Test::More tests => 18;
 
 use List::Util qw( all );
 
@@ -1870,6 +1870,70 @@ subtest 'OPAC record suppression (Bug XXXXX)' => sub {
         $qb->build_query_compat( undef, ['*'], undef, ['items.homebranch:CPL'], undef, 0, undef, { is_opac => 1 } );
     ok( $has_hard_nested->($query),       'a hard nested item filter is used when the user filters' );
     ok( !$has_items_count_zero->($query), 'no items_count:0 OR when the user filters (item-less records hidden)' );
+};
+
+subtest 'OPAC hiding filters are not widened by user filters (Bug XXXXX)' => sub {
+    plan tests => 3;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems',              1 );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 0 );
+
+    # The OPAC whitelist already drops the limits on the hiding fields: let them
+    # through, to check that the hiding filters hold by themselves if a user
+    # filter ever reaches them.
+    my %whitelist = %Koha::SearchEngine::Elasticsearch::QueryBuilder::OPAC_ITEM_LIMIT_FIELDS;
+    local %Koha::SearchEngine::Elasticsearch::QueryBuilder::OPAC_ITEM_LIMIT_FIELDS =
+        ( %whitelist, map { $_ => 1 } qw( lost hidden_in_opac_custom hidden_in_opac_by_preferences ) );
+
+    $se->mock(
+        'get_facet_fields',
+        sub { return ( Koha::SearchField->new( { name => 'homebranch', label => 'Home libraries' } ) ); }
+    );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+    my ( undef, $query ) = $qb->build_query_compat(
+        undef, ['*'], undef,
+        [ 'items.lost:1', 'items.hidden_in_opac_custom:true', 'items.hidden_in_opac_by_preferences:true' ],
+        undef, 0, undef, { is_opac => 1 }
+    );
+
+    # Each hiding filter keeps a term of its own, AND-ed with the user filter on
+    # the same field: merged into a terms clause, they would match the hidden
+    # items too.
+    my $expected = [
+        { term => { 'items.lost'                          => '0' } },
+        { term => { 'items.hidden_in_opac_custom'         => JSON::false } },
+        { term => { 'items.hidden_in_opac_by_preferences' => JSON::false } },
+        { term => { 'items.lost'                          => '1' } },
+        { term => { 'items.hidden_in_opac_custom'         => JSON::true } },
+        { term => { 'items.hidden_in_opac_by_preferences' => JSON::true } },
+    ];
+    is_deeply(
+        _first_nested_item_leaves($query), $expected,
+        'the query keeps the hiding filters apart from the user filters on the same fields'
+    );
+    is_deeply(
+        $query->{aggregations}{homebranch}{aggs}{item_filter}{filter}{bool}{filter}, $expected,
+        'and so do the item facets'
+    );
+
+    # The same for a patron whose category overrides the preferences hiding:
+    # the custom hiding still holds.
+    ( undef, $query ) = $qb->build_query_compat(
+        undef, ['*'], undef, ['items.hidden_in_opac_custom:true'], undef, 0, undef,
+        { is_opac => 1, override_hidden_items => 1 }
+    );
+    is_deeply(
+        _first_nested_item_leaves($query),
+        [
+            { term => { 'items.lost'                  => '0' } },
+            { term => { 'items.hidden_in_opac_custom' => JSON::false } },
+            { term => { 'items.hidden_in_opac_custom' => JSON::true } },
+        ],
+        'the custom hiding is not widened for an overriding category either'
+    );
+
+    $se->unmock('get_facet_fields');
 };
 
 subtest 'matched-item inner_hits (Bug XXXXX)' => sub {

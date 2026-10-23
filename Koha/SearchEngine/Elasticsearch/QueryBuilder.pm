@@ -373,6 +373,10 @@ facet semantics: a record with items in CPL and FFL must still match
 C<homebranch:CPL OR homebranch:FFL>. Filters on *different* fields stay AND-ed on
 the same nested item. First-occurrence order of the fields is preserved.
 
+A filter flagged C<enforced> (the automatic OPAC hiding filters) is never
+merged: it keeps its own clause, so a user filter on the same field cannot widen
+it into an OR.
+
 Each entry of C<@item_filters> is a hashref describing one leaf condition:
 
 =over 4
@@ -437,7 +441,9 @@ descriptor grammar) into the ordered arrayref of Elasticsearch clauses that goes
 inside a C<bool> C<filter> (Bug XXXXX). Equality filters (term/terms) on the
 *same* field are accumulated into a single C<terms> clause (OR semantics, matching
 Koha facets); geo_distance, should disjunctions, wildcard and range leaves are
-never merged and keep their own slot, preserving first-occurrence order.
+never merged and keep their own slot, preserving first-occurrence order. Nor are
+the C<enforced> filters, so that they are AND-ed with any user filter on the
+same field.
 
 Shared by L</_build_item_filter_query> (the hard same-item filter) and the item
 facet aggregations (L</_build_item_facet_aggregation>), so the facet bucket counts
@@ -461,12 +467,16 @@ sub _item_filter_clauses {
             next;
         }
         if (   $filter->{should}
+            || $filter->{enforced}
             || defined $filter->{distance}
             || exists $filter->{wildcard}
             || exists $filter->{range} )
         {
             # Non-equality leaves (geo, disjunction, wildcard, range) are never
-            # merged with the term/terms slots: each keeps its own clause.
+            # merged with the term/terms slots: each keeps its own clause. Nor
+            # are the enforced filters: merged with a user filter on the same
+            # field (e.g. lost:0 with lost:1), they would become an OR and let
+            # the hidden items match.
             push @slots, { leaf => $self->_item_filter_leaf($filter) };
             next;
         }
@@ -1115,18 +1125,20 @@ sub build_query_compat {
         # In the OPAC, hidelostitems is resolved here as a nested filter on
         # items.lost rather than at index time (see Koha::Item->hidden_in_opac).
         if ( $params->{is_opac} && C4::Context->preference('hidelostitems') ) {
-            push @auto_item_filters, { field => 'lost', value => '0' };
+            push @auto_item_filters, { field => 'lost', value => '0', enforced => 1 };
         }
 
         # In the OPAC, hidden items must never match a search (Bug XXXXX): a
         # hidden item must not satisfy a same-item facet, so the hiding filters
-        # are combined with the user filters in the same nested bool below. Both
+        # are combined with the user filters in the same nested bool below, each
+        # in a clause of its own (enforced) that no user filter can widen. Both
         # subfields are boolean, hence the JSON::false value. Custom hiding is
         # always hard; preferences-based hiding is lifted for patrons whose
         # category is listed in OpacHiddenItemsExceptions (override_hidden_items).
         if ( $params->{is_opac} ) {
-            push @auto_item_filters, { field => 'hidden_in_opac_custom',         value => JSON::false };
-            push @auto_item_filters, { field => 'hidden_in_opac_by_preferences', value => JSON::false }
+            push @auto_item_filters, { field => 'hidden_in_opac_custom', value => JSON::false, enforced => 1 };
+            push @auto_item_filters,
+                { field => 'hidden_in_opac_by_preferences', value => JSON::false, enforced => 1 }
                 unless $params->{override_hidden_items};
         }
 

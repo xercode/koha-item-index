@@ -28,6 +28,7 @@ use Modern::Perl;
 
 use Test::More;
 use Test::MockModule;
+use Test::Warn;
 use JSON;
 
 use t::lib::Mocks;
@@ -445,6 +446,81 @@ subtest 'advanced-search item operands routed to nested' => sub {
         [1],
         'an empty q with an mc-itype limit still matches via the * fallback'
     );
+};
+
+subtest 'OPAC hidden items do not leak through user filters (Bug XXXXX)' => sub {
+    plan tests => 9;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems',              1 );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 0 );
+
+    # A record whose only copy in DDD is lost, with a visible copy in EEE.
+    $es->index(
+        index => $searcher->index_name,
+        id    => 6,
+        body  => {
+            title       => 'river',
+            items_count => 2,
+            items       => [
+                item( itemnumber => 61, homebranch => 'DDD', holdingbranch => 'DDD', lost => '1' ),
+                item( itemnumber => 62, homebranch => 'EEE', holdingbranch => 'EEE' ),
+            ],
+        }
+    );
+    $es->indices->refresh( index => $searcher->index_name );
+
+    my $ids;
+    warning_like { $ids = matching_ids( [ 'items.homebranch:DDD', 'items.lost:1' ], { is_opac => 1 } ) }
+    qr/Ignoring OPAC limit 'items\.lost:1'/, 'the limit on items.lost is dropped in the OPAC';
+    is_deeply( $ids, [], 'so the lost copy does not match the library filter' );
+
+    # Let the hiding fields through the OPAC whitelist: the hiding filters must
+    # hold by themselves.
+    my %whitelist = %Koha::SearchEngine::Elasticsearch::QueryBuilder::OPAC_ITEM_LIMIT_FIELDS;
+    local %Koha::SearchEngine::Elasticsearch::QueryBuilder::OPAC_ITEM_LIMIT_FIELDS =
+        ( %whitelist, map { $_ => 1 } qw( lost hidden_in_opac_custom hidden_in_opac_by_preferences ) );
+
+    is_deeply(
+        matching_ids( [ 'items.homebranch:DDD', 'items.lost:1' ], { is_opac => 1 } ),
+        [], 'a user filter on items.lost does not bring the lost copy back'
+    );
+    is_deeply(
+        matching_ids( ['items.hidden_in_opac_by_preferences:true'], { is_opac => 1 } ),
+        [], 'a user filter on items.hidden_in_opac_by_preferences does not bring the hidden copies back'
+    );
+    is_deeply(
+        matching_ids( ['items.hidden_in_opac_custom:true'], { is_opac => 1, override_hidden_items => 1 } ),
+        [], 'a user filter on items.hidden_in_opac_custom does not bring the hidden copies back'
+    );
+    is_deeply(
+        matching_ids( [ 'items.homebranch:DDD', 'items.lost:1' ] ),
+        [6], 'the staff interface finds the lost copy'
+    );
+
+    # Item facets: the counts only take the visible copies into account.
+    $se->mock(
+        'get_facet_fields',
+        sub { return ( Koha::SearchField->new( { name => 'homebranch', label => 'Home libraries' } ) ); }
+    );
+    my $facet_buckets = sub {
+        my ($limits) = @_;
+        my ( undef, $query ) =
+            $builder->build_query_compat( undef, ['*'], undef, $limits, undef, undef, undef, { is_opac => 1 } );
+        my $results = $searcher->search( $query, undef, 50 );
+        return { map { $_->{key} => $_->{record_count}{doc_count} }
+                @{ $results->{aggregations}{homebranch}{item_filter}{homebranch}{buckets} } };
+    };
+    my $buckets = $facet_buckets->( [] );
+    ok( !exists $buckets->{DDD}, 'no facet entry for a library whose only copy is lost' );
+    is( $buckets->{EEE}, 1, 'the visible copy of the record is counted' );
+    is_deeply(
+        $facet_buckets->( ['items.lost:1'] ), {},
+        'a user filter on items.lost does not count the lost copies'
+    );
+    $se->unmock('get_facet_fields');
+
+    $es->delete( index => $searcher->index_name, id => 6 );
+    $es->indices->refresh( index => $searcher->index_name );
 };
 
 subtest 'the record read from the index has its item fields (Bug XXXXX)' => sub {

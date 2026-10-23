@@ -421,7 +421,7 @@ subtest '_create_query_string' => sub {
 };
 
 subtest '_build_item_filter_query() tests (Bug XXXXX)' => sub {
-    plan tests => 12;
+    plan tests => 14;
 
     my $qb = 'Koha::SearchEngine::Elasticsearch::QueryBuilder';
 
@@ -574,6 +574,41 @@ subtest '_build_item_filter_query() tests (Bug XXXXX)' => sub {
         $range->{nested}{query}{bool}{filter},
         [ { range => { 'items.dateaccessioned' => { gte => '2020-01-01', lte => '2020-12-31' } } } ],
         'a range leaf becomes a range clause on the same item'
+    );
+
+    # an enforced filter (the automatic OPAC hiding ones) keeps its own clause,
+    # so a user filter on the same field is AND-ed with it rather than OR-ed.
+    my $enforced = $qb->_build_item_filter_query(
+        [
+            { field => 'lost',       value => '0', enforced => 1 },
+            { field => 'homebranch', value => 'CPL' },
+            { field => 'lost',       value => '1' },
+            { field => 'lost',       value => '2' },
+        ]
+    );
+    is_deeply(
+        $enforced->{nested}{query}{bool}{filter},
+        [
+            { term  => { 'items.lost'       => '0' } },
+            { term  => { 'items.homebranch' => 'CPL' } },
+            { terms => { 'items.lost'       => [ '1', '2' ] } },
+        ],
+        'an enforced filter is not merged with the user filters on the same field'
+    );
+
+    my $enforced_first = $qb->_build_item_filter_query(
+        [
+            { field => 'hidden_in_opac_by_preferences', value => JSON::true },
+            { field => 'hidden_in_opac_by_preferences', value => JSON::false, enforced => 1 },
+        ]
+    );
+    is_deeply(
+        $enforced_first->{nested}{query}{bool}{filter},
+        [
+            { term => { 'items.hidden_in_opac_by_preferences' => JSON::true } },
+            { term => { 'items.hidden_in_opac_by_preferences' => JSON::false } },
+        ],
+        'nor when the user filter comes first'
     );
 
     # without want_inner_hits the nested carries no inner_hits.
