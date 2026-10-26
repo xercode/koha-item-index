@@ -1461,7 +1461,7 @@ subtest 'marc_records_to_documents should build the nested "items" field' => sub
 };
 
 subtest 'marc_records_to_documents should compute the nested "available_for_patron" field' => sub {
-    plan tests => 9;
+    plan tests => 10;
 
     t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
     t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
@@ -1511,11 +1511,23 @@ subtest 'marc_records_to_documents should compute the nested "available_for_patr
     is_deeply( $afp->(), \0, 'available_for_patron is false for a lost item' );
     $item->set( { itemlost => 0 } )->store;
 
-    # withdrawn / damaged (truthy) block the patron.
+    # withdrawn (truthy) blocks the patron.
     $item->set( { withdrawn => 1 } )->store;
     is_deeply( $afp->(), \0, 'available_for_patron is false for a withdrawn item' );
-    $item->set( { withdrawn => 0, damaged => 1 } )->store;
-    is_deeply( $afp->(), \0, 'available_for_patron is false for a damaged item' );
+    $item->set( { withdrawn => 0 } )->store;
+
+    # damaged (truthy) blocks the patron unless holds on damaged items are allowed.
+    $item->set( { damaged => 1 } )->store;
+    t::lib::Mocks::mock_preference( 'AllowHoldsOnDamagedItems', 0 );
+    is_deeply(
+        $afp->(), \0,
+        'available_for_patron is false for a damaged item if AllowHoldsOnDamagedItems is off'
+    );
+    t::lib::Mocks::mock_preference( 'AllowHoldsOnDamagedItems', 1 );
+    is_deeply(
+        $afp->(), \1,
+        'available_for_patron is true for a damaged item if AllowHoldsOnDamagedItems is on'
+    );
     $item->set( { damaged => 0 } )->store;
 
     # intransit: an active transfer.

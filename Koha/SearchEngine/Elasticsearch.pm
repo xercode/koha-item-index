@@ -1029,14 +1029,14 @@ status) and the libraries' geolocation are resolved with grouped queries over
 the whole batch, to avoid N+1 lookups inside the indexing loop.
 
 Some fields are computed from settings that are not item data: the
-C<OpacHiddenItems> system preference (C<hidden_in_opac_by_preferences>) and the
-C<item_hidden_in_opac> and C<item_available_for_patron> plugin hooks
-(C<hidden_in_opac_custom>, C<available_for_patron>). They are evaluated when a
-record is indexed, and nothing reindexes the records when those settings change:
-whoever changes them (the administrator changing the preference, the developer or
-administrator of the plugin when it is installed, enabled, disabled or
-reconfigured, or when the data its hooks depend on changes) is responsible for
-reindexing the affected records, e.g. with
+C<OpacHiddenItems> system preference (C<hidden_in_opac_by_preferences>), the
+C<AllowHoldsOnDamagedItems> system preference and the C<item_hidden_in_opac> and
+C<item_available_for_patron> plugin hooks (C<hidden_in_opac_custom>,
+C<available_for_patron>). They are evaluated when a record is indexed, and nothing
+reindexes the records when those settings change: whoever changes them (the
+administrator changing a preference, the developer or administrator of the plugin
+when it is installed, enabled, disabled or reconfigured, or when the data its hooks
+depend on changes) is responsible for reindexing the affected records, e.g. with
 C<misc/search_tools/rebuild_elasticsearch.pl>.
 
 =cut
@@ -1366,8 +1366,9 @@ A plugin that dies fails closed: the item is not available, without calling the
 remaining plugins, and the error is logged (see L</_log_item_hook_error>).
 
 Default conditions: the item is B<not> available if any of these holds:
-C<itemlost> is non-zero, C<withdrawn> is truthy, C<damaged> is truthy, the item is
-C<$intransit>, or it is C<$blocked_by_hold> (an active hold found in 'W'/'T'/'P').
+C<itemlost> is non-zero, C<withdrawn> is truthy, C<damaged> is truthy and the
+C<AllowHoldsOnDamagedItems> system preference is off, the item is C<$intransit>,
+or it is C<$blocked_by_hold> (an active hold found in 'W'/'T'/'P').
 
 C<onloan>, C<restricted> and C<notforloan> do B<not> affect the value. C<onloan> is
 excluded on purpose: an item that is checked out can still be reserved by a patron,
@@ -1381,8 +1382,9 @@ implementing the hook, as returned by L</_item_hook_plugins>, so that a batch
 resolves them only once. When it is not passed, they are looked up here.
 
 The result is stored in the index when the record is indexed: a plugin whose
-answer changes (new rules, configuration, data) must have the affected records
-reindexed (see L</_get_item_documents>).
+answer changes (new rules, configuration, data), or a change of
+C<AllowHoldsOnDamagedItems>, requires reindexing the affected records (see
+L</_get_item_documents>).
 
 =cut
 
@@ -1423,9 +1425,12 @@ sub _item_available_for_patron {
     # which never excludes on-loan items).
     return 0 if $item->itemlost;     # non-zero
     return 0 if $item->withdrawn;    # truthy
-    return 0 if $item->damaged;      # truthy
     return 0 if $intransit;          # derived from branchtransfers
     return 0 if $blocked_by_hold;    # active hold found IN ('W','T','P')
+
+    # A damaged item can only be requested if holds on damaged items are allowed
+    # (as C4::Reserves::IsAvailableForItemLevelRequest checks).
+    return 0 if $item->damaged && !C4::Context->preference('AllowHoldsOnDamagedItems');
 
     return 1;
 }
