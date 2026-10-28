@@ -30,6 +30,7 @@ use Test::MockModule;
 use Test::Warn;
 use t::lib::TestBuilder;
 use t::lib::Mocks;
+use t::lib::Mocks::Logger;
 
 use Test::NoWarnings;
 use Test::More tests => 10;
@@ -731,7 +732,7 @@ subtest "Tests for investigate (singular)." => sub {
 };
 
 subtest "Tests for toggle_indemand" => sub {
-    plan tests => 16;
+    plan tests => 17;
     $schema->storage->txn_begin;
 
     my $sritem = $builder->build(
@@ -782,7 +783,10 @@ subtest "Tests for toggle_indemand" => sub {
 
     # The record must be reindexed once the transfer is reset, not before
     # (Bug XXXXX): the index would otherwise keep the item in transit.
+    # The indexer fails here: the reset is already stored, so the failure is
+    # only logged, and the checks below still hold.
     my @reindexed;
+    my $logger         = t::lib::Mocks::Logger->new;
     my $indexer_module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch::Indexer');
     $indexer_module->mock(
         'index_records',
@@ -790,6 +794,7 @@ subtest "Tests for toggle_indemand" => sub {
             my ( $self, $record_numbers ) = @_;
             my $arrived = Koha::Item::Transfers->find( $transfer->id )->datearrived;
             push @reindexed, { biblionumber => $record_numbers, transfer_arrived => defined $arrived ? 1 : 0 };
+            die "Indexer down\n";
         }
     );
     t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
@@ -798,6 +803,10 @@ subtest "Tests for toggle_indemand" => sub {
         \@reindexed,
         [ { biblionumber => $dbitem->item->biblionumber, transfer_arrived => 1 } ],
         'The record is reindexed once, after the transfer is reset'
+    );
+    $logger->error_like(
+        qr/^Unable to reindex biblio @{[ $dbitem->item->biblionumber ]} after resetting stock rotation item/,
+        'A failure to reindex is logged'
     );
     $indexer_module->unmock_all;
 

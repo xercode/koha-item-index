@@ -25,8 +25,10 @@ use C4::Log   qw( logaction );
 use Koha::Database;
 use Koha::DateUtils qw( dt_from_string );
 use Koha::Exceptions::Item::Transfer;
+use Koha::Logger;
 use Koha::SearchEngine;
 use Koha::SearchEngine::Indexer;
+use Try::Tiny qw( catch try );
 
 use base qw(Koha::Object);
 
@@ -215,8 +217,19 @@ sub cancel {
         && !$params->{skip_record_index}
         && C4::Context->preference('SearchEngine') eq 'Elasticsearch' )
     {
-        my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
-        $indexer->index_records( $self->item->biblionumber, "specialUpdate", "biblioserver" );
+        # The transfer is already cancelled: do not make it fail
+        my $biblionumber = $self->item->biblionumber;
+        try {
+            my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+            $indexer->index_records( $biblionumber, "specialUpdate", "biblioserver" );
+        } catch {
+            Koha::Logger->get->error(
+                sprintf(
+                    "Unable to reindex biblio %s after cancelling transfer %s: %s", $biblionumber, $self->id,
+                    $_
+                )
+            );
+        };
     }
 
     return $self;

@@ -34,6 +34,7 @@ use Koha::Caches;
 use Koha::AuthorisedValues;
 
 use t::lib::Mocks;
+use t::lib::Mocks::Logger;
 use t::lib::TestBuilder;
 
 use Test::NoWarnings;
@@ -257,7 +258,7 @@ subtest 'ModItemTransfer tests' => sub {
 };
 
 subtest 'ModItemTransfer reindexes a checked out item whose transit is reset (Bug XXXXX)' => sub {
-    plan tests => 3;
+    plan tests => 5;
 
     $schema->storage->txn_begin;
 
@@ -290,6 +291,22 @@ subtest 'ModItemTransfer reindexes a checked out item whose transit is reset (Bu
         { skip_record_index => 1 }
     );
     is_deeply( \@reindexed, [], 'No reindex with skip_record_index' );
+
+    # The transfer is already stored when the record is reindexed: a failure
+    # to reindex is logged, and the transfer is kept
+    my $other_item = $builder->build_sample_item();
+    $stock_transfer = $other_item->request_transfer( { to => $library2, reason => 'StockrotationAdvance' } );
+    $stock_transfer->datesent(dt_from_string)->store;
+    $builder->build_object( { class => 'Koha::Checkouts', value => { itemnumber => $other_item->itemnumber } } );
+    my $logger = t::lib::Mocks::Logger->new;
+    $indexer_module->mock( 'index_records', sub { die "Indexer down\n"; } );
+    ModItemTransfer( $other_item->itemnumber, $library1->branchcode, $library2->branchcode, 'Manual' );
+    $stock_transfer->discard_changes;
+    is( $stock_transfer->datesent, undef, 'The transit is reset even if the record cannot be reindexed' );
+    $logger->error_like(
+        qr/^Unable to reindex biblio @{[ $other_item->biblionumber ]} after resetting a transfer: Indexer down/,
+        'The failure to reindex is logged'
+    );
 
     $schema->storage->txn_rollback;
 };

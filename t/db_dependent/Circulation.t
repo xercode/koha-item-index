@@ -31,6 +31,7 @@ use Time::Fake;
 use JSON  qw( from_json );
 use POSIX qw( floor );
 use t::lib::Mocks;
+use t::lib::Mocks::Logger;
 use t::lib::TestBuilder;
 
 use C4::Accounts;
@@ -8160,7 +8161,7 @@ subtest "CanBookBeIssued + needsconfirmation message" => sub {
 
 subtest 'Tests for BlockReturnOfWithdrawnItems' => sub {
 
-    plan tests => 6;
+    plan tests => 8;
 
     t::lib::Mocks::mock_preference( 'BlockReturnOfWithdrawnItems', 1 );
     t::lib::Mocks::mock_preference( 'RecordLocalUseOnReturn',      0 );
@@ -8203,6 +8204,23 @@ subtest 'Tests for BlockReturnOfWithdrawnItems' => sub {
     @reindexed = ();
     AddReturn( $item->barcode, $item->homebranch, 0, undef );
     is_deeply( \@reindexed, [], 'Nothing changed, nothing to reindex' );
+
+    # onloan is already cleared when the record is reindexed: a failure to
+    # reindex is logged, and does not make the return die
+    my $logger = t::lib::Mocks::Logger->new;
+    $indexer_module->mock( 'index_records', sub { die "Indexer down\n"; } );
+    $item->discard_changes;
+    $item->onloan( dt_from_string->ymd )->store( { skip_record_index => 1 } );
+    my @blocked = AddReturn( $item->barcode, $item->homebranch, 0, undef );
+    is_deeply(
+        \@blocked,
+        [ 0, { NotIssued => $item->barcode, withdrawn => 1 }, undef, {} ],
+        'The return is still blocked as usual if the record cannot be reindexed'
+    );
+    $logger->error_like(
+        qr/^Unable to reindex biblio @{[ $item->biblionumber ]} after a blocked return: Indexer down/,
+        'The failure to reindex is logged'
+    );
 };
 
 subtest 'Tests for Wrongbranch blocker (AllowReturnToBranch)' => sub {

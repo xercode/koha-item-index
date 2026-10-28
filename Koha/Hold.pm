@@ -39,8 +39,10 @@ use Koha::Plugins;
 use Koha::ILL::ISO18626::Request;
 
 use Koha::BackgroundJob::BatchUpdateBiblioHoldsQueue;
+use Koha::Logger;
 use Koha::SearchEngine;
 use Koha::SearchEngine::Indexer;
+use Try::Tiny qw( catch try );
 
 use Koha::Exceptions;
 use Koha::HoldGroups;
@@ -1167,10 +1169,7 @@ sub fill {
         }
     );
 
-    if ($reindex_biblionumber) {
-        my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
-        $indexer->index_records( $reindex_biblionumber, "specialUpdate", "biblioserver" );
-    }
+    $self->_reindex_biblio_for_item_status($reindex_biblionumber) if $reindex_biblionumber;
 
     return $self;
 }
@@ -1498,13 +1497,24 @@ Internal helper. Enqueues a reindex of this hold's biblio (or of the given
 biblionumber) so its nested item documents pick up the new onhold/onrequest
 status (Bug XXXXX).
 
+The hold change is already stored when this is called: a failure to enqueue the
+reindex is logged, and does not make the hold change fail.
+
 =cut
 
 sub _reindex_biblio_for_item_status {
     my ( $self, $biblionumber ) = @_;
 
-    my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
-    $indexer->index_records( $biblionumber // $self->biblionumber, "specialUpdate", "biblioserver" );
+    $biblionumber //= $self->biblionumber;
+    try {
+        my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+        $indexer->index_records( $biblionumber, "specialUpdate", "biblioserver" );
+    } catch {
+        Koha::Logger->get->error(
+            sprintf( "Unable to reindex biblio %s after a change to hold %s: %s", $biblionumber, $self->id, $_ ) );
+    };
+
+    return;
 }
 
 =head3 _set_default_expirationdate

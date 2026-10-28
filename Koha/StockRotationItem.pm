@@ -25,6 +25,7 @@ use Koha::Database;
 use Koha::DateUtils qw( dt_from_string );
 use Koha::Item::Transfer;
 use Koha::Item;
+use Koha::Logger;
 use Koha::SearchEngine;
 use Koha::SearchEngine::Indexer;
 use Koha::StockRotationStage;
@@ -321,9 +322,19 @@ sub toggle_indemand {
             $transfer->store;
 
             # Reindex once both the homebranch and the transfer are reset, so
-            # the index never sees the item still in transit.
-            Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } )
-                ->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+            # the index never sees the item still in transit. They are already
+            # stored: a failure to reindex must not make the change fail.
+            try {
+                Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } )
+                    ->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+            } catch {
+                Koha::Logger->get->error(
+                    sprintf(
+                        "Unable to reindex biblio %s after resetting stock rotation item %s: %s",
+                        $item->biblionumber, $self->itemnumber_id, $_
+                    )
+                );
+            };
         }
     }
 

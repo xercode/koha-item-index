@@ -25,7 +25,7 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 8;
+use Test::More tests => 9;
 use Test::MockModule;
 
 use Koha::Database;
@@ -37,6 +37,7 @@ use Koha::DateUtils qw( dt_from_string );
 
 use t::lib::TestBuilder;
 use t::lib::Mocks;
+use t::lib::Mocks::Logger;
 
 my $schema  = Koha::Database->new->schema;
 my $builder = t::lib::TestBuilder->new;
@@ -297,6 +298,83 @@ subtest 'Koha::Item::Transfer reactive reindex (Bug XXXXX)' => sub {
     reset_calls();
     $transfer3->transit;
     ok( ( scalar @index_calls ) >= 1, 'transit() reindexes via Koha::Item->store (already covered)' );
+
+    $schema->storage->txn_rollback;
+};
+
+subtest 'a failure to reindex does not make the hold or transfer change fail (Bug XXXXX)' => sub {
+    plan tests => 8;
+
+    $schema->storage->txn_begin;
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
+
+    my $library = $builder->build_object( { class => 'Koha::Libraries' } );
+    my $patron  = $builder->build_object( { class => 'Koha::Patrons' } );
+    my $biblio  = $builder->build_sample_biblio;
+    my $item    = $builder->build_sample_item( { biblionumber => $biblio->biblionumber } );
+    my $bibnum  = $biblio->biblionumber;
+    my $to      = $builder->build_object( { class => 'Koha::Libraries' } );
+
+    my $logger = t::lib::Mocks::Logger->new;
+    $indexer_module->mock( 'index_records', sub { die "Indexer down\n"; } );
+
+    my $hold = Koha::Hold->new(
+        {
+            borrowernumber  => $patron->borrowernumber,
+            biblionumber    => $bibnum,
+            itemnumber      => $item->itemnumber,
+            branchcode      => $library->branchcode,
+            reservedate     => dt_from_string->ymd,
+            item_level_hold => 1,
+            priority        => 1,
+        }
+    )->store;
+    ok( $hold->in_storage, 'the hold is placed' );
+    $logger->error_like(
+        qr/^Unable to reindex biblio $bibnum after a change to hold @{[ $hold->id ]}: Indexer down/,
+        'and the failure to reindex is logged'
+    );
+    $logger->clear;
+
+    $hold->fill;
+    ok( !Koha::Holds->find( $hold->id ), 'the hold is filled' );
+    $logger->error_like( qr/^Unable to reindex biblio $bibnum after a change to hold/, 'and the failure is logged' );
+    $logger->clear;
+
+    my $other_hold = Koha::Hold->new(
+        {
+            borrowernumber  => $patron->borrowernumber,
+            biblionumber    => $bibnum,
+            itemnumber      => $item->itemnumber,
+            branchcode      => $library->branchcode,
+            reservedate     => dt_from_string->ymd,
+            item_level_hold => 1,
+            priority        => 1,
+        }
+    )->store;
+    $logger->clear;
+    $other_hold->delete;
+    ok( !Koha::Holds->find( $other_hold->id ), 'the hold is deleted' );
+    $logger->error_like( qr/^Unable to reindex biblio $bibnum after a change to hold/, 'and the failure is logged' );
+    $logger->clear;
+
+    my $transfer = $item->request_transfer( { to => $to, reason => 'Manual', ignore_limits => 1 } );
+    $transfer->datesent(dt_from_string)->store;
+    $transfer->cancel( { reason => 'Manual', force => 1 } );
+    ok( $transfer->get_from_storage->datecancelled, 'the transfer is cancelled' );
+    $logger->error_like(
+        qr/^Unable to reindex biblio $bibnum after cancelling transfer @{[ $transfer->id ]}: Indexer down/,
+        'and the failure to reindex is logged'
+    );
+
+    # Back to capturing the reindex requests for the next tests
+    $indexer_module->mock(
+        'index_records',
+        sub {
+            my ( $self, $record_numbers ) = @_;
+            push @index_calls, ref $record_numbers eq 'ARRAY' ? @$record_numbers : $record_numbers;
+        }
+    );
 
     $schema->storage->txn_rollback;
 };

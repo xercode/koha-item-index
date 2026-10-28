@@ -111,6 +111,7 @@ use Koha::Policy::Biblio::AgeRestriction;
 use Koha::Patron::Debarments qw( DelUniqueDebarment AddUniqueDebarment );
 use Koha::Database;
 use Koha::Libraries;
+use Koha::Logger;
 use Koha::Account::Lines;
 use Koha::Holds;
 use Koha::Account::Lines;
@@ -2492,10 +2493,16 @@ sub AddReturn {
         }
 
         # The onloan change above skipped indexing, counting on the reindex at
-        # the end of the return, which this early return never reaches.
+        # the end of the return, which this early return never reaches. It is
+        # already stored: a failure to reindex must not make the return fail.
         if ($onloan_cleared) {
-            my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
-            $indexer->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+            try {
+                my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+                $indexer->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+            } catch {
+                Koha::Logger->get->error(
+                    sprintf( "Unable to reindex biblio %s after a blocked return: %s", $item->biblionumber, $_ ) );
+            };
         }
 
         return ( 0, $messages, $issue, ( $patron ? $patron->unblessed : {} ) );

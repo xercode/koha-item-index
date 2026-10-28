@@ -428,9 +428,16 @@ sub ModItemTransfer {
         $transfer->transit( { skip_record_index => $params->{skip_record_index} } );
     } elsif ( $transit_reset && !$params->{skip_record_index} ) {
 
-        # The item is no longer in transit and no ->transit will reindex it
-        my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
-        $indexer->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+        # The item is no longer in transit and no ->transit will reindex it.
+        # The transfer is already stored: a failure to reindex must not make
+        # it fail.
+        try {
+            my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+            $indexer->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+        } catch {
+            Koha::Logger->get->error(
+                sprintf( "Unable to reindex biblio %s after resetting a transfer: %s", $item->biblionumber, $_ ) );
+        };
     }
 
     return $transfer;
