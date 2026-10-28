@@ -23,7 +23,7 @@ use Test::Warn;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
 use Test::NoWarnings;
-use Test::More tests => 18;
+use Test::More tests => 19;
 
 use List::Util qw( all );
 
@@ -82,6 +82,9 @@ $se->mock(
         return $all_mappings{ $self->index };
     }
 );
+
+# The index has the nested items (Bug XXXXX), unless a test says otherwise
+$se->mock( 'nested_items_ready', sub { return 1; } );
 
 subtest 'build_authorities_query_compat() tests' => sub {
 
@@ -1932,6 +1935,72 @@ subtest 'OPAC hiding filters are not widened by user filters (Bug XXXXX)' => sub
         ],
         'the custom hiding is not widened for an overriding category either'
     );
+
+    $se->unmock('get_facet_fields');
+};
+
+subtest 'build_query_compat() on an index without the nested items (Bug XXXXX)' => sub {
+    plan tests => 12;
+
+    t::lib::Mocks::mock_preference( 'hidelostitems',              1 );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItemsHidesRecord', 1 );
+
+    $se->mock( 'nested_items_ready', sub { return 0; } );
+    $se->mock(
+        'get_facet_fields',
+        sub { return ( Koha::SearchField->new( { name => 'homebranch', label => 'Home libraries' } ) ); }
+    );
+
+    my $qb = Koha::SearchEngine::Elasticsearch::QueryBuilder->new( { index => 'biblios' } );
+
+    my ( $query, $limit, $limit_desc );
+    warnings_like {
+        ( undef, $query, undef, undef, undef, $limit, undef, $limit_desc ) = $qb->build_query_compat(
+            ['and'], [ 'river', '12345' ], [ 'kw', 'bc' ],
+            [
+                'items.homebranch:CPL',  'items.available_for_patron:true',
+                'items.onrequest:false', 'items.home_geolocation,geo_distance:40.4168,-3.7038,10km',
+                'mc-itype:BK',
+            ],
+            undef, 0, undef,
+            { is_opac => 1, want_matched_items => 1 }
+        );
+    }
+    [
+        qr/Ignoring limit 'items\.onrequest:false': the index has no nested items yet/,
+        qr/Ignoring limit 'items\.home_geolocation,geo_distance:[^']+': the index has no nested items yet/,
+    ],
+        'the item limits without an equivalent on the record fields are dropped with a warning';
+
+    ok( !( grep { ref $_ eq 'HASH' } @{ $query->{query}{bool}{filter} || [] } ), 'no nested item filter is built' );
+    like( $limit, qr/homebranch:\("CPL"\)/, 'an item facet limit is applied to the record field' );
+    like( $limit, qr/available:true/,       'the patron availability control is the record availability' );
+    like( $limit, qr/itype:\(\("BK"\)\)/,   'the advanced search item type limit stays a flat limit' );
+    unlike( $limit, qr/onrequest|geolocation/, 'the dropped limits are not applied' );
+    like(
+        $limit_desc, qr/\Qitems.onrequest:false (ignored)\E/,
+        'the dropped limits are described as ignored'
+    );
+    like(
+        $query->{query}{bool}{must}[0]{query_string}{query}, qr/12345/,
+        'the barcode operand stays in the query string'
+    );
+    is_deeply(
+        $query->{aggregations}{homebranch},
+        { terms => { field => 'homebranch__facet', size => C4::Context->preference('FacetMaxCount') } },
+        'the item facets aggregate on the record fields'
+    );
+
+    # Without user filters, in the OPAC, no item hiding nor record suppression
+    ( undef, $query ) = $qb->build_query_compat( undef, ['*'], undef, undef, undef, 0, undef, { is_opac => 1 } );
+    ok( !$query->{query}{bool}{filter}, 'no OPAC item hiding nor record suppression' );
+
+    # The same limits, once the index has the nested items
+    $se->mock( 'nested_items_ready', sub { return 1; } );
+    ( undef, $query ) =
+        $qb->build_query_compat( undef, ['*'], undef, ['items.homebranch:CPL'], undef, 0, undef, { is_opac => 1 } );
+    ok( _first_nested_item_leaves($query)->[0],     'with the nested items, the item limit is a nested filter' );
+    ok( $query->{aggregations}{homebranch}{nested}, 'and the item facets aggregate on the nested items' );
 
     $se->unmock('get_facet_fields');
 };

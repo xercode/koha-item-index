@@ -47,7 +47,6 @@ use Koha::ItemTypes;
 use Koha::AuthorisedValues;
 use Koha::AuthorisedValueCategories;
 use Koha::SearchEngine::QueryBuilder;
-use Koha::SearchEngine::Elasticsearch::QueryBuilder;
 use Koha::SearchEngine::Search;
 use Koha::Exceptions::Elasticsearch;
 use MARC::Record;
@@ -613,17 +612,16 @@ sub _convert_facets {
         # The item_filter level applies the active item filters so the counts stay
         # coherent with what activating the facet returns (same item; fork fix).
         # The per-record count comes from the reverse_nested sub-aggregation.
-        my $is_nested = $Koha::SearchEngine::Elasticsearch::QueryBuilder::ITEM_FACET_FIELDS{$type} ? 1 : 0;
-        my $buckets   = $is_nested ? $data->{item_filter}{$type}{buckets} : $data->{buckets};
+        # On an index without the nested items, they aggregate on the record
+        # fields instead, as the other facets (see nested_items_ready).
+        my $is_nested = exists $data->{item_filter} ? 1                                    : 0;
+        my $buckets   = $is_nested                  ? $data->{item_filter}{$type}{buckets} : $data->{buckets};
 
         # Item facets (Bug XXXXX) link through the nested "items.<field>" prefix
         # so that clicking them emits a "items.homebranch:CPL" limit, which the
         # query builder routes to the same-item nested filter. The displayed
         # label still derives from the bare $type via %special / av_cat.
-        my $type_link_value =
-            $Koha::SearchEngine::Elasticsearch::QueryBuilder::ITEM_FACET_FIELDS{$type}
-            ? "items.$type"
-            : $type;
+        my $type_link_value = $is_nested ? "items.$type" : $type;
 
         # We restrict to the most popular $limit !results
         my $limit = C4::Context->preference('FacetMaxCount');

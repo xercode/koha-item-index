@@ -246,6 +246,12 @@ This should be an arrayref of hashrefs, each containing a C<field> and an
 C<direction> (optional, defaults to C<asc>.) The results will be sorted
 according to these values. Valid values for C<direction> are 'asc' and 'desc'.
 
+=item nested_items
+
+Whether the item facets aggregate on the nested items (Bug XXXXX). Defaults to
+L<Koha::SearchEngine::Elasticsearch/nested_items_ready>: on an index without
+them, they aggregate on the record fields.
+
 =back
 
 =cut
@@ -325,6 +331,10 @@ sub build_query {
         my $size   = C4::Context->preference('FacetMaxCount');
         my @facets = Koha::SearchEngine::Elasticsearch->get_facet_fields;
 
+        # Without the nested items in the index (Bug XXXXX), the item facets
+        # aggregate on the record fields, as before them.
+        my $nested_items = $options{nested_items} // $self->nested_items_ready;
+
         # Item facet counts must respect the same active item filters as the hard
         # query filter (own fork fix, not in community 26.05): the clauses are
         # applied in an item_filter sub-agg inside every item facet's nested scope,
@@ -334,7 +344,7 @@ sub build_query {
 
         for my $f (@facets) {
             my $name = $f->name;
-            if ( $ITEM_FACET_FIELDS{$name} ) {
+            if ( $nested_items && $ITEM_FACET_FIELDS{$name} ) {
 
                 # Item facets (Bug XXXXX) aggregate over the nested items, and use
                 # reverse_nested so the bucket counts remain per-record, matching
@@ -685,6 +695,41 @@ sub _extract_item_filters {
     }
 
     return ( \@item_filters, \@remaining );
+}
+
+=head2 _flat_item_limits
+
+    my ( $limits, $ignored ) = $builder->_flat_item_limits(\@limits);
+
+For an index without the nested items (Bug XXXXX, see
+L<Koha::SearchEngine::Elasticsearch/nested_items_ready>), turns the C<items.*>
+limits back into the limits on the record fields that the searches used before
+them: an item facet (C<items.homebranch:CPL>) into the facet on the record field
+(C<homebranch:CPL>), and the availability controls (C<items.available:true>,
+C<items.available_for_patron:true>) into the record availability
+(C<available>). Any other C<items.*> limit has no equivalent: it is dropped with
+a warning and returned in C<$ignored>. The other limits are kept as they are.
+
+=cut
+
+sub _flat_item_limits {
+    my ( $self, $limits ) = @_;
+
+    my ( @limits, @ignored );
+    for my $limit ( @{ $limits // [] } ) {
+        if ( $limit =~ /^items\.(?:available|available_for_patron):true$/ ) {
+            push @limits, 'available';
+        } elsif ( $limit =~ /^items\.(\w+):(.+)$/ && $ITEM_FACET_FIELDS{$1} ) {
+            push @limits, "$1:$2";
+        } elsif ( $limit =~ /^items\./ ) {
+            warn "Ignoring limit '$limit': the index has no nested items yet";
+            push @ignored, $limit;
+        } else {
+            push @limits, $limit;
+        }
+    }
+
+    return ( \@limits, \@ignored );
 }
 
 =head2 _item_operand_to_filter
@@ -1072,6 +1117,11 @@ sub build_query_compat {
         # linear boolean structure cannot be decomposed, so every operand keeps
         # flowing through the flat query_string.
         my $operands_pure_and = !grep { defined && /^(?:or|not)$/i } @$operators;
+
+        # Until the index is recreated with the nested items (Bug XXXXX), the
+        # item operands, limits and facets work as they did before them: on the
+        # record fields, with no same-item filtering and no OPAC item hiding.
+        my $nested_items = $self->nested_items_ready;
         unshift @$operators, undef;    # The first one can't have an op
         my @search_params;
         my @operand_item_filters;
@@ -1079,8 +1129,8 @@ sub build_query_compat {
         my $ea       = each_array( @$operands, @$operators, @index_params );
         while ( my ( $oand, $otor, $index ) = $ea->() ) {
             next if ( !defined($oand) || $oand eq '' );
-            my $field = $index                                   ? $index->{field}              : undef;
-            my $spec  = ( $operands_pure_and && defined $field ) ? $ITEM_OPERAND_FIELDS{$field} : undef;
+            my $field = $index                                                   ? $index->{field}              : undef;
+            my $spec = ( $nested_items && $operands_pure_and && defined $field ) ? $ITEM_OPERAND_FIELDS{$field} : undef;
             if ($spec) {
 
                 # Use the raw operand, before query_string cleaning/truncation
@@ -1112,19 +1162,26 @@ sub build_query_compat {
         # Saved search filters are expanded first, so that their item limits are
         # routed like any other limit; their query part stays a string limit.
         my ( $expanded_limits, $filter_query_limits ) = $self->_expand_search_filters($orig_limits);
-        my ( $user_item_filters, $remaining_limits ) =
-            $self->_extract_item_filters( $expanded_limits, { is_opac => $params->{is_opac} } );
+        my ( $user_item_filters, $remaining_limits );
+        if ($nested_items) {
+            ( $user_item_filters, $remaining_limits ) =
+                $self->_extract_item_filters( $expanded_limits, { is_opac => $params->{is_opac} } );
+        } else {
+            ( $remaining_limits, my $ignored_limits ) = $self->_flat_item_limits($expanded_limits);
+            $user_item_filters = [];
+            push @item_filter_descriptions, map { "$_ (ignored)" } @$ignored_limits;
+        }
         push @$user_item_filters, @operand_item_filters;
 
         # Describe the user-supplied item filters (not the automatic ones) so the
         # breadcrumb only shows what the user actually chose.
-        @item_filter_descriptions = $self->_describe_item_filters($user_item_filters);
+        push @item_filter_descriptions, $self->_describe_item_filters($user_item_filters);
 
         my @auto_item_filters;
 
         # In the OPAC, hidelostitems is resolved here as a nested filter on
         # items.lost rather than at index time (see Koha::Item->hidden_in_opac).
-        if ( $params->{is_opac} && C4::Context->preference('hidelostitems') ) {
+        if ( $nested_items && $params->{is_opac} && C4::Context->preference('hidelostitems') ) {
             push @auto_item_filters, { field => 'lost', value => '0', enforced => 1 };
         }
 
@@ -1135,7 +1192,7 @@ sub build_query_compat {
         # subfields are boolean, hence the JSON::false value. Custom hiding is
         # always hard; preferences-based hiding is lifted for patrons whose
         # category is listed in OpacHiddenItemsExceptions (override_hidden_items).
-        if ( $params->{is_opac} ) {
+        if ( $nested_items && $params->{is_opac} ) {
             push @auto_item_filters, { field => 'hidden_in_opac_custom', value => JSON::false, enforced => 1 };
             push @auto_item_filters,
                 { field => 'hidden_in_opac_by_preferences', value => JSON::false, enforced => 1 }
@@ -1224,7 +1281,8 @@ sub build_query_compat {
         # the same-item descriptors are passed, never the OpacHiddenItemsHidesRecord
         # should/items_count:0 wrapper, so the counts track the visible items.
         $options{item_facet_filters} = [ @auto_item_filters, @$user_item_filters ];
-        $query = $self->build_query( $query_str, %options );
+        $options{nested_items}       = $nested_items;
+        $query                       = $self->build_query( $query_str, %options );
     }
 
     # We roughly emulate the CGI parameters of the zebra query builder

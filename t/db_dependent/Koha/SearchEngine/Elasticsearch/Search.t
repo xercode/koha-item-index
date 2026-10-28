@@ -17,7 +17,7 @@
 
 use Modern::Perl;
 
-use Test::More tests => 16;
+use Test::More tests => 17;
 use Test::NoWarnings;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
@@ -83,7 +83,7 @@ SKIP: {
 
     eval { $builder->get_elasticsearch_params; };
 
-    skip 'Elasticsearch configuration not available', 10
+    skip 'Elasticsearch configuration not available', 12
         if $@;
 
     Koha::SearchEngine::Elasticsearch::Indexer->new( { index => 'mydb' } )->drop_index;
@@ -220,6 +220,35 @@ SKIP: {
         is(
             $koha_facets->[0]->{facets}->[0]->{type_link_value}, 'items.homebranch',
             "Each facet entry also carries the items. prefixed type_link_value"
+        );
+
+        $schema->storage->txn_rollback;
+    };
+
+    subtest "_convert_facets item facets on an index without the nested items (Bug XXXXX)" => sub {
+        plan tests => 3;
+
+        $schema->storage->txn_begin;
+
+        # Until the index is recreated with the nested items, the item facets
+        # aggregate on the record fields, as the other facets.
+        my $es_facets = {
+            homebranch => {
+                buckets => [ { key => 'CPL', doc_count => 3 }, { key => 'MPL', doc_count => 2 } ],
+            },
+        };
+
+        my $koha_facets = $searcher->_convert_facets($es_facets);
+        my %count_by_value =
+            map { $_->{facet_link_value} => $_->{facet_count} } @{ $koha_facets->[0]->{facets} };
+        is_deeply( \%count_by_value, { CPL => 3, MPL => 2 }, "The buckets are read as for any facet" );
+        is(
+            $koha_facets->[0]->{type_link_value}, 'homebranch',
+            "The group links through the record field, without the items. prefix"
+        );
+        is(
+            $koha_facets->[0]->{facets}->[0]->{type_link_value}, 'homebranch',
+            "And so does each facet entry"
         );
 
         $schema->storage->txn_rollback;
