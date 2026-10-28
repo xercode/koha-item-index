@@ -29,6 +29,8 @@ use Koha::StockRotationStages;
 use Koha::SMTP::Servers;
 use Koha::Library::Hours;
 use Koha::BackgroundJob::UpdateBiblioItemsGeolocation;
+use Koha::Logger;
+use Try::Tiny qw( catch try );
 
 use base qw(Koha::Object::Mixin::AdditionalFields Koha::Object);
 
@@ -73,8 +75,19 @@ sub store {
         $cache->clear_from_cache('libraries:name');
     }
 
+    # The library is already stored: a failure to enqueue the reindex must not
+    # make the change fail
     if ( $geolocation_changed && C4::Context->preference('SearchEngine') eq 'Elasticsearch' ) {
-        Koha::BackgroundJob::UpdateBiblioItemsGeolocation->new->enqueue( { branchcode => $self->branchcode } );
+        try {
+            Koha::BackgroundJob::UpdateBiblioItemsGeolocation->new->enqueue( { branchcode => $self->branchcode } );
+        } catch {
+            Koha::Logger->get->error(
+                sprintf(
+                    "Unable to reindex the records with items in library %s after a geolocation change: %s",
+                    $self->branchcode, $_
+                )
+            );
+        };
     }
 
     return $self;

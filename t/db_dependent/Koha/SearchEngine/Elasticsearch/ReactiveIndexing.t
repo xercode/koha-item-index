@@ -380,7 +380,7 @@ subtest 'a failure to reindex does not make the hold or transfer change fail (Bu
 };
 
 subtest 'Koha::Library geolocation triggers a batch reindex (Bug XXXXX)' => sub {
-    plan tests => 4;
+    plan tests => 6;
 
     $schema->storage->txn_begin;
     t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
@@ -414,6 +414,18 @@ subtest 'Koha::Library geolocation triggers a batch reindex (Bug XXXXX)' => sub 
     @enqueued = ();
     $library->geolocation('3.0,3.0')->store;
     is( scalar @enqueued, 0, 'no enqueue when SearchEngine is not Elasticsearch' );
+
+    # The library is already stored: a failure to enqueue is logged, and the
+    # change is kept
+    t::lib::Mocks::mock_preference( 'SearchEngine', 'Elasticsearch' );
+    my $logger = t::lib::Mocks::Logger->new;
+    $job_module->mock( 'enqueue', sub { die "Broker down\n"; } );
+    $library->geolocation('4.0,4.0')->store;
+    is( $library->get_from_storage->geolocation, '4.0,4.0', 'the geolocation is changed even if the job fails' );
+    $logger->error_like(
+        qr/^Unable to reindex the records with items in library @{[ $library->branchcode ]} after a geolocation change: Broker down/,
+        'and the failure is logged'
+    );
 
     $schema->storage->txn_rollback;
 };
