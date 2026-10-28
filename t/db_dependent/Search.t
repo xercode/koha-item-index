@@ -1422,7 +1422,7 @@ subtest 'buildQuery() limit on an unknown or empty library group' => sub {
 };
 
 subtest 'buildQuery() limits on the nested items (Bug XXXXX)' => sub {
-    plan tests => 10;
+    plan tests => 11;
 
     require C4::Search;
 
@@ -1433,6 +1433,10 @@ subtest 'buildQuery() limits on the nested items (Bug XXXXX)' => sub {
         C4::Search::buildQuery( [], ['salud'], [], ['items.available:true'], [], 0, 'en' );
     like( $limit,     $availability,                      'items.available:true is the record availability' );
     like( $limit_cgi, qr/&limit=items\.available%3Atrue/, 'and is kept in limit_cgi' );
+
+    ( undef, undef, undef, undef, undef, $limit ) =
+        C4::Search::buildQuery( [], ['salud'], [], ['items.available_for_patron:true'], [], 0, 'en' );
+    like( $limit, $availability, 'items.available_for_patron:true (OPAC) is the record availability too' );
 
     ( undef, undef, undef, undef, undef, $limit ) =
         C4::Search::buildQuery( [], ['salud'], [], [ 'available', 'items.available:true' ], [], 0, 'en' );

@@ -1311,7 +1311,7 @@ sub getIndexes {
 
 # Limits on the nested items of Elasticsearch (Bug XXXXX) that are the record
 # availability with Zebra
-my %ZEBRA_AVAILABILITY_ITEM_LIMITS = map { $_ => 1 } qw( items.available:true );
+my %ZEBRA_AVAILABILITY_ITEM_LIMITS = map { $_ => 1 } qw( items.available:true items.available_for_patron:true );
 
 =head2 buildQuery
 
@@ -1327,9 +1327,9 @@ handle truncation, stemming, field weighting, fuzziness, etc.
 See verbose embedded documentation.
 
 The C<items.*> limits are the limits on the nested items of Elasticsearch
-(Bug XXXXX), which Zebra has no index for. The availability control
-(C<items.available:true>) is the record availability, as the C<available>
-limit. Any other one is ignored with a warning, and described as ignored.
+(Bug XXXXX), which Zebra has no index for. The availability controls
+(C<items.available:true> and, in the OPAC, C<items.available_for_patron:true>)
+are the record availability, as the C<available> limit. Any other one is ignored with a warning, and described as ignored.
 
 
 =cut

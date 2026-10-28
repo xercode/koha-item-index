@@ -34,14 +34,24 @@
                 <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#availability_collapse" id="filter_facets">Availability</a>
                 <div class="facet-collapse collapse show" id="availability_collapse">
                     <ul>
-                        [%# Bug XXXXX: OPAC shows a single, patron-facing availability control (items.available_for_patron), replacing the staff-facing items.available toggle. %]
+                        [%# Bug XXXXX: OPAC shows a single, patron-facing availability control (items.available_for_patron), replacing the staff-facing items.available toggle. Only Elasticsearch indexes it: with Zebra, the record availability as before. %]
                         [% IF ( available ) %]
-                            <li><strong>Showing only records with items available for hold or reference</strong></li
-                            ><li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_availablity | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
-                        [% ELSE %]
+                            [% IF Koha.Preference('SearchEngine') == 'Elasticsearch' %]
+                                <li><strong>Showing only records with items available for hold or reference</strong></li>
+                            [% ELSE %]
+                                <li><strong>Showing only records with available items</strong></li>
+                            [% END %]
+                            <li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_availablity | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
+                        [% ELSIF Koha.Preference('SearchEngine') == 'Elasticsearch' %]
                             <li
                                 ><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.available_for_patron:true"
                                     >Limit to records with items available for hold or reference</a
+                                ></li
+                            >
+                        [% ELSE %]
+                            <li
+                                ><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=available"
+                                    >Limit to records with available items</a
                                 ></li
                             >
                         [% END %]

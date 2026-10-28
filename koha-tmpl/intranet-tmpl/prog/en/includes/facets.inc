@@ -50,27 +50,29 @@
                 </li>
                 <!-- /#availability_facet -->
 
-                [%# Bug XXXXX: patron-facing availability (items.available_for_patron), added alongside the staff availability control above. %]
-                <li id="available_for_patron_facet">
-                    Availability for patrons
-                    <ul>
-                        [% IF ( available_for_patron ) %]
-                            <li>
-                                <strong>Showing only records with items available for hold or reference</strong>
-                            </li>
-                            <li>
-                                <a href="/cgi-bin/koha/catalogue/search.pl?[% query_cgi | $raw %][% limit_cgi_not_available_for_patron | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]">Show all records</a>
-                            </li>
-                        [% ELSE %]
-                            <li>
-                                <a href="/cgi-bin/koha/catalogue/search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.available_for_patron:true"
-                                    >Limit to records with items available for hold or reference</a
-                                >
-                            </li>
-                        [% END # /IF available_for_patron %]
-                    </ul>
-                </li>
-                <!-- /#available_for_patron_facet -->
+                [%# Bug XXXXX: patron-facing availability (items.available_for_patron), added alongside the staff availability control above. Only Elasticsearch indexes it. %]
+                [% IF Koha.Preference('SearchEngine') == 'Elasticsearch' %]
+                    <li id="available_for_patron_facet">
+                        Availability for patrons
+                        <ul>
+                            [% IF ( available_for_patron ) %]
+                                <li>
+                                    <strong>Showing only records with items available for hold or reference</strong>
+                                </li>
+                                <li>
+                                    <a href="/cgi-bin/koha/catalogue/search.pl?[% query_cgi | $raw %][% limit_cgi_not_available_for_patron | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]">Show all records</a>
+                                </li>
+                            [% ELSE %]
+                                <li>
+                                    <a href="/cgi-bin/koha/catalogue/search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.available_for_patron:true"
+                                        >Limit to records with items available for hold or reference</a
+                                    >
+                                </li>
+                            [% END # /IF available_for_patron %]
+                        </ul>
+                    </li>
+                    <!-- /#available_for_patron_facet -->
+                [% END # /IF Elasticsearch %]
 
                 [%# Bug XXXXX: three-way item on-request filter (all / not on request / on request). %]
                 [% SET onrequest_base = "/cgi-bin/koha/catalogue/search.pl?" _ query_cgi _ limit_cgi_not_onrequest %]
