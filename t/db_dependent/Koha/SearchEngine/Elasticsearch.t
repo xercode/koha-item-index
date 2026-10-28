@@ -18,7 +18,7 @@
 use Modern::Perl;
 use Encode;
 
-use Test::More tests => 13;
+use Test::More tests => 14;
 use Test::NoWarnings;
 use Test::Warn;
 use Test::Exception;
@@ -27,6 +27,7 @@ use t::lib::Mocks;
 use t::lib::TestBuilder;
 
 use Test::MockModule;
+use Test::MockObject;
 
 use JSON::PP ();
 use MARC::Record;
@@ -1642,6 +1643,56 @@ subtest '_get_item_documents resolves the item hook plugins once per batch' => s
     $enabled_plugins_cnt = 0;
     $es->_get_item_documents( \@biblionumbers );
     is( $enabled_plugins_cnt, 0, 'no plugin lookup when plugins are disabled' );
+};
+
+subtest 'indexed_items_schema_version() and nested_items_ready() tests (Bug XXXXX)' => sub {
+    plan tests => 9;
+
+    # Not the biblios index, so as not to touch the cached version of the real one
+    my $es = Koha::SearchEngine::Elasticsearch->new( { index => 'items_schema_version_test' } );
+    $es->clear_items_schema_version_cache;
+
+    # Fake the mapping read from Elasticsearch, counting the requests
+    my ( $meta, $requests, $dies ) = ( undef, 0, 0 );
+    my $indices = Test::MockObject->new;
+    $indices->mock(
+        'get_mapping',
+        sub {
+            $requests++;
+            die "No Elasticsearch\n" if $dies;
+            return { real_index_name => { mappings => { properties => {}, ( $meta ? ( _meta => $meta ) : () ) } } };
+        }
+    );
+    my $client = Test::MockObject->new;
+    $client->mock( 'indices', sub { return $indices; } );
+    my $module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch');
+    $module->mock( 'get_elasticsearch', sub { return $client; } );
+
+    is( $es->indexed_items_schema_version, 0, 'an index created before the nested items has no version' );
+    ok( !$es->nested_items_ready, 'so it is not ready for the nested items' );
+
+    $meta = { items_schema_version => $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION };
+    is( $es->indexed_items_schema_version, 0, 'the version is cached' );
+    is( $requests,                         1, 'and Elasticsearch is asked once' );
+
+    $es->clear_items_schema_version_cache;
+    is(
+        $es->indexed_items_schema_version, $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION,
+        'the version of an index created with the nested items is read from the _meta of its mapping'
+    );
+    ok( $es->nested_items_ready, 'so it is ready for the nested items' );
+
+    $es->clear_items_schema_version_cache;
+    $dies = 1;
+    is( $es->indexed_items_schema_version, 0, 'the version is 0 when Elasticsearch cannot be reached' );
+    $dies = 0;
+    is(
+        $es->indexed_items_schema_version, $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION,
+        'and that is not cached'
+    );
+    is( $requests, 4, 'Elasticsearch is asked again' );
+
+    $es->clear_items_schema_version_cache;
 };
 
 subtest 'marc_records_to_documents stores the item fields in items.marc (Bug XXXXX)' => sub {

@@ -88,7 +88,8 @@ Readonly our $AUTHORITIES_INDEX => 'authorities';
 # items_schema_version field of every catalogued record. It tells the documents
 # indexed before a change to the items schema apart, e.g. to fill a new item
 # subfield from items.marc in place, without reindexing. Version 1 introduces
-# items.marc.
+# items.marc. It is also written to the _meta of the index mapping when the
+# index is created (see indexed_items_schema_version).
 Readonly our $ITEMS_SCHEMA_VERSION => 1;
 
 =head1 NAME
@@ -314,6 +315,82 @@ sub get_elasticsearch_mappings {
     }
     $self->sort_fields( \%{ $sort_fields{ $self->index } } );
     return $all_mappings{ $self->index };
+}
+
+=head2 indexed_items_schema_version
+
+    my $version = $self->indexed_items_schema_version;
+
+Returns the version of the nested items schema the index was created with
+(Bug XXXXX), as written to the C<_meta> of its mapping by
+L<Koha::SearchEngine::Elasticsearch::Indexer/create_index>, or 0 if the index has
+none: it was created before the nested items, or does not exist. Only recreating
+the index (C<rebuild_elasticsearch.pl -d>) writes it, so a version means that the
+index has the C<items> mapping and that every record indexed in it has its
+nested items.
+
+The value is cached for a few minutes, and the cache is cleared when the index
+is created or dropped. When Elasticsearch cannot be reached, 0 is returned and
+nothing is cached.
+
+=cut
+
+sub indexed_items_schema_version {
+    my ($self) = @_;
+
+    my $cache   = Koha::Caches->get_instance;
+    my $key     = $self->_items_schema_version_cache_key;
+    my $version = $cache->get_from_cache($key);
+    return $version if defined $version;
+
+    $version = try {
+        my $mappings = $self->get_elasticsearch->indices->get_mapping( index => $self->index_name );
+
+        # Keyed by the real index name, which may differ from an alias
+        my ($index) = values %$mappings;
+        return $index->{mappings}{_meta}{items_schema_version} // 0;
+    } catch {
+        return;
+    };
+    return 0 unless defined $version;
+
+    $cache->set_in_cache( $key, $version, { expiry => 300 } );
+    return $version;
+}
+
+=head2 nested_items_ready
+
+    if ( $self->nested_items_ready ) { ... }
+
+Whether the index was created with the current nested items schema (see
+L</indexed_items_schema_version>), so that the searches can filter and facet on
+the nested items (Bug XXXXX). Until the index is recreated after an upgrade,
+the searches work as they did before the nested items.
+
+=cut
+
+sub nested_items_ready {
+    my ($self) = @_;
+    return $self->indexed_items_schema_version >= $ITEMS_SCHEMA_VERSION;
+}
+
+=head2 clear_items_schema_version_cache
+
+    $self->clear_items_schema_version_cache;
+
+Clears the cached L</indexed_items_schema_version> of the index.
+
+=cut
+
+sub clear_items_schema_version_cache {
+    my ($self) = @_;
+    Koha::Caches->get_instance->clear_from_cache( $self->_items_schema_version_cache_key );
+    return;
+}
+
+sub _items_schema_version_cache_key {
+    my ($self) = @_;
+    return 'elasticsearch_items_schema_version_' . $self->index_name;
 }
 
 =head2 raw_elasticsearch_mappings

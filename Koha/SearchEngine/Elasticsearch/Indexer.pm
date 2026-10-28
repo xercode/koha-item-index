@@ -404,6 +404,7 @@ sub drop_index {
     if ( $self->index_exists ) {
         my $elasticsearch = $self->get_elasticsearch();
         $elasticsearch->indices->delete( index => $self->index_name );
+        $self->clear_items_schema_version_cache;
         $self->set_index_status_recreate_required();
     }
 }
@@ -411,6 +412,11 @@ sub drop_index {
 =head2 create_index
 
 Creates the index (including mappings) on the Elasticsearch server.
+
+When the mappings include the nested items (Bug XXXXX), the version of their
+schema is written to the C<_meta> of the mapping, which tells the searches that
+the index can be searched on them (see
+L<Koha::SearchEngine::Elasticsearch/indexed_items_schema_version>).
 
 =cut
 
@@ -422,7 +428,20 @@ sub create_index {
         index => $self->index_name,
         body  => { settings => $settings }
     );
-    $self->update_mappings();
+    my $status = $self->update_mappings();
+
+    # Record the nested items schema the index is created with (Bug XXXXX), so
+    # that the searches know they can use the nested items. Only here: an index
+    # whose mappings are just updated keeps the documents indexed before.
+    if ( $self->get_elasticsearch_mappings->{properties}{items} ) {
+        $elasticsearch->indices->put_mapping(
+            index => $self->index_name,
+            body  => { _meta => { items_schema_version => $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION } },
+        );
+    }
+    $self->clear_items_schema_version_cache;
+
+    return $status;
 }
 
 =head2 index_exists

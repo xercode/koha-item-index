@@ -217,6 +217,24 @@ sub matched_map {
     return \%by_id;
 }
 
+subtest 'create_index records the nested items schema version (Bug XXXXX)' => sub {
+    plan tests => 3;
+
+    is(
+        $builder->indexed_items_schema_version, $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION,
+        'the index created with the nested items has their schema version in the _meta of its mapping'
+    );
+    ok( $builder->nested_items_ready, 'so the searches use the nested items' );
+
+    # Updating the mappings must not drop it
+    $indexer->update_mappings;
+    $builder->clear_items_schema_version_cache;
+    is(
+        $builder->indexed_items_schema_version, $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION,
+        'updating the mappings keeps it'
+    );
+};
+
 subtest 'inner_hits reports the matching items (Bug XXXXX)' => sub {
     plan tests => 6;
 
