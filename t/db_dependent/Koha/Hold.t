@@ -420,6 +420,11 @@ subtest 'fill() tests' => sub {
             'enqueue',
             sub {
                 my ( $self, $args ) = @_;
+
+                # Bug XXXXX: the base enqueue is also used by the reactive item
+                # reindex (UpdateElasticIndex); this subtest only cares about the
+                # holds queue job.
+                return unless ref($self) eq 'Koha::BackgroundJob::BatchUpdateBiblioHoldsQueue';
                 is_deeply(
                     $args->{job_args}->{biblio_ids},
                     [ $biblio->id ],

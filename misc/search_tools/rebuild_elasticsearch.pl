@@ -220,10 +220,13 @@ if ($index_biblios) {
         $next = sub {
             my $r = shift @biblionumbers;
             return () unless defined $r;
-            return ( $r, Koha::BiblioUtils->get_from_biblionumber( $r, item_data => 1 ) );
+            return ( $r, Koha::BiblioUtils->get_from_biblionumber($r) );
         };
     } else {
-        my $records = Koha::BiblioUtils->get_all_biblios_iterator(%iterator_options);
+
+        # The records are read without their items: the indexing adds the
+        # item fields of the items in the database (Bug XXXXX).
+        my $records = Koha::BiblioUtils->get_all_biblios_iterator( %iterator_options, item_data => 0 );
         $next = sub {
             $records->next();
         }

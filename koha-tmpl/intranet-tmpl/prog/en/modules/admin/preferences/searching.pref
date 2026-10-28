@@ -277,6 +277,14 @@ Searching:
             - <br/>Availability statuses may show incorrectly in search results if a record has more items than the limit set. Statuses will display correctly in the record details.
             - <br/>Leave empty for no limit.
         -
+            - pref: StaffSearchResultsShowOnlyMatchingItems
+              type: boolean
+              default: yes
+              choices:
+                  1: Show
+                  0: "Don't show"
+            - only the items that match the search filters (library, availability, item type, call number…) in staff search results, and recompute the item counts over that subset. Requires Elasticsearch (uses inner_hits). When disabled, all of a record's items are shown.
+        -
             - By default, sort search results in the OPAC by
             - pref: OPACdefaultSortField
               default: relevance

@@ -17,7 +17,7 @@
 
 use Modern::Perl;
 
-use Test::More tests => 15;
+use Test::More tests => 17;
 use Test::NoWarnings;
 use t::lib::Mocks;
 use t::lib::TestBuilder;
@@ -83,7 +83,7 @@ SKIP: {
 
     eval { $builder->get_elasticsearch_params; };
 
-    skip 'Elasticsearch configuration not available', 9
+    skip 'Elasticsearch configuration not available', 12
         if $@;
 
     Koha::SearchEngine::Elasticsearch::Indexer->new( { index => 'mydb' } )->drop_index;
@@ -172,5 +172,85 @@ SKIP: {
 
         $schema->storage->txn_rollback;
 
+    };
+
+    subtest "_convert_facets nested item facets (Bug XXXXX)" => sub {
+        plan tests => 7;
+
+        $schema->storage->txn_begin;
+
+        # homebranch is faceted and lives on the nested items object, so the
+        # aggregation is shaped as: items nested -> item_filter -> terms ->
+        # reverse_nested. The item_filter level applies the active item filters
+        # (Bug XXXXX fork fix), so the buckets live under it.
+        my $es_facets = {
+            homebranch => {
+                doc_count   => 7,
+                item_filter => {
+                    doc_count  => 7,
+                    homebranch => {
+                        buckets => [
+                            { key => 'CPL', doc_count => 5, record_count => { doc_count => 3 } },
+                            { key => 'MPL', doc_count => 2, record_count => { doc_count => 2 } },
+                        ],
+                    },
+                },
+            },
+        };
+
+        my $koha_facets = $searcher->_convert_facets($es_facets);
+        is( scalar @$koha_facets, 1, "One facet group is returned for the nested aggregation" );
+
+        my %count_by_value =
+            map { $_->{facet_link_value} => $_->{facet_count} } @{ $koha_facets->[0]->{facets} };
+        is( scalar keys %count_by_value, 2, "Both nested buckets are converted to facets" );
+        is( $count_by_value{CPL},        3, "CPL count comes from reverse_nested (records), not the item doc_count" );
+        is( $count_by_value{MPL},        2, "MPL count comes from reverse_nested (records)" );
+
+        # Bug XXXXX: item facets link through the nested "items.<field>"
+        # prefix so the limit reaches the same-item nested filter channel.
+        is(
+            $koha_facets->[0]->{type_link_value}, 'items.homebranch',
+            "Group type_link_value is prefixed with items. for an item facet"
+        );
+        unlike(
+            $koha_facets->[0]->{label}, qr/^items\./,
+            "Group label is left untouched (not prefixed with items.)"
+        );
+        is(
+            $koha_facets->[0]->{facets}->[0]->{type_link_value}, 'items.homebranch',
+            "Each facet entry also carries the items. prefixed type_link_value"
+        );
+
+        $schema->storage->txn_rollback;
+    };
+
+    subtest "_convert_facets item facets on an index without the nested items (Bug XXXXX)" => sub {
+        plan tests => 3;
+
+        $schema->storage->txn_begin;
+
+        # Until the index is recreated with the nested items, the item facets
+        # aggregate on the record fields, as the other facets.
+        my $es_facets = {
+            homebranch => {
+                buckets => [ { key => 'CPL', doc_count => 3 }, { key => 'MPL', doc_count => 2 } ],
+            },
+        };
+
+        my $koha_facets = $searcher->_convert_facets($es_facets);
+        my %count_by_value =
+            map { $_->{facet_link_value} => $_->{facet_count} } @{ $koha_facets->[0]->{facets} };
+        is_deeply( \%count_by_value, { CPL => 3, MPL => 2 }, "The buckets are read as for any facet" );
+        is(
+            $koha_facets->[0]->{type_link_value}, 'homebranch',
+            "The group links through the record field, without the items. prefix"
+        );
+        is(
+            $koha_facets->[0]->{facets}->[0]->{type_link_value}, 'homebranch',
+            "And so does each facet entry"
+        );
+
+        $schema->storage->txn_rollback;
     };
 }

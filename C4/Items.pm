@@ -373,6 +373,7 @@ sub ModItemTransfer {
     # will have been preceded by a check of branch transfer limits)
     my $to_library = Koha::Libraries->find($tobranch);
     my $transfer;
+    my $transit_reset;
     try {
         $transfer = $item->request_transfer(
             {
@@ -398,14 +399,16 @@ sub ModItemTransfer {
                 );
 
                 # Ensure transit is reset
+                $transit_reset = 1 if $found_transfer->datesent;
                 $found_transfer->datesent(undef)->store;
             } else {
                 $transfer = $item->request_transfer(
                     {
-                        to            => $to_library,
-                        reason        => $trigger,
-                        ignore_limits => 1,
-                        replace       => $trigger
+                        to                => $to_library,
+                        reason            => $trigger,
+                        ignore_limits     => 1,
+                        replace           => $trigger,
+                        skip_record_index => $params->{skip_record_index},
                     }
                 );
             }
@@ -423,6 +426,18 @@ sub ModItemTransfer {
             }
         );
         $transfer->transit( { skip_record_index => $params->{skip_record_index} } );
+    } elsif ( $transit_reset && !$params->{skip_record_index} ) {
+
+        # The item is no longer in transit and no ->transit will reindex it.
+        # The transfer is already stored: a failure to reindex must not make
+        # it fail.
+        try {
+            my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+            $indexer->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+        } catch {
+            Koha::Logger->get->error(
+                sprintf( "Unable to reindex biblio %s after resetting a transfer: %s", $item->biblionumber, $_ ) );
+        };
     }
 
     return $transfer;

@@ -43,5 +43,11 @@ index:
         replacement: ''
 index.mapping.total_fields.limit: 10000
 index.max_result_window: 1000000
+# Bug XXXXX: cap of nested items returned via inner_hits (default 100).
+# Raised for serials, whose records can hold well over 100 issues, so the
+# "show only matching items" feature can report the full matching set. Distinct
+# from max_result_window (top-level hits). Dynamic setting; on an already-nested
+# index it can be applied with PUT /biblios/_settings without reindexing.
+index.max_inner_result_window: 50000
 index.number_of_replicas: 1
 index.number_of_shards: 5

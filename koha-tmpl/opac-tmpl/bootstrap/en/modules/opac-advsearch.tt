@@ -266,7 +266,12 @@
                                 <fieldset>
                                     <legend>Availability: </legend>
                                     <div style="margin-top:.4em">
-                                        <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="available" /> Only items currently available for loan or reference</label>
+                                        [%# Bug XXXXX: only Elasticsearch indexes the patron-facing availability %]
+                                        [% IF Koha.Preference('SearchEngine') == 'Elasticsearch' %]
+                                            <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="items.available_for_patron:true" /> Only items available for hold or reference</label>
+                                        [% ELSE %]
+                                            <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="available" /> Only items currently available for loan or reference</label>
+                                        [% END %]
                                     </div>
                                 </fieldset>
                             </div>
@@ -308,7 +313,12 @@
                                         [% END %]
                                     [% END %]
                                     <div style="margin-top:.4em">
-                                        <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="available" /> Only items currently available for loan or reference</label>
+                                        [%# Bug XXXXX: only Elasticsearch indexes the patron-facing availability %]
+                                        [% IF Koha.Preference('SearchEngine') == 'Elasticsearch' %]
+                                            <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="items.available_for_patron:true" /> Only items available for hold or reference</label>
+                                        [% ELSE %]
+                                            <label for="available-items"><input type="checkbox" id="available-items" name="limit" value="available" /> Only items currently available for loan or reference</label>
+                                        [% END %]
                                     </div>
                                 </fieldset>
                             </div>

@@ -33,6 +33,13 @@ use Koha::AuthorisedValueCategories;
 use C4::Heading;
 use C4::AuthoritiesMarc qw( GuessAuthTypeCode );
 use C4::Biblio;
+use Koha::Biblios;
+use Koha::Biblioitems;
+use Koha::Items;
+use Koha::Item::Transfers;
+use Koha::Holds;
+use Koha::Libraries;
+use Koha::Logger;
 
 use Carp  qw( carp croak );
 use Clone qw( clone );
@@ -62,7 +69,9 @@ use JSON::PP  ();
 use YAML::XS;
 
 use List::Util qw( sum0 );
+use MARC::Field;
 use MARC::File::XML;
+use MARC::Record;
 use MIME::Base64 qw( encode_base64 );
 use Encode       qw( encode );
 use Business::ISBN;
@@ -74,6 +83,14 @@ __PACKAGE__->mk_accessors(qw( sort_fields ));
 # Constants to refer to the standard index names
 Readonly our $BIBLIOS_INDEX     => 'biblios';
 Readonly our $AUTHORITIES_INDEX => 'authorities';
+
+# Version of the nested items schema (Bug XXXXX), written to the
+# items_schema_version field of every catalogued record. It tells the documents
+# indexed before a change to the items schema apart, e.g. to fill a new item
+# subfield from items.marc in place, without reindexing. Version 1 introduces
+# items.marc. It is also written to the _meta of the index mapping when the
+# index is created (see indexed_items_schema_version).
+Readonly our $ITEMS_SCHEMA_VERSION => 1;
 
 =head1 NAME
 
@@ -274,6 +291,18 @@ sub get_elasticsearch_mappings {
             $mappings->{properties}{'subject-heading-thesaurus'} = _get_elasticsearch_field_config( 'search', 'text' );
         }
 
+        # Nested item object (Bug XXXXX). The `items` field is a `nested` object
+        # whose values are computed from the database at index time, so it is not
+        # represented in the search_field / search_marc_map tables. Inject its
+        # mapping directly from the dedicated 'item' section of field_config.yaml.
+        if ( $self->index eq $BIBLIOS_INDEX ) {
+            $mappings->{properties}{items} = clone( _get_elasticsearch_field_config( 'item', '' ) );
+
+            # Mapped explicitly so that range queries on the version (see
+            # $ITEMS_SCHEMA_VERSION) do not depend on dynamic mapping.
+            $mappings->{properties}{items_schema_version} = { type => 'integer' };
+        }
+
         # Disable date and numeric detection to prevent Elasticsearch from
         # auto-detecting field types in marc_data_array. Without this, a
         # subfield value that looks like a date (e.g. "2024-01-15") causes
@@ -286,6 +315,82 @@ sub get_elasticsearch_mappings {
     }
     $self->sort_fields( \%{ $sort_fields{ $self->index } } );
     return $all_mappings{ $self->index };
+}
+
+=head2 indexed_items_schema_version
+
+    my $version = $self->indexed_items_schema_version;
+
+Returns the version of the nested items schema the index was created with
+(Bug XXXXX), as written to the C<_meta> of its mapping by
+L<Koha::SearchEngine::Elasticsearch::Indexer/create_index>, or 0 if the index has
+none: it was created before the nested items, or does not exist. Only recreating
+the index (C<rebuild_elasticsearch.pl -d>) writes it, so a version means that the
+index has the C<items> mapping and that every record indexed in it has its
+nested items.
+
+The value is cached for a few minutes, and the cache is cleared when the index
+is created or dropped. When Elasticsearch cannot be reached, 0 is returned and
+nothing is cached.
+
+=cut
+
+sub indexed_items_schema_version {
+    my ($self) = @_;
+
+    my $cache   = Koha::Caches->get_instance;
+    my $key     = $self->_items_schema_version_cache_key;
+    my $version = $cache->get_from_cache($key);
+    return $version if defined $version;
+
+    $version = try {
+        my $mappings = $self->get_elasticsearch->indices->get_mapping( index => $self->index_name );
+
+        # Keyed by the real index name, which may differ from an alias
+        my ($index) = values %$mappings;
+        return $index->{mappings}{_meta}{items_schema_version} // 0;
+    } catch {
+        return;
+    };
+    return 0 unless defined $version;
+
+    $cache->set_in_cache( $key, $version, { expiry => 300 } );
+    return $version;
+}
+
+=head2 nested_items_ready
+
+    if ( $self->nested_items_ready ) { ... }
+
+Whether the index was created with the current nested items schema (see
+L</indexed_items_schema_version>), so that the searches can filter and facet on
+the nested items (Bug XXXXX). Until the index is recreated after an upgrade,
+the searches work as they did before the nested items.
+
+=cut
+
+sub nested_items_ready {
+    my ($self) = @_;
+    return $self->indexed_items_schema_version >= $ITEMS_SCHEMA_VERSION;
+}
+
+=head2 clear_items_schema_version_cache
+
+    $self->clear_items_schema_version_cache;
+
+Clears the cached L</indexed_items_schema_version> of the index.
+
+=cut
+
+sub clear_items_schema_version_cache {
+    my ($self) = @_;
+    Koha::Caches->get_instance->clear_from_cache( $self->_items_schema_version_cache_key );
+    return;
+}
+
+sub _items_schema_version_cache_key {
+    my ($self) = @_;
+    return 'elasticsearch_items_schema_version_' . $self->index_name;
 }
 
 =head2 raw_elasticsearch_mappings
@@ -644,6 +749,15 @@ Using mappings stored in database convert C<$marc_records> to Elasticsearch docu
 Returns array of hash references, representing Elasticsearch documents,
 acceptable as body payload in C<Search::Elasticsearch> requests.
 
+For the biblios index, a record in the catalogue is indexed with the item fields
+of its items in the database, whatever item fields it is passed with (Bug XXXXX):
+the mappings and the C<elasticsearch_to_document> plugin hook get the record with
+them, but the stored MARC (C<marc_data>, C<marc_data_array>) leaves them out.
+Each item keeps its own field in C<items.marc> instead, and
+C<Koha::SearchEngine::Elasticsearch::Search-E<gt>decode_record_from_result> adds
+them back. So the records do not need their items embedded. A record that is not
+in the catalogue is indexed as it is passed.
+
 =over 4
 
 =item C<$marc_documents>
@@ -670,8 +784,50 @@ sub marc_records_to_documents {
         %auth_match_headings = map { $_->authtypecode => $_->auth_tag_to_report } @auth_types;
     }
 
-    foreach my $record ( @{$records} ) {
+    # Build the nested item documents (Bug XXXXX) for the whole batch up front,
+    # so transit/hold status and library geolocation are resolved with grouped
+    # queries instead of one lookup per item inside the loop below.
+    my $item_documents = {};
+    my ( $biblionumber_tag, $biblionumber_code, $item_tag );
+    if ( $self->index eq $BIBLIOS_INDEX ) {
+        ( $biblionumber_tag, $biblionumber_code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
+        ($item_tag) = C4::Biblio::GetMarcFromKohaField('items.itemnumber');
+        my @biblionumbers;
+        foreach my $record ( @{$records} ) {
+            my $field = $record->field($biblionumber_tag);
+            next unless $field;
+            push @biblionumbers, $field->is_control_field ? $field->data : $field->subfield($biblionumber_code);
+        }
+        $item_documents = $self->_get_item_documents( \@biblionumbers );
+    }
+
+    foreach my $source_record ( @{$records} ) {
+        my $record          = $source_record;
         my $record_document = {};
+
+        # A record in the catalogue is indexed with the item fields of its
+        # items in the database (Bug XXXXX), whatever item fields it comes
+        # with: the mappings and the elasticsearch_to_document hook get them,
+        # but the stored MARC leaves them out, as each item keeps its own in
+        # items.marc. A record that is not in the catalogue has no items in the
+        # database, and is indexed as it comes.
+        my ( $biblionumber_field, $biblionumber, $catalogued );
+        if ( $self->index eq $BIBLIOS_INDEX ) {
+            $biblionumber_field = $record->field($biblionumber_tag);
+            if ($biblionumber_field) {
+                $biblionumber =
+                      $biblionumber_field->is_control_field
+                    ? $biblionumber_field->data
+                    : $biblionumber_field->subfield($biblionumber_code);
+                $catalogued = defined $biblionumber && exists $item_documents->{$biblionumber};
+            }
+        }
+        if ($catalogued) {
+            $record = MARC::Record->new;
+            $record->leader( $source_record->leader );
+            $record->append_fields( grep { $_->tag ne $item_tag } $source_record->fields );
+            $self->_append_item_fields( $record, $item_documents->{$biblionumber} );
+        }
 
         if ( $self->index eq 'authorities' ) {
             my $authtypecode = GuessAuthTypeCode($record);
@@ -838,8 +994,14 @@ sub marc_records_to_documents {
 
         # TODO: Perhaps should check if $records_document non empty, but really should never be the case
         $record->encoding('UTF-8');
+        my $stored_record = $record;
+        if ($catalogued) {
+            $stored_record = MARC::Record->new;
+            $stored_record->leader( $record->leader );
+            $stored_record->append_fields( grep { $_->tag ne $item_tag } $record->fields );
+        }
         if ($use_array) {
-            $record_document->{'marc_data_array'} = $self->_marc_to_array($record);
+            $record_document->{'marc_data_array'} = $self->_marc_to_array($stored_record);
             $record_document->{'marc_format'}     = 'ARRAY';
         } else {
             my @warnings;
@@ -848,7 +1010,7 @@ sub marc_records_to_documents {
                 local $SIG{__WARN__} = sub {
                     push @warnings, $_[0];
                 };
-                my $usmarc_record = $record->as_usmarc();
+                my $usmarc_record = $stored_record->as_usmarc();
 
                 #NOTE: Try to round-trip the record to prove it will work for retrieval after searching
                 my $decoded_usmarc_record;
@@ -867,12 +1029,12 @@ sub marc_records_to_documents {
             if (@warnings) {
 
                 # Suppress warnings if record length exceeded
-                unless ( substr( $record->leader(), 0, 5 ) eq '99999' ) {
+                unless ( substr( $stored_record->leader(), 0, 5 ) eq '99999' ) {
                     foreach my $warning (@warnings) {
                         carp $warning;
                     }
                 }
-                $record_document->{'marc_data'}   = $record->as_xml_record($marcflavour);
+                $record_document->{'marc_data'}   = $stored_record->as_xml_record($marcflavour);
                 $record_document->{'marc_format'} = 'MARCXML';
             } else {
                 $record_document->{'marc_format'} = 'base64ISO2709';
@@ -889,22 +1051,26 @@ sub marc_records_to_documents {
                 map { $_ eq 'z' ? () : $_ } @{ $record_document->{'subject-heading-thesaurus'} };
         }
 
-        # Check if there is at least one available item
-        if ( $self->index eq $BIBLIOS_INDEX ) {
-            my ( $tag, $code ) = C4::Biblio::GetMarcFromKohaField('biblio.biblionumber');
-            my $field = $record->field($tag);
-            if ($field) {
-                my $biblionumber = $field->is_control_field ? $field->data : $field->subfield($code);
-                my $avail_items  = Koha::Items->search(
-                    {
-                        biblionumber => $biblionumber,
-                        onloan       => undef,
-                        itemlost     => 0,
-                    }
-                )->count;
+        # Check if there is at least one available item, and attach the nested
+        # item documents (Bug XXXXX) built up front for this batch.
+        if ($biblionumber_field) {
+            my $avail_items = Koha::Items->search(
+                {
+                    biblionumber => $biblionumber,
+                    onloan       => undef,
+                    itemlost     => 0,
+                }
+            )->count;
 
-                $record_document->{available} = $avail_items ? \1 : \0;
-            }
+            $record_document->{available} = $avail_items ? \1 : \0;
+            $record_document->{items}     = $item_documents->{$biblionumber} // [];
+
+            # Record-level item count (Bug XXXXX). Structural (patron
+            # independent): lets a query tell "record with no items" apart
+            # from "record whose items are all filtered out".
+            $record_document->{items_count} = scalar @{ $record_document->{items} };
+
+            $record_document->{items_schema_version} = $ITEMS_SCHEMA_VERSION if $catalogued;
         }
 
         Koha::Plugins->call(
@@ -919,6 +1085,452 @@ sub marc_records_to_documents {
         push @record_documents, $record_document;
     }
     return \@record_documents;
+}
+
+=head2 _get_item_documents
+
+    my $items_by_biblio = $self->_get_item_documents(\@biblionumbers);
+
+Builds the C<items> nested objects (Bug XXXXX) for a batch of biblionumbers and
+returns a hashref mapping each biblionumber to an arrayref of item documents,
+sorted by C<itemnumber>. Every biblionumber of a record in the catalogue has an
+entry, empty if the record has no items, so a missing entry means that the
+record is not in the catalogue.
+
+Each item document carries the item's MARC field in C<marc> (see
+L</_item_field_to_marc>), built by C<Koha::Item-E<gt>as_marc_field> as when the
+items are embedded in the record, with the framework resolved once per record.
+
+Item-level state that does not live in the C<items> table (transit and hold
+status) and the libraries' geolocation are resolved with grouped queries over
+the whole batch, to avoid N+1 lookups inside the indexing loop.
+
+Some fields are computed from settings that are not item data: the
+C<OpacHiddenItems> system preference (C<hidden_in_opac_by_preferences>), the
+C<AllowHoldsOnDamagedItems> system preference and the C<item_hidden_in_opac> and
+C<item_available_for_patron> plugin hooks (C<hidden_in_opac_custom>,
+C<available_for_patron>). They are evaluated when a record is indexed, and nothing
+reindexes the records when those settings change: whoever changes them (the
+administrator changing a preference, the developer or administrator of the plugin
+when it is installed, enabled, disabled or reconfigured, or when the data its hooks
+depend on changes) is responsible for reindexing the affected records, e.g. with
+C<misc/search_tools/rebuild_elasticsearch.pl>.
+
+=cut
+
+sub _get_item_documents {
+    my ( $self, $biblionumbers ) = @_;
+
+    my %items_by_biblio;
+    return \%items_by_biblio unless @{$biblionumbers};
+
+    # The framework of each record, needed to build the item MARC fields. It
+    # also tells which records are in the catalogue.
+    my %frameworkcode_by_biblio =
+        map { $_->biblionumber => $_->frameworkcode }
+        Koha::Biblios->search( { biblionumber => { -in => $biblionumbers } } )->as_list;
+    $items_by_biblio{$_} = [] for keys %frameworkcode_by_biblio;
+
+    my @items = Koha::Items->search(
+        { biblionumber => { -in  => $biblionumbers } },
+        { order_by     => { -asc => 'itemnumber' } }
+    )->as_list;
+    my @itemnumbers = map { $_->itemnumber } @items;
+    return \%items_by_biblio unless @items;
+
+    # in_transit: a transfer that has been sent but neither arrived nor
+    # cancelled (mirrors Koha::Item::Transfer->in_transit).
+    my %intransit;
+    my $transfers = Koha::Item::Transfers->search(
+        {
+            itemnumber    => { -in  => \@itemnumbers },
+            datesent      => { '!=' => undef },
+            datearrived   => undef,
+            datecancelled => undef,
+        }
+    );
+    $intransit{ $_->itemnumber } = 1 for $transfers->as_list;
+
+    # onrequest: any active (not cancelled, not suspended) hold on the item.
+    # onhold: such a hold that is also waiting ('W') or in transit ('T').
+    # blocking_hold: such a hold that is found ('W'/'T'/'P'), i.e. it makes the
+    # item unreachable to a patron (feeds available_for_patron, Bug XXXXX).
+    my ( %onhold, %onrequest, %blocking_hold );
+    my $holds = Koha::Holds->search(
+        {
+            itemnumber       => { -in => \@itemnumbers },
+            cancellationdate => undef,
+            suspend          => 0,
+        }
+    );
+    for my $hold ( $holds->as_list ) {
+        my $itemnumber = $hold->itemnumber;
+        $onrequest{$itemnumber} = 1;
+        my $found = $hold->found;
+        $onhold{$itemnumber}        = 1 if defined $found && ( $found eq 'W' || $found eq 'T' );
+        $blocking_hold{$itemnumber} = 1 if $hold->is_found;    # W/T/P (canonical Koha method)
+    }
+
+    # branches is a small table: load branchcode => geolocation once and resolve
+    # in memory rather than querying per item.
+    my %geolocation_by_branch =
+        map { $_->branchcode => $_->geolocation }
+        grep { defined $_->geolocation && $_->geolocation ne '' } Koha::Libraries->search->as_list;
+
+    # OpacHiddenItems rules, evaluated once for the whole batch.
+    my $hidden_rules = C4::Context->yaml_preference('OpacHiddenItems') // {};
+
+    # The plugins implementing the item hooks, resolved once for the whole
+    # batch: looking them up for every item was most of the cost of building
+    # the item documents.
+    my ( $hidden_in_opac_plugins, $available_for_patron_plugins ) =
+        $self->_item_hook_plugins( 'item_hidden_in_opac', 'item_available_for_patron' );
+
+    # Index the effective item type (Koha::Item->effective_itemtype): the item
+    # type of the record unless item-level_itypes is on and the item has its
+    # own. The record item types are loaded once for the whole batch.
+    my $item_level_itypes = C4::Context->preference('item-level_itypes');
+    my %itemtype_by_biblioitem =
+        map { $_->biblioitemnumber => $_->itemtype }
+        Koha::Biblioitems->search( { biblionumber => { -in => $biblionumbers } } )->as_list;
+
+    for my $item (@items) {
+        my $itemnumber = $item->itemnumber;
+        my $document   = {
+            itemnumber    => $itemnumber + 0,
+            homebranch    => $item->homebranch,
+            holdingbranch => $item->holdingbranch,
+            itype         => ( $item_level_itypes && $item->itype )
+            ? $item->itype
+            : $itemtype_by_biblioitem{ $item->biblioitemnumber },
+            location             => $item->location,
+            permanent_location   => $item->permanent_location,
+            ccode                => $item->ccode,
+            callnumber           => $item->itemcallnumber,
+            cn_sort              => $item->cn_sort,
+            barcode              => $item->barcode,
+            enumchron            => $item->enumchron,
+            restricted           => $item->restricted,
+            notforloan           => $item->notforloan,
+            onloan               => $item->onloan,
+            damaged              => $item->damaged,
+            lost                 => $item->itemlost,
+            withdrawn            => $item->withdrawn,
+            intransit            => $intransit{$itemnumber}                ? \1 : \0,
+            onhold               => $onhold{$itemnumber}                   ? \1 : \0,
+            onrequest            => $onrequest{$itemnumber}                ? \1 : \0,
+            available            => ( !$item->onloan && !$item->itemlost ) ? \1 : \0,
+            available_for_patron => $self->_item_available_for_patron(
+                $item, $intransit{$itemnumber}, $blocking_hold{$itemnumber},
+                $available_for_patron_plugins
+            ) ? \1 : \0,
+            hidden_in_opac_custom => $self->_item_hidden_in_opac_custom( $item, $hidden_in_opac_plugins ) ? \1 : \0,
+            hidden_in_opac_by_preferences => $item->hidden_in_opac( { rules => $hidden_rules, skip_lost_check => 1 } )
+            ? \1
+            : \0,
+        };
+
+        # date_of_acquisition (search field) lives on items.dateaccessioned. The
+        # column is a DATE (YYYY-MM-DD), already ES-parseable; omit the subfield
+        # when empty so the `date` mapping does not reject a blank value.
+        my $dateaccessioned = $item->dateaccessioned;
+        $document->{dateaccessioned} = $dateaccessioned
+            if defined $dateaccessioned && $dateaccessioned ne '';
+
+        # geo_point accepts the native "lat,lon" string. Omit the subfield when
+        # the library has no geolocation so ES does not reject an empty value.
+        my $home_geolocation    = $geolocation_by_branch{ $item->homebranch };
+        my $holding_geolocation = $geolocation_by_branch{ $item->holdingbranch };
+        $document->{home_geolocation}    = $home_geolocation    if defined $home_geolocation;
+        $document->{holding_geolocation} = $holding_geolocation if defined $holding_geolocation;
+
+        # The item's MARC field, built as when the items are embedded in the
+        # record (Koha::Filter::MARC::EmbedItems), so that the record rebuilt
+        # from the index is the same.
+        my $marc_field = $item->as_marc_field( { frameworkcode => $frameworkcode_by_biblio{ $item->biblionumber } } );
+        $document->{marc} = $self->_item_field_to_marc($marc_field) if $marc_field;
+
+        push @{ $items_by_biblio{ $item->biblionumber } }, $document;
+    }
+
+    return \%items_by_biblio;
+}
+
+=head2 _item_field_to_marc
+
+    my $marc = $self->_item_field_to_marc($field);
+
+Converts an item C<MARC::Field> into the string stored in C<items.marc>
+(Bug XXXXX): the field data as in ISO2709, without the field terminator. That is,
+the two indicators followed by every subfield, each one made of the subfield
+delimiter (C<0x1F>), the code and the value:
+
+    "  \x1faCPL\x1fbCPL\x1fp39000001"
+
+The tag is not stored: it is the item tag of the MARC flavour. A single string
+per item is smaller than a structure, and much faster to parse when a search
+result is decoded.
+
+A value cannot contain the subfield delimiter in a valid MARC record, but an item
+column could. It would split the subfield when the field is read back, so it is
+removed, with a warning.
+
+=cut
+
+sub _item_field_to_marc {
+    my ( $self, $field ) = @_;
+
+    my $marc = $field->indicator(1) . $field->indicator(2);
+    for my $subfield ( $field->subfields ) {
+        my ( $code, $value ) = @{$subfield};
+        if ( $value =~ tr/\x1f//d ) {
+            carp sprintf(
+                'Removed the subfield delimiter (0x1F) from the value of subfield %s of item field %s',
+                $code, $field->tag
+            );
+        }
+        $marc .= "\x1f$code$value";
+    }
+
+    return $marc;
+}
+
+=head2 _item_marc_to_field
+
+    my $field = $self->_item_marc_to_field( $tag, $marc );
+
+Converts the C<items.marc> string of an item back into a C<MARC::Field> with the
+given tag. The reverse of L</_item_field_to_marc>.
+
+=cut
+
+sub _item_marc_to_field {
+    my ( $self, $tag, $marc ) = @_;
+
+    my ( $indicators, @subfields ) = split /\x1f/, $marc;
+
+    return MARC::Field->new(
+        $tag,
+        substr( $indicators, 0, 1 ),
+        substr( $indicators, 1, 1 ),
+        map { ( substr( $_, 0, 1 ), substr( $_, 1 ) ) } @subfields
+    );
+}
+
+=head2 _append_item_fields
+
+    $self->_append_item_fields( $record, $item_documents );
+
+Appends to C<$record> the item fields stored in the C<marc> subfield of the
+given item documents (Bug XXXXX), in C<itemnumber> order, which is the order in
+which they are embedded in the record. Item documents without C<marc>, such as
+the ones indexed before it existed, are skipped.
+
+=cut
+
+sub _append_item_fields {
+    my ( $self, $record, $item_documents ) = @_;
+
+    my @marcs =
+        map  { $_->{marc} }
+        sort { $a->{itemnumber} <=> $b->{itemnumber} }
+        grep { $_->{marc} } @{ $item_documents // [] };
+    return unless @marcs;
+
+    my ($item_tag) = C4::Biblio::GetMarcFromKohaField('items.itemnumber');
+    $record->append_fields( map { $self->_item_marc_to_field( $item_tag, $_ ) } @marcs );
+
+    return;
+}
+
+=head2 _item_hook_plugins
+
+    my ( $hidden_in_opac_plugins, $available_for_patron_plugins ) =
+        $self->_item_hook_plugins( 'item_hidden_in_opac', 'item_available_for_patron' );
+
+Returns, for each hook name passed, an arrayref with the enabled plugins that
+implement it, in the order of C<Koha::Plugins-E<gt>get_enabled_plugins>. The
+enabled plugins are looked up once, whatever the number of hooks. The arrayrefs
+are empty when plugins are disabled.
+
+=cut
+
+sub _item_hook_plugins {
+    my ( $self, @hooks ) = @_;
+
+    my @plugins =
+        C4::Context->config('enable_plugins') ? Koha::Plugins->get_enabled_plugins( { verbose => 0 } ) : ();
+
+    return map {
+        my $hook = $_;
+        [ grep { $_->can($hook) } @plugins ]
+    } @hooks;
+}
+
+=head2 _item_hidden_in_opac_custom
+
+    my $bool = $self->_item_hidden_in_opac_custom( $item, $plugins );
+
+Custom OPAC item-hiding rules (Bug XXXXX). Feeds the C<item.hidden_in_opac_custom>
+field. Delegates to the C<item_hidden_in_opac> plugin hook, passing the item, and
+is B<restrictive>: it stops and hides the item as soon as the first plugin returns
+a true value, without calling the remaining plugins.
+
+C<$plugins> is an optional arrayref with the plugins implementing the hook, as
+returned by L</_item_hook_plugins>, so that a batch resolves them only once (see
+L</_get_item_documents>). When it is not passed, they are looked up here.
+
+Returns 0 (not hidden) when no plugin vetoes the item, when no plugin implements
+the hook, or when plugins are disabled. This hiding is unconditional (it is not
+lifted by C<OpacHiddenItemsExceptions>).
+
+A plugin that dies fails closed: the item is hidden, without calling the
+remaining plugins, and the error is logged (see L</_log_item_hook_error>).
+
+The result is stored in the index when the record is indexed: a plugin whose
+answer changes (new rules, configuration, data) must have the affected records
+reindexed (see L</_get_item_documents>).
+
+=cut
+
+sub _item_hidden_in_opac_custom {
+    my ( $self, $item, $plugins ) = @_;
+
+    ($plugins) = $self->_item_hook_plugins('item_hidden_in_opac') unless $plugins;
+
+    for my $plugin ( @{$plugins} ) {
+        my $hidden;
+        unless ( eval { $hidden = $plugin->item_hidden_in_opac( { item => $item } ); 1 } ) {
+            $self->_log_item_hook_error( $plugin, 'item_hidden_in_opac', $@, 'the item is hidden in the OPAC' );
+            return 1;
+        }
+        return 1 if $hidden;
+    }
+
+    return 0;
+}
+
+=head2 _item_available_for_patron
+
+    my $bool = $self->_item_available_for_patron( $item, $intransit, $blocked_by_hold, $plugins );
+
+Patron-facing availability (Bug XXXXX). Feeds the C<item.available_for_patron>
+field: whether a patron could request the loan or consultation of this item. This
+is B<distinct> from C<item.available> (the community, staff-facing flag), which is
+left untouched.
+
+Delegates to the C<item_available_for_patron> plugin hook with B<three-state>
+semantics and priority C<< false > true > default >> (which differs from the
+additive veto of C<_item_hidden_in_opac_custom>). The hook receives the item plus
+the batch-computed C<intransit> and C<blocked_by_hold> flags, so a plugin can weigh
+the same inputs as the default conditions without querying C<branchtransfers> and
+C<reserves> again:
+
+=over 4
+
+=item * the first plugin returning a defined B<false> makes the item unavailable
+and short-circuits (false is final);
+
+=item * if no plugin returns false and at least one returns B<true>, the item is
+available;
+
+=item * if there are no plugins, plugins are disabled, or every plugin abstains
+(returns C<undef>), the default conditions below apply.
+
+=back
+
+A plugin that dies fails closed: the item is not available, without calling the
+remaining plugins, and the error is logged (see L</_log_item_hook_error>).
+
+Default conditions: the item is B<not> available if any of these holds:
+C<itemlost> is non-zero, C<withdrawn> is truthy, C<damaged> is truthy and the
+C<AllowHoldsOnDamagedItems> system preference is off, the item is C<$intransit>,
+or it is C<$blocked_by_hold> (an active hold found in 'W'/'T'/'P').
+
+C<onloan>, C<restricted> and C<notforloan> do B<not> affect the value. C<onloan> is
+excluded on purpose: an item that is checked out can still be reserved by a patron,
+so a loan does not make it unrequestable (C4::Reserves::IsAvailableForItemLevelRequest
+never excludes on-loan items). This is what makes the field diverge from the
+community C<available> flag, which does treat C<onloan> as unavailable.
+
+C<$intransit> and C<$blocked_by_hold> are the batch-computed booleans for this item
+(see L</_get_item_documents>). C<$plugins> is an optional arrayref with the plugins
+implementing the hook, as returned by L</_item_hook_plugins>, so that a batch
+resolves them only once. When it is not passed, they are looked up here.
+
+The result is stored in the index when the record is indexed: a plugin whose
+answer changes (new rules, configuration, data), or a change of
+C<AllowHoldsOnDamagedItems>, requires reindexing the affected records (see
+L</_get_item_documents>).
+
+=cut
+
+sub _item_available_for_patron {
+    my ( $self, $item, $intransit, $blocked_by_hold, $plugins ) = @_;
+
+    ($plugins) = $self->_item_hook_plugins('item_available_for_patron') unless $plugins;
+
+    my $saw_true = 0;
+    for my $plugin ( @{$plugins} ) {
+        my $value;
+        my $ok = eval {
+            $value = $plugin->item_available_for_patron(
+                {
+                    item            => $item,
+                    intransit       => $intransit,
+                    blocked_by_hold => $blocked_by_hold,
+                }
+            );
+            1;
+        };
+        unless ($ok) {
+            $self->_log_item_hook_error(
+                $plugin, 'item_available_for_patron', $@,
+                'the item is not available for patrons'
+            );
+            return 0;
+        }
+        next     unless defined $value;    # abstention
+        return 0 unless $value;            # defined false: not available, short-circuit
+        $saw_true = 1;
+    }
+    return 1 if $saw_true;                 # some true, no false: available
+
+    # Default conditions (no plugin opinion): not available if any of these holds.
+    # `onloan` is deliberately NOT a condition: a checked-out item can still be
+    # placed on hold by a patron (see C4::Reserves::IsAvailableForItemLevelRequest,
+    # which never excludes on-loan items).
+    return 0 if $item->itemlost;     # non-zero
+    return 0 if $item->withdrawn;    # truthy
+    return 0 if $intransit;          # derived from branchtransfers
+    return 0 if $blocked_by_hold;    # active hold found IN ('W','T','P')
+
+    # A damaged item can only be requested if holds on damaged items are allowed
+    # (as C4::Reserves::IsAvailableForItemLevelRequest checks).
+    return 0 if $item->damaged && !C4::Context->preference('AllowHoldsOnDamagedItems');
+
+    return 1;
+}
+
+=head2 _log_item_hook_error
+
+    $self->_log_item_hook_error( $plugin, $hook, $error, $outcome );
+
+Logs, at error level, that C<$plugin> died in the item hook C<$hook> with
+C<$error>, and the C<$outcome> applied to the item instead (Bug XXXXX). The
+plugin name is read within an C<eval>, so that a broken plugin cannot make the
+logging die too; the plugin class is used when it cannot be read.
+
+=cut
+
+sub _log_item_hook_error {
+    my ( $self, $plugin, $hook, $error, $outcome ) = @_;
+
+    my $name = eval { $plugin->get_metadata->{name} } || ref $plugin;
+    chomp $error;
+    Koha::Logger->get->error( sprintf( "Plugin error (%s) in %s, %s: %s", $name, $hook, $outcome, $error ) );
+
+    return;
 }
 
 =head2 _process_data_field_rules($rules, $field, $record_document, $altscript, $exclude_target_fields_regexp)

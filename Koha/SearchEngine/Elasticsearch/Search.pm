@@ -180,17 +180,27 @@ sub search_compat {
     # right place in the array, according to $offset
     my $index = $offset;
     my $hits  = $results->{'hits'};
+
+    # Bug XXXXX: itemnumbers of the nested items that matched the query,
+    # extracted from inner_hits (present only when the query requested them).
+    # Kept in a parallel channel aligned with RECORDS so searchResults can show
+    # only the matching items. undef for a record without inner_hits (no item
+    # filter) or one whose match set was truncated -- both mean "do not filter".
+    my @matched_itemnumbers;
+
     foreach my $es_record ( @{ $hits->{'hits'} } ) {
-        $records[$index] = $self->decode_record_from_result( $es_record->{'_source'} );
-        $scores[ $index++ ] = $es_record->{'_score'};
+        $records[$index]             = $self->decode_record_from_result( $es_record->{'_source'} );
+        $matched_itemnumbers[$index] = $self->matched_itemnumbers($es_record);
+        $scores[ $index++ ]          = $es_record->{'_score'};
     }
 
     # consumers of this expect a name-spaced result, we provide the default
     # configuration.
     my %result;
-    $result{biblioserver}{hits}    = $hits->{'total'};
-    $result{biblioserver}{RECORDS} = \@records;
-    $result{biblioserver}{scores}  = \@scores;
+    $result{biblioserver}{hits}                = $hits->{'total'};
+    $result{biblioserver}{RECORDS}             = \@records;
+    $result{biblioserver}{MATCHED_ITEMNUMBERS} = \@matched_itemnumbers;
+    $result{biblioserver}{scores}              = \@scores;
 
     my $facets = $self->_convert_facets( $results->{aggregations} );
     if ( C4::Context->interface eq 'opac' ) {
@@ -198,6 +208,59 @@ sub search_compat {
         $facets = Koha::SearchEngine::Search->post_filter_opac_facets( { facets => $facets, rules => $rules } );
     }
     return ( undef, \%result, $facets );
+}
+
+=head2 matched_itemnumbers
+
+    my $itemnumbers = $searcher->matched_itemnumbers($es_record);
+
+Given a single Elasticsearch hit, returns the arrayref of itemnumbers of the
+nested items that matched the query, read from its C<inner_hits> (Bug XXXXX).
+Returns:
+
+=over 4
+
+=item * C<undef> when the hit carries no C<items> inner_hits (the query had no
+item filter, or did not request them) -- the caller must not filter.
+
+=item * C<undef> when the match set was truncated (the reported total exceeds
+the number of returned inner hits, i.e. more than C<max_inner_result_window>
+items matched) -- again the caller must not filter, to avoid truncated counters.
+
+=item * an arrayref (possibly empty) of itemnumbers otherwise.
+
+=back
+
+This is the reusable extraction channel: the future biblio detail view
+can feed it a hit from a biblionumber-scoped search with inner_hits to get the
+record's matching items.
+
+=cut
+
+sub matched_itemnumbers {
+    my ( $self, $es_record ) = @_;
+
+    my $inner = $es_record->{inner_hits}{items}{hits};
+    return unless $inner;
+
+    my $hits = $inner->{hits} // [];
+
+    # inner_hits.total may be a scalar (ES pre-7 style) or { value, relation }.
+    my $total = ref $inner->{total} eq 'HASH' ? $inner->{total}{value} : $inner->{total};
+    $total //= scalar @$hits;
+
+    # Truncated match set: do not filter this record.
+    return if $total > scalar @$hits;
+
+    my @itemnumbers;
+    for my $hit (@$hits) {
+
+        # Nested inner-hit _source is relative to the path, so the itemnumber is
+        # normally at the top level; be lenient about a path-prefixed shape too.
+        my $itemnumber = $hit->{_source}{itemnumber} // $hit->{_source}{items}{itemnumber};
+        push @itemnumbers, $itemnumber if defined $itemnumber;
+    }
+    return \@itemnumbers;
 }
 
 =head2 search_auth_compat
@@ -415,6 +478,10 @@ sub extract_biblionumber {
 
 Extracts marc data from Elasticsearch result and decodes to MARC::Record object
 
+The stored MARC of a record leaves its item fields out, and each nested item
+keeps its own in C<items.marc> (Bug XXXXX): they are added back at the end of
+the record, in C<itemnumber> order, as when the items are embedded in it.
+
 =cut
 
 sub decode_record_from_result {
@@ -422,15 +489,21 @@ sub decode_record_from_result {
     # Result is passed in as array, will get flattened
     # and first element will be $result
     my ( $self, $result ) = @_;
+    my $record;
     if ( $result->{marc_format} eq 'base64ISO2709' ) {
-        return MARC::Record->new_from_usmarc( decode_base64( $result->{marc_data} ) );
+        $record = MARC::Record->new_from_usmarc( decode_base64( $result->{marc_data} ) );
     } elsif ( $result->{marc_format} eq 'MARCXML' ) {
-        return MARC::Record->new_from_xml( $result->{marc_data}, 'UTF-8', uc C4::Context->preference('marcflavour') );
+        $record =
+            MARC::Record->new_from_xml( $result->{marc_data}, 'UTF-8', uc C4::Context->preference('marcflavour') );
     } elsif ( $result->{marc_format} eq 'ARRAY' ) {
-        return $self->_array_to_marc( $result->{marc_data_array} );
+        $record = $self->_array_to_marc( $result->{marc_data_array} );
     } else {
         Koha::Exceptions::Elasticsearch->throw("Missing marc_format field in Elasticsearch result");
     }
+
+    $self->_append_item_fields( $record, $result->{items} );
+
+    return $record;
 }
 
 =head2 max_result_window
@@ -534,13 +607,29 @@ sub _convert_facets {
     while ( my ( $type, $data ) = each %$es ) {
         next if !exists( $type_to_label{$type} );
 
+        # Item facets (Bug XXXXX) are nested aggregations: the buckets live two
+        # levels down (nested -> item_filter -> an inner agg named like the facet).
+        # The item_filter level applies the active item filters so the counts stay
+        # coherent with what activating the facet returns (same item; fork fix).
+        # The per-record count comes from the reverse_nested sub-aggregation.
+        # On an index without the nested items, they aggregate on the record
+        # fields instead, as the other facets (see nested_items_ready).
+        my $is_nested = exists $data->{item_filter} ? 1                                    : 0;
+        my $buckets   = $is_nested                  ? $data->{item_filter}{$type}{buckets} : $data->{buckets};
+
+        # Item facets (Bug XXXXX) link through the nested "items.<field>" prefix
+        # so that clicking them emits a "items.homebranch:CPL" limit, which the
+        # query builder routes to the same-item nested filter. The displayed
+        # label still derives from the bare $type via %special / av_cat.
+        my $type_link_value = $is_nested ? "items.$type" : $type;
+
         # We restrict to the most popular $limit !results
         my $limit = C4::Context->preference('FacetMaxCount');
         my $facet = {
             type_id                                   => $type . '_id',
             "type_label_$type_to_label{$type}{label}" => 1,
             label                                     => $type_to_label{$type}{label},
-            type_link_value                           => $type,
+            type_link_value                           => $type_link_value,
             order                                     => $type_to_label{$type}{order},
             av_cat                                    => $type_to_label{$type}{av_cat},
         };
@@ -549,13 +638,13 @@ sub _convert_facets {
             %authorised_values = map { $_->{authorised_value} => $_->{lib} }
                 @{ C4::Koha::GetAuthorisedValues( $type_to_label{$type}{av_cat}, $opac ) };
         }
-        $limit = @{ $data->{buckets} } if ( $limit > @{ $data->{buckets} } );
-        foreach my $term ( @{ $data->{buckets} }[ 0 .. $limit - 1 ] ) {
+        $limit = @{$buckets} if ( $limit > @{$buckets} );
+        foreach my $term ( @{$buckets}[ 0 .. $limit - 1 ] ) {
             my $t = $term->{key};
             next
                 unless length($t)
                 ; # FIXME Currently we cannot search for an empty faceted field i.e. ln:"" to find records missing languages, though ES does count them correctly
-            my $c = $term->{doc_count};
+            my $c = $is_nested ? $term->{record_count}{doc_count} : $term->{doc_count};
             my $label;
             if ( exists( $special{$type} ) ) {
                 $label = $special{$type}->{$t} // $t;
@@ -568,9 +657,9 @@ sub _convert_facets {
                 facet_count       => $c,
                 facet_link_value  => $t,
                 facet_title_value => $t,
-                facet_label_value => $label || q{},    # TODO either truncate this,
-                                                       # or make the template do it like it should anyway
-                type_link_value   => $type,
+                facet_label_value => $label || q{},      # TODO either truncate this,
+                                                         # or make the template do it like it should anyway
+                type_link_value   => $type_link_value,
             };
         }
         if ( C4::Context->preference('FacetOrder') eq 'Alphabetical' ) {

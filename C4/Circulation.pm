@@ -111,6 +111,7 @@ use Koha::Policy::Biblio::AgeRestriction;
 use Koha::Patron::Debarments qw( DelUniqueDebarment AddUniqueDebarment );
 use Koha::Database;
 use Koha::Libraries;
+use Koha::Logger;
 use Koha::Account::Lines;
 use Koha::Holds;
 use Koha::Account::Lines;
@@ -2468,9 +2469,13 @@ sub AddReturn {
     }
 
     # Set NotIssued message if item not checked out
+    my $onloan_cleared;
     if ( !$issue ) {
         $messages->{'NotIssued'} = $barcode;
-        $item->onloan(undef)->store( { skip_record_index => 1, skip_holds_queue => 1 } ) if defined $item->onloan;
+        if ( defined $item->onloan ) {
+            $item->onloan(undef)->store( { skip_record_index => 1, skip_holds_queue => 1 } );
+            $onloan_cleared = 1;
+        }
         $doreturn = 0;
     }
 
@@ -2483,8 +2488,21 @@ sub AddReturn {
         if ( !$issue && C4::Context->preference("RecordLocalUseOnReturn") ) {
             my $localuse_count = $item->localuse || 0;
             $localuse_count++;
-            $item->localuse($localuse_count)->store;
+            $item->localuse($localuse_count)->store( { skip_record_index => $onloan_cleared } );
             $messages->{'LocalUse'} = 1;
+        }
+
+        # The onloan change above skipped indexing, counting on the reindex at
+        # the end of the return, which this early return never reaches. It is
+        # already stored: a failure to reindex must not make the return fail.
+        if ($onloan_cleared) {
+            try {
+                my $indexer = Koha::SearchEngine::Indexer->new( { index => $Koha::SearchEngine::BIBLIOS_INDEX } );
+                $indexer->index_records( $item->biblionumber, "specialUpdate", "biblioserver" );
+            } catch {
+                Koha::Logger->get->error(
+                    sprintf( "Unable to reindex biblio %s after a blocked return: %s", $item->biblionumber, $_ ) );
+            };
         }
 
         return ( 0, $messages, $issue, ( $patron ? $patron->unblessed : {} ) );
@@ -3513,7 +3531,7 @@ sub CanBookBeRenewed {
                         unless CanItemBeReserved(
                         $patron_with_reserve, $other_item, undef,
                         { ignore_hold_counts => 1 }
-                        )->{status} eq 'OK';
+                    )->{status} eq 'OK';
 
                     # NOTE: At checkin we call 'CheckReserves' which checks hold 'policy'
                     # CanItemBeReserved checks 'rules' and 'policies' which means

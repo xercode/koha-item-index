@@ -18,7 +18,7 @@
 use Modern::Perl;
 
 use Test::NoWarnings;
-use Test::More tests => 5;
+use Test::More tests => 6;
 use Test::MockModule;
 use t::lib::Mocks;
 use Encode       qw( encode );
@@ -196,6 +196,59 @@ subtest 'search_auth_compat' => sub {
         undef, 'Valid main heading with ShowHeadingUse'
     );
     is( @$results[0]->{series}, 1, 'Valid main heading with ShowHeadingUse' );
+};
+
+subtest 'matched_itemnumbers (Bug XXXXX)' => sub {
+    plan tests => 6;
+
+    # The helper is index-agnostic; the index name is irrelevant here.
+    my $search = Koha::SearchEngine::Elasticsearch::Search->new( { index => 'biblios' } );
+
+    # Helper to build a fake ES hit with an items inner_hits block.
+    my $hit = sub {
+        my ( $total, @itemnumbers ) = @_;
+        return {
+            inner_hits => {
+                items => {
+                    hits => {
+                        total => { value => $total, relation => 'eq' },
+                        hits  => [ map { { _source => { itemnumber => $_ } } } @itemnumbers ],
+                    }
+                }
+            }
+        };
+    };
+
+    is_deeply(
+        $search->matched_itemnumbers( $hit->( 2, 42, 57 ) ),
+        [ 42, 57 ],
+        'returns the matched itemnumbers from inner_hits'
+    );
+
+    is( $search->matched_itemnumbers( {} ), undef, 'no inner_hits => undef (do not filter)' );
+
+    is_deeply(
+        $search->matched_itemnumbers( $hit->(0) ),
+        [],
+        'an empty match set is an empty arrayref (record has items but none match)'
+    );
+
+    # Truncated: total (3) exceeds the returned hits (2) => undef, do not filter.
+    is( $search->matched_itemnumbers( $hit->( 3, 1, 2 ) ), undef, 'truncated match set => undef (do not filter)' );
+
+    # total reported as a plain scalar (older ES style) is honoured too.
+    my $scalar_total =
+        { inner_hits => { items => { hits => { total => 1, hits => [ { _source => { itemnumber => 9 } } ] } } } };
+    is_deeply( $search->matched_itemnumbers($scalar_total), [9], 'scalar total form is handled' );
+
+    # A path-prefixed _source shape (items.itemnumber) is tolerated.
+    my $prefixed = {
+        inner_hits => {
+            items =>
+                { hits => { total => { value => 1 }, hits => [ { _source => { items => { itemnumber => 5 } } } ] } }
+        }
+    };
+    is_deeply( $search->matched_itemnumbers($prefixed), [5], 'path-prefixed _source shape is handled' );
 };
 
 sub _get_facets {

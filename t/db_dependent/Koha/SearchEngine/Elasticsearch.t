@@ -18,7 +18,7 @@
 use Modern::Perl;
 use Encode;
 
-use Test::More tests => 9;
+use Test::More tests => 14;
 use Test::NoWarnings;
 use Test::Warn;
 use Test::Exception;
@@ -27,14 +27,20 @@ use t::lib::Mocks;
 use t::lib::TestBuilder;
 
 use Test::MockModule;
+use Test::MockObject;
 
 use JSON::PP ();
 use MARC::Record;
+use MIME::Base64 qw( decode_base64 encode_base64 );
 use Try::Tiny;
 use List::Util qw( any );
 
 use C4::AuthoritiesMarc qw( AddAuthority );
 use C4::Biblio;
+use C4::Items;
+
+use Koha::Caches;
+use Koha::Cache::Memory::Lite;
 
 use Koha::SearchEngine::Elasticsearch;
 use Koha::SearchEngine::Elasticsearch::Search;
@@ -1225,7 +1231,7 @@ subtest 'Koha::SearchEngine::Elasticsearch::marc_records_to_documents with Inclu
 };
 
 subtest 'marc_records_to_documents should set the "available" field' => sub {
-    plan tests => 8;
+    plan tests => 11;
 
     t::lib::Mocks::mock_preference( 'marcflavour', 'MARC21' );
     my $dbh = C4::Context->dbh;
@@ -1245,6 +1251,7 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
 
     my $docs = $see->marc_records_to_documents( [$marc_record_1] );
     is_deeply( $docs->[0]->{available}, \0, 'a biblio without items is not available' );
+    is( $docs->[0]->{items_count}, 0, 'items_count is 0 for a biblio without items' );
 
     my $item = $builder->build_sample_item(
         {
@@ -1254,6 +1261,7 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
 
     $docs = $see->marc_records_to_documents( [$marc_record_1] );
     is_deeply( $docs->[0]->{available}, \1, 'a biblio with one item that has no particular status is available' );
+    is( $docs->[0]->{items_count}, 1, 'items_count is 1 for a biblio with one item' );
 
     $item->notforloan(1)->store();
     $docs = $see->marc_records_to_documents( [$marc_record_1] );
@@ -1285,6 +1293,632 @@ subtest 'marc_records_to_documents should set the "available" field' => sub {
         $docs->[0]->{available}, \1,
         'a biblio with at least one item that has no particular status is available'
     );
+    is( $docs->[0]->{items_count}, 2, 'items_count is 2 for a biblio with two items' );
 };
 
+subtest 'marc_records_to_documents should build the nested "items" field' => sub {
+    plan tests => 29;
+
+    t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+    t::lib::Mocks::mock_preference( 'hidelostitems',   0 );
+
+    my $se = Test::MockModule->new('Koha::SearchEngine::Elasticsearch');
+    $se->noop('_foreach_mapping');
+
+    my $see = Koha::SearchEngine::Elasticsearch::Search->new(
+        { index => $Koha::SearchEngine::Elasticsearch::BIBLIOS_INDEX } );
+
+    # sort_fields will call this and use the actual db values unless we call it first
+    $see->get_elasticsearch_mappings();
+
+    my $builder = t::lib::TestBuilder->new;
+    my $biblio  = $builder->build_sample_biblio;
+    my $record  = $biblio->metadata->record;
+
+    # A biblio without items gets an empty nested array
+    my $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}, [], 'a biblio without items gets an empty items array' );
+
+    # A single plain item, in a library without geolocation
+    my $library =
+        $builder->build_object( { class => 'Koha::Libraries', value => { geolocation => undef } } );
+    my $item = $builder->build_sample_item(
+        {
+            biblionumber    => $biblio->biblionumber,
+            homebranch      => $library->branchcode,
+            holdingbranch   => $library->branchcode,
+            barcode         => 'NESTED-0001',
+            dateaccessioned => '2020-01-15',
+        }
+    );
+
+    $docs = $see->marc_records_to_documents( [$record] );
+    my $doc = $docs->[0]->{items}->[0];
+    is( scalar @{ $docs->[0]->{items} }, 1,                    'one item produces one nested item document' );
+    is( $doc->{itemnumber},              $item->itemnumber,    'itemnumber is mapped' );
+    is( $doc->{homebranch},              $library->branchcode, 'homebranch is mapped' );
+    is( $doc->{barcode},                 'NESTED-0001',        'barcode is mapped' );
+    is( $doc->{dateaccessioned},         '2020-01-15',         'dateaccessioned (date_of_acquisition) is mapped' );
+    is_deeply( $doc->{intransit},             \0, 'intransit is false by default' );
+    is_deeply( $doc->{onhold},                \0, 'onhold is false by default' );
+    is_deeply( $doc->{onrequest},             \0, 'onrequest is false by default' );
+    is_deeply( $doc->{available},             \1, 'available is true for a plain item (no loan, not lost)' );
+    is_deeply( $doc->{available_for_patron},  \1, 'available_for_patron is true for a plain reachable item' );
+    is_deeply( $doc->{hidden_in_opac_custom}, \0, 'hidden_in_opac_custom is false with no plugins enabled' );
+    ok( !exists $doc->{home_geolocation}, 'home_geolocation is omitted when the library has no geolocation' );
+
+    # Library geolocation is indexed as the native "lat,lon" string
+    $library->geolocation('40.4168,-3.7038')->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is( $docs->[0]->{items}->[0]->{home_geolocation}, '40.4168,-3.7038', 'home_geolocation is set from the library' );
+    is(
+        $docs->[0]->{items}->[0]->{holding_geolocation}, '40.4168,-3.7038',
+        'holding_geolocation is set from the library'
+    );
+
+    # intransit: an active transfer (sent, not arrived, not cancelled)
+    my $transfer = $builder->build_object(
+        {
+            class => 'Koha::Item::Transfers',
+            value => {
+                itemnumber    => $item->itemnumber,
+                datesent      => '2024-01-01 00:00:00',
+                datearrived   => undef,
+                datecancelled => undef,
+            }
+        }
+    );
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{intransit}, \1, 'intransit is true with an active transfer' );
+
+    $transfer->datearrived('2024-01-02 00:00:00')->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{intransit}, \0, 'intransit is false once the transfer has arrived' );
+
+    # onhold + onrequest: a waiting hold
+    my $hold = $builder->build_object(
+        {
+            class => 'Koha::Holds',
+            value => {
+                biblionumber     => $biblio->biblionumber,
+                itemnumber       => $item->itemnumber,
+                found            => 'W',
+                cancellationdate => undef,
+                suspend          => 0,
+            }
+        }
+    );
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{onhold},    \1, 'onhold is true for a waiting hold' );
+    is_deeply( $docs->[0]->{items}->[0]->{onrequest}, \1, 'onrequest is true for a waiting hold' );
+
+    # onrequest only: a plain (not yet waiting/in transit) hold
+    $hold->set( { found => undef } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{onhold},    \0, 'onhold is false for a hold not waiting/in transit' );
+    is_deeply( $docs->[0]->{items}->[0]->{onrequest}, \1, 'onrequest is true for an active hold' );
+
+    # A suspended hold counts as neither
+    $hold->set( { suspend => 1 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply( $docs->[0]->{items}->[0]->{onrequest}, \0, 'onrequest is false for a suspended hold' );
+    $hold->set( { suspend => 0 } )->store;
+
+    # hidden_in_opac_by_preferences honours OpacHiddenItems
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', "withdrawn: [1]" );
+    $item->set( { withdrawn => 1 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{hidden_in_opac_by_preferences}, \1,
+        'hidden_in_opac_by_preferences is true when the item matches an OpacHiddenItems rule'
+    );
+
+    $item->set( { withdrawn => 0 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{hidden_in_opac_by_preferences}, \0,
+        'hidden_in_opac_by_preferences is false when the item matches no rule'
+    );
+
+    # hidelostitems must NOT influence the indexed value (it is resolved with a
+    # query-time filter on item.lost, not at index time)
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+    t::lib::Mocks::mock_preference( 'hidelostitems',   1 );
+    $item->set( { itemlost => 1 } )->store;
+    $docs = $see->marc_records_to_documents( [$record] );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{hidden_in_opac_by_preferences}, \0,
+        'hidden_in_opac_by_preferences ignores hidelostitems'
+    );
+    is_deeply(
+        $docs->[0]->{items}->[0]->{available}, \0,
+        'available is false for a lost item'
+    );
+    $item->set( { itemlost => 0 } )->store;
+    t::lib::Mocks::mock_preference( 'hidelostitems', 0 );
+
+    # A batch with two items yields two nested documents
+    $builder->build_sample_item( { biblionumber => $biblio->biblionumber } );
+    $docs = $see->marc_records_to_documents( [$record] );
+    is( scalar @{ $docs->[0]->{items} }, 2, 'two items produce two nested item documents' );
+
+    # The effective item type is indexed (Bug XXXXX): the record one unless
+    # item-level_itypes is on and the item has its own.
+    my $record_itype = $builder->build_object( { class => 'Koha::ItemTypes' } )->itemtype;
+    my $item_itype   = $builder->build_object( { class => 'Koha::ItemTypes' } )->itemtype;
+    my $itype_biblio = $builder->build_sample_biblio( { itemtype => $record_itype } );
+    $builder->build_sample_item( { biblionumber => $itype_biblio->biblionumber, itype => $item_itype } );
+    my $itype_record = $itype_biblio->metadata->record;
+
+    t::lib::Mocks::mock_preference( 'item-level_itypes', 1 );
+    $docs = $see->marc_records_to_documents( [$itype_record] );
+    is( $docs->[0]->{items}->[0]->{itype}, $item_itype, 'item-level_itypes on: the item type is indexed' );
+
+    t::lib::Mocks::mock_preference( 'item-level_itypes', 0 );
+    $docs = $see->marc_records_to_documents( [$itype_record] );
+    is( $docs->[0]->{items}->[0]->{itype}, $record_itype, 'item-level_itypes off: the record item type is indexed' );
+    t::lib::Mocks::mock_preference( 'item-level_itypes', 1 );
+};
+
+subtest 'marc_records_to_documents should compute the nested "available_for_patron" field' => sub {
+    plan tests => 10;
+
+    t::lib::Mocks::mock_preference( 'marcflavour',     'MARC21' );
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+
+    my $se = Test::MockModule->new('Koha::SearchEngine::Elasticsearch');
+    $se->noop('_foreach_mapping');
+
+    my $see = Koha::SearchEngine::Elasticsearch::Search->new(
+        { index => $Koha::SearchEngine::Elasticsearch::BIBLIOS_INDEX } );
+    $see->get_elasticsearch_mappings();
+
+    my $builder = t::lib::TestBuilder->new;
+    my $biblio  = $builder->build_sample_biblio;
+    my $record  = $biblio->metadata->record;
+    my $item    = $builder->build_sample_item(
+        {
+            biblionumber => $biblio->biblionumber,
+            onloan       => undef,
+            itemlost     => 0,
+            withdrawn    => 0,
+            damaged      => 0,
+            restricted   => 0,
+            notforloan   => 0,
+        }
+    );
+
+    # Helper: reindex and return the item's available_for_patron flag.
+    my $afp = sub {
+        my $docs = $see->marc_records_to_documents( [$record] );
+        return $docs->[0]->{items}->[0]->{available_for_patron};
+    };
+
+    is_deeply( $afp->(), \1, 'available_for_patron is true for a plain reachable item' );
+
+    # restricted / notforloan must NOT affect the value.
+    $item->set( { restricted => 1, notforloan => 1 } )->store;
+    is_deeply( $afp->(), \1, 'restricted and notforloan do not affect available_for_patron' );
+    $item->set( { restricted => 0, notforloan => 0 } )->store;
+
+    # On loan does NOT block the patron: a checked-out item can still be reserved.
+    $item->set( { onloan => '2024-01-01' } )->store;
+    is_deeply( $afp->(), \1, 'available_for_patron is true for an item on loan (it can be reserved)' );
+    $item->set( { onloan => undef } )->store;
+
+    # A lost item is not requestable.
+    $item->set( { itemlost => 1 } )->store;
+    is_deeply( $afp->(), \0, 'available_for_patron is false for a lost item' );
+    $item->set( { itemlost => 0 } )->store;
+
+    # withdrawn (truthy) blocks the patron.
+    $item->set( { withdrawn => 1 } )->store;
+    is_deeply( $afp->(), \0, 'available_for_patron is false for a withdrawn item' );
+    $item->set( { withdrawn => 0 } )->store;
+
+    # damaged (truthy) blocks the patron unless holds on damaged items are allowed.
+    $item->set( { damaged => 1 } )->store;
+    t::lib::Mocks::mock_preference( 'AllowHoldsOnDamagedItems', 0 );
+    is_deeply(
+        $afp->(), \0,
+        'available_for_patron is false for a damaged item if AllowHoldsOnDamagedItems is off'
+    );
+    t::lib::Mocks::mock_preference( 'AllowHoldsOnDamagedItems', 1 );
+    is_deeply(
+        $afp->(), \1,
+        'available_for_patron is true for a damaged item if AllowHoldsOnDamagedItems is on'
+    );
+    $item->set( { damaged => 0 } )->store;
+
+    # intransit: an active transfer.
+    my $transfer = $builder->build_object(
+        {
+            class => 'Koha::Item::Transfers',
+            value => {
+                itemnumber    => $item->itemnumber,
+                datesent      => '2024-01-01 00:00:00',
+                datearrived   => undef,
+                datecancelled => undef,
+            }
+        }
+    );
+    is_deeply( $afp->(), \0, 'available_for_patron is false for an item in transit' );
+    $transfer->datearrived('2024-01-02 00:00:00')->store;
+
+    # A found hold (W/T/P) blocks the patron; a plain (pending) hold does not.
+    my $hold = $builder->build_object(
+        {
+            class => 'Koha::Holds',
+            value => {
+                biblionumber     => $biblio->biblionumber,
+                itemnumber       => $item->itemnumber,
+                found            => 'P',
+                cancellationdate => undef,
+                suspend          => 0,
+            }
+        }
+    );
+    is_deeply( $afp->(), \0, 'available_for_patron is false for a processing (P) hold' );
+    $hold->set( { found => undef } )->store;
+    is_deeply( $afp->(), \1, 'available_for_patron is true for a non-found (pending) hold' );
+};
+
+subtest '_get_item_documents resolves the item hook plugins once per batch' => sub {
+    plan tests => 8;
+
+    t::lib::Mocks::mock_preference( 'OpacHiddenItems', '' );
+
+    my $builder = t::lib::TestBuilder->new;
+    my @biblios = map { $builder->build_sample_biblio } 1 .. 2;
+    my @items   = map {
+        my $biblio = $_;
+        map { $builder->build_sample_item( { biblionumber => $biblio->biblionumber } ) } 1 .. 3
+    } @biblios;
+    my ( $intransit_item, $held_item ) = @items[ 0, 4 ];
+
+    $builder->build_object(
+        {
+            class => 'Koha::Item::Transfers',
+            value => {
+                itemnumber    => $intransit_item->itemnumber,
+                datesent      => '2024-01-01 00:00:00',
+                datearrived   => undef,
+                datecancelled => undef,
+            }
+        }
+    );
+    $builder->build_object(
+        {
+            class => 'Koha::Holds',
+            value => {
+                biblionumber     => $held_item->biblionumber,
+                itemnumber       => $held_item->itemnumber,
+                found            => 'W',
+                cancellationdate => undef,
+                suspend          => 0,
+            }
+        }
+    );
+
+    my $spy                 = Koha::Test::SpyItemHooksPlugin->new;
+    my $enabled_plugins_cnt = 0;
+    my $plugins             = Test::MockModule->new('Koha::Plugins');
+    $plugins->mock( 'get_enabled_plugins', sub { $enabled_plugins_cnt++; return ($spy); } );
+
+    my $es            = Koha::SearchEngine::Elasticsearch->new( { index => 'biblios' } );
+    my @biblionumbers = map { $_->biblionumber } @biblios;
+
+    t::lib::Mocks::mock_config( 'enable_plugins', 1 );
+    my $documents = $es->_get_item_documents( \@biblionumbers );
+
+    is( scalar( map { @{$_} } values %{$documents} ), 6, 'one document per item' );
+    is( $enabled_plugins_cnt,                         1, 'the enabled plugins are looked up once for the whole batch' );
+    is( scalar @{ $spy->{available} },                6, 'item_available_for_patron is called once per item' );
+    is( scalar @{ $spy->{hidden} },                   6, 'item_hidden_in_opac is called once per item' );
+
+    # The hooks get the same arguments as when each item looked its plugins up.
+    my %expected = map { $_->itemnumber => [ 0, 0 ] } @items;
+    $expected{ $intransit_item->itemnumber }->[0] = 1;
+    $expected{ $held_item->itemnumber }->[1]      = 1;
+    is_deeply(
+        {
+            map { $_->{item}->itemnumber => [ $_->{intransit} ? 1 : 0, $_->{blocked_by_hold} ? 1 : 0 ] }
+                @{ $spy->{available} }
+        },
+        \%expected,
+        'item_available_for_patron gets the item, intransit and blocked_by_hold'
+    );
+    is_deeply(
+        [ sort { $a <=> $b } map { $_->{item}->itemnumber } @{ $spy->{hidden} } ],
+        [ sort { $a <=> $b } map { $_->itemnumber } @items ],
+        'item_hidden_in_opac gets the item'
+    );
+
+    # The batch-resolved plugins drive the fields as before.
+    my ($held_document) = grep { $_->{itemnumber} == $held_item->itemnumber } map { @{$_} } values %{$documents};
+    is_deeply( $held_document->{available_for_patron}, \0, 'default conditions apply when the plugin abstains' );
+
+    t::lib::Mocks::mock_config( 'enable_plugins', 0 );
+    $enabled_plugins_cnt = 0;
+    $es->_get_item_documents( \@biblionumbers );
+    is( $enabled_plugins_cnt, 0, 'no plugin lookup when plugins are disabled' );
+};
+
+subtest 'indexed_items_schema_version() and nested_items_ready() tests (Bug XXXXX)' => sub {
+    plan tests => 9;
+
+    # Not the biblios index, so as not to touch the cached version of the real one
+    my $es = Koha::SearchEngine::Elasticsearch->new( { index => 'items_schema_version_test' } );
+    $es->clear_items_schema_version_cache;
+
+    # Fake the mapping read from Elasticsearch, counting the requests
+    my ( $meta, $requests, $dies ) = ( undef, 0, 0 );
+    my $indices = Test::MockObject->new;
+    $indices->mock(
+        'get_mapping',
+        sub {
+            $requests++;
+            die "No Elasticsearch\n" if $dies;
+            return { real_index_name => { mappings => { properties => {}, ( $meta ? ( _meta => $meta ) : () ) } } };
+        }
+    );
+    my $client = Test::MockObject->new;
+    $client->mock( 'indices', sub { return $indices; } );
+    my $module = Test::MockModule->new('Koha::SearchEngine::Elasticsearch');
+    $module->mock( 'get_elasticsearch', sub { return $client; } );
+
+    is( $es->indexed_items_schema_version, 0, 'an index created before the nested items has no version' );
+    ok( !$es->nested_items_ready, 'so it is not ready for the nested items' );
+
+    $meta = { items_schema_version => $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION };
+    is( $es->indexed_items_schema_version, 0, 'the version is cached' );
+    is( $requests,                         1, 'and Elasticsearch is asked once' );
+
+    $es->clear_items_schema_version_cache;
+    is(
+        $es->indexed_items_schema_version, $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION,
+        'the version of an index created with the nested items is read from the _meta of its mapping'
+    );
+    ok( $es->nested_items_ready, 'so it is ready for the nested items' );
+
+    $es->clear_items_schema_version_cache;
+    $dies = 1;
+    is( $es->indexed_items_schema_version, 0, 'the version is 0 when Elasticsearch cannot be reached' );
+    $dies = 0;
+    is(
+        $es->indexed_items_schema_version, $Koha::SearchEngine::Elasticsearch::ITEMS_SCHEMA_VERSION,
+        'and that is not cached'
+    );
+    is( $requests, 4, 'Elasticsearch is asked again' );
+
+    $es->clear_items_schema_version_cache;
+};
+
+subtest 'marc_records_to_documents stores the item fields in items.marc (Bug XXXXX)' => sub {
+    plan tests => 4;
+
+    my $see = Koha::SearchEngine::Elasticsearch::Search->new(
+        { index => $Koha::SearchEngine::Elasticsearch::BIBLIOS_INDEX } );
+    my $mappings = $see->get_elasticsearch_mappings();
+
+    subtest 'the item field as a string' => sub {
+        plan tests => 4;
+
+        my $field = MARC::Field->new( '952', '1', ' ', a => 'CPL', p => 39000001, z => 'A note' );
+        my $marc  = $see->_item_field_to_marc($field);
+        is( $marc, "1 \x1faCPL\x1fp39000001\x1fzA note", 'the string is the field data as in ISO2709' );
+        is_deeply(
+            [ map { $_->as_usmarc } $see->_item_marc_to_field( '952', $marc ) ],
+            [ $field->as_usmarc ], 'the string is converted back into the same field'
+        );
+
+        my $broken = MARC::Field->new( '952', ' ', ' ', a => 'CPL', z => "Two\x1fparts" );
+        warning_like { $marc = $see->_item_field_to_marc($broken) }
+        qr/Removed the subfield delimiter \(0x1F\) from the value of subfield z of item field 952/,
+            'a subfield delimiter in a value is reported';
+        is_deeply(
+            [ $see->_item_marc_to_field( '952', $marc )->subfields ],
+            [ [ a => 'CPL' ], [ z => 'Twoparts' ] ],
+            'and removed, so that it does not split the subfield'
+        );
+    };
+
+    subtest 'mappings' => sub {
+        plan tests => 2;
+
+        my $marc_mapping = $mappings->{properties}{items}{properties}{marc};
+        ok(
+            $marc_mapping->{type} eq 'keyword' && !$marc_mapping->{index} && !$marc_mapping->{doc_values},
+            'items.marc is a string stored but not indexed'
+        );
+        is_deeply(
+            $mappings->{properties}{items_schema_version}, { type => 'integer' },
+            'items_schema_version is mapped as an integer'
+        );
+    };
+
+    for my $marcflavour (qw( MARC21 UNIMARC )) {
+        subtest $marcflavour => sub {
+            plan tests => 15;
+
+            $schema->storage->txn_begin;
+
+            t::lib::Mocks::mock_preference( 'marcflavour',             $marcflavour );
+            t::lib::Mocks::mock_preference( 'ElasticsearchMARCFormat', 'base64ISO2709' );
+            simulate_unimarc_framework() if $marcflavour eq 'UNIMARC';
+
+            my ($item_tag) = C4::Biblio::GetMarcFromKohaField('items.itemnumber');
+            is( $item_tag, $marcflavour eq 'UNIMARC' ? '995' : '952', "the item tag is $item_tag" );
+
+            # An unlinked item subfield, kept in more_subfields_xml
+            $schema->resultset('MarcSubfieldStructure')
+                ->update_or_create(
+                { frameworkcode => '', tagfield => $item_tag, tagsubfield => 'X', kohafield => '', tab => 10 } );
+            clear_framework_caches();
+
+            my $builder = t::lib::TestBuilder->new;
+            my $biblio  = $builder->build_sample_biblio;
+            my @items   = map { $builder->build_sample_item( { biblionumber => $biblio->biblionumber } ) } 1 .. 3;
+            $items[1]->more_subfields_xml( C4::Items::_get_unlinked_subfields_xml( [ X => 'Unlinked' ] ) )->store;
+            $_->discard_changes for @items;
+
+            my $embedded = $biblio->metadata_record( { embed_items => 1 } );
+            my $plain    = $biblio->metadata->record;
+            my $stale    = $biblio->metadata->record;
+            $stale->append_fields( MARC::Field->new( $item_tag, ' ', ' ', p => 'STALE' ) );
+
+            my @hook_records;
+            my $plugins = Test::MockModule->new('Koha::Plugins');
+            $plugins->mock(
+                'call',
+                sub {
+                    my ( $class, $method, $params ) = @_;
+                    push @hook_records, $params->{record} if $method eq 'elasticsearch_to_document';
+                    return;
+                }
+            );
+            my ( $embedded_doc, $plain_doc, $stale_doc ) =
+                @{ $see->marc_records_to_documents( [ $embedded, $plain, $stale ] ) };
+
+            my $stored = MARC::Record->new_from_usmarc( decode_base64( $embedded_doc->{marc_data} ) );
+            is(
+                scalar( my @stored_item_fields = $stored->field($item_tag) ), 0,
+                'the stored MARC leaves the item fields out'
+            );
+            is_deeply(
+                [ $plain_doc->{marc_data},    $stale_doc->{marc_data} ],
+                [ $embedded_doc->{marc_data}, $embedded_doc->{marc_data} ],
+                'the stored MARC does not depend on the item fields the record comes with'
+            );
+
+            is_deeply(
+                [ map { $_->{marc} } @{ $embedded_doc->{items} } ],
+                [ map { $see->_item_field_to_marc( $_->as_marc_field ) } @items ],
+                'items.marc holds the MARC field of each item, in itemnumber order'
+            );
+            like(
+                $embedded_doc->{items}[1]{marc}, qr/\x1fXUnlinked(?:\x1f|$)/,
+                'items.marc includes the unlinked subfields of more_subfields_xml'
+            );
+            ok( !( grep { ref $_->{marc} } @{ $embedded_doc->{items} } ), 'items.marc is a string' );
+            is( $embedded_doc->{items_schema_version}, 1, 'items_schema_version is set' );
+
+            my $item_fields = sub {
+                [ map { $_->as_formatted } $_[0]->field($item_tag) ]
+            };
+            is_deeply(
+                [ map { $_->as_formatted } $see->decode_record_from_result($embedded_doc)->fields ],
+                [ map { $_->as_formatted } $embedded->fields ],
+                'the decoded record is the record with its items embedded'
+            );
+            is_deeply(
+                [ map { $item_fields->($_) } @hook_records ],
+                [ ( $item_fields->($embedded) ) x 3 ],
+                'the elasticsearch_to_document hook gets the item fields of the items in the database'
+            );
+
+            t::lib::Mocks::mock_preference( 'ElasticsearchMARCFormat', 'ARRAY' );
+            my ($array_doc) = @{ $see->marc_records_to_documents( [$plain] ) };
+            ok(
+                !( grep { exists $_->{$item_tag} } @{ $array_doc->{marc_data_array}{fields} } ),
+                'the stored ARRAY leaves the item fields out'
+            );
+            is_deeply(
+                [ map { $_->as_formatted } $see->decode_record_from_result($array_doc)->fields ],
+                [ map { $_->as_formatted } $embedded->fields ],
+                'the decoded record is the same with the ARRAY format'
+            );
+            t::lib::Mocks::mock_preference( 'ElasticsearchMARCFormat', 'base64ISO2709' );
+
+            # A document indexed before items.marc existed is decoded as stored
+            my $legacy_doc = {
+                %{$embedded_doc},
+                marc_data => encode_base64( Encode::encode( 'UTF-8', $embedded->as_usmarc ) ),
+                items     => [
+                    map {
+                        { %{$_}, marc => undef }
+                    } @{ $embedded_doc->{items} }
+                ],
+            };
+            is_deeply(
+                $item_fields->( $see->decode_record_from_result($legacy_doc) ),
+                $item_fields->($embedded),
+                'a document without items.marc keeps the item fields of its stored MARC'
+            );
+
+            # A record that is not in the catalogue is indexed as it comes
+            my $not_catalogued = MARC::Record->new;
+            $not_catalogued->append_fields(
+                $marcflavour eq 'UNIMARC'
+                ? MARC::Field->new( '001', '999999999' )
+                : MARC::Field->new( '999', ' ', ' ', c => '999999999' ),
+                MARC::Field->new( $item_tag, ' ', ' ', p => 'NOT-CATALOGUED' ),
+            );
+            my ($not_catalogued_doc) = @{ $see->marc_records_to_documents( [$not_catalogued] ) };
+            is_deeply(
+                $item_fields->( $see->decode_record_from_result($not_catalogued_doc) ),
+                $item_fields->($not_catalogued),
+                'a record not in the catalogue keeps its item fields'
+            );
+            ok( !exists $not_catalogued_doc->{items_schema_version}, 'and has no items_schema_version' );
+
+            my $empty_biblio = $builder->build_sample_biblio;
+            my ($empty_doc) = @{ $see->marc_records_to_documents( [ $empty_biblio->metadata->record ] ) };
+            is_deeply(
+                [ $empty_doc->{items}, $empty_doc->{items_schema_version} ], [ [], 1 ],
+                'a record without items has no items and items_schema_version'
+            );
+
+            $schema->storage->txn_rollback;
+            clear_framework_caches();
+        };
+    }
+    t::lib::Mocks::mock_preference( 'marcflavour', 'MARC21' );
+};
+
+# Turn the default framework into a UNIMARC one for the item and record number
+# fields: the items in 995 and the record number in 001.
+sub simulate_unimarc_framework {
+    my $subfields = $schema->resultset('MarcSubfieldStructure')->search( { frameworkcode => '' } );
+    my $tags      = $schema->resultset('MarcTagStructure')->search( { frameworkcode => '' } );
+    $subfields->search( { tagfield => '995' } )->delete;
+    $tags->search( { tagfield => '995' } )->delete;
+    $tags->search( { tagfield => '952' } )->update( { tagfield => '995' } );
+    $subfields->search( { tagfield => '952' } )->update( { tagfield => '995' } );
+    $subfields->search( { kohafield => 'biblio.biblionumber' } )->update( { kohafield => '' } );
+    $subfields->update_or_create(
+        { frameworkcode => '', tagfield => '001', tagsubfield => '@', kohafield => 'biblio.biblionumber', tab => 0 } );
+    clear_framework_caches();
+    return;
+}
+
+sub clear_framework_caches {
+    my $cache = Koha::Caches->get_instance;
+    $cache->clear_from_cache($_) for qw( MarcStructure-0- MarcStructure-1- MarcSubfieldStructure- );
+    Koha::Cache::Memory::Lite->flush;
+    return;
+}
+
 $schema->storage->txn_rollback;
+
+{
+
+    package Koha::Test::SpyItemHooksPlugin;
+
+    sub new { return bless { available => [], hidden => [] }, shift; }
+
+    sub item_available_for_patron {
+        my ( $self, $params ) = @_;
+        push @{ $self->{available} }, $params;
+        return;    # abstain
+    }
+
+    sub item_hidden_in_opac {
+        my ( $self, $params ) = @_;
+        push @{ $self->{hidden} }, $params;
+        return 0;
+    }
+
+    sub get_metadata { return { name => 'Koha::Test::SpyItemHooksPlugin' }; }
+}

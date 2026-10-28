@@ -317,10 +317,11 @@
             <fieldset id="availability">
                 <legend>Location and availability</legend>
                 <fieldset id="currently-avail">
+                    [%# Bug XXXXX: same-item availability filter via the nested items.available subfield. %]
                     [% IF limit_available %]
-                        <p><label for="available-items">Only items currently available:</label> <input type="checkbox" id="available-items" name="limit" value="available" checked="checked" /></p>
+                        <p><label for="available-items">Only items currently available:</label> <input type="checkbox" id="available-items" name="limit" value="items.available:true" checked="checked" /></p>
                     [% ELSE %]
-                        <p><label for="available-items">Only items currently available:</label> <input type="checkbox" id="available-items" name="limit" value="available" /></p>
+                        <p><label for="available-items">Only items currently available:</label> <input type="checkbox" id="available-items" name="limit" value="items.available:true" /></p>
                     [% END %]
                 </fieldset>
                 <!-- /#currently-avail -->

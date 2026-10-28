@@ -88,7 +88,7 @@ RECORD_IDS: for my $record_id ( sort { $a <=> $b } @record_ids ) {
         # Cancel reserves
         my $holds = $biblio->holds;
         while ( my $hold = $holds->next ) {
-            eval { $hold->cancel( { skip_holds_queue => 1 } ); };
+            eval { $hold->cancel( { skip_holds_queue => 1, skip_record_index => 1 } ); };
             if ($@) {
                 push @messages, {
                     type         => 'error',
