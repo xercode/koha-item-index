@@ -1309,6 +1309,10 @@ sub getIndexes {
     return \@indexes;
 }
 
+# Limits on the nested items of Elasticsearch (Bug XXXXX) that are the record
+# availability with Zebra
+my %ZEBRA_AVAILABILITY_ITEM_LIMITS = map { $_ => 1 } qw( items.available:true );
+
 =head2 buildQuery
 
 ( $error, $query,
@@ -1321,6 +1325,11 @@ Build queries and limits in CCL, CGI, Human,
 handle truncation, stemming, field weighting, fuzziness, etc.
 
 See verbose embedded documentation.
+
+The C<items.*> limits are the limits on the nested items of Elasticsearch
+(Bug XXXXX), which Zebra has no index for. The availability control
+(C<items.available:true>) is the record availability, as the C<available>
+limit. Any other one is ignored with a warning, and described as ignored.
 
 
 =cut
@@ -1366,15 +1375,28 @@ sub buildQuery {
     # add limits
     my %group_OR_limits;
     my $availability_limit;
+    ## 'available' is defined as (items.onloan is NULL) and (items.itemlost = 0)
+    ## In English:
+    ## all records not indexed in the onloan register (zebra) and all records with a value of lost equal to 0
+    my $available_limit =
+        "( (allrecords,AlwaysMatches='') and (not-onloan-count,st-numeric >= 1) and (lost,st-numeric=0) )";
+
     foreach my $this_limit (@limits) {
         next unless $this_limit;
-        if ( $this_limit =~ /available/ ) {
-            #
-## 'available' is defined as (items.onloan is NULL) and (items.itemlost = 0)
-## In English:
-## all records not indexed in the onloan register (zebra) and all records with a value of lost equal to 0
-            $availability_limit .=
-                "( (allrecords,AlwaysMatches='') and (not-onloan-count,st-numeric >= 1) and (lost,st-numeric=0) )";
+
+        # Bug XXXXX: limits on the nested items of Elasticsearch. Zebra has no
+        # index for them: the availability controls are the record
+        # availability, and the others are ignored.
+        if ( $this_limit =~ /^items\./ ) {
+            $limit_cgi .= "&limit=" . uri_escape_utf8($this_limit);
+            if ( $ZEBRA_AVAILABILITY_ITEM_LIMITS{$this_limit} ) {
+                $availability_limit = $available_limit;
+            } else {
+                warn "Ignoring limit '$this_limit': Zebra cannot search on the nested items";
+                $limit_desc .= " $this_limit (ignored)";
+            }
+        } elsif ( $this_limit =~ /available/ ) {
+            $availability_limit = $available_limit;
             $limit_cgi  .= "&limit=available";
             $limit_desc .= "";
         }

@@ -28,7 +28,7 @@ require C4::Context;
 use open ':std', ':encoding(utf8)';
 
 use Test::NoWarnings;
-use Test::More tests => 8;
+use Test::More tests => 9;
 use Test::MockModule;
 use Test::Warn;
 use t::lib::Mocks;
@@ -1419,6 +1419,37 @@ subtest 'buildQuery() limit on an unknown or empty library group' => sub {
     }
 
     $schema->storage->txn_rollback;
+};
+
+subtest 'buildQuery() limits on the nested items (Bug XXXXX)' => sub {
+    plan tests => 10;
+
+    require C4::Search;
+
+    my $availability = qr/\(allrecords,AlwaysMatches=''\) and \(not-onloan-count,st-numeric >= 1\)/;
+
+    my ( $limit, $limit_cgi, $limit_desc );
+    ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc ) =
+        C4::Search::buildQuery( [], ['salud'], [], ['items.available:true'], [], 0, 'en' );
+    like( $limit,     $availability,                      'items.available:true is the record availability' );
+    like( $limit_cgi, qr/&limit=items\.available%3Atrue/, 'and is kept in limit_cgi' );
+
+    ( undef, undef, undef, undef, undef, $limit ) =
+        C4::Search::buildQuery( [], ['salud'], [], [ 'available', 'items.available:true' ], [], 0, 'en' );
+    my @availability = $limit =~ /not-onloan-count/g;
+    is( scalar @availability, 1, 'the availability is applied once with both availability limits' );
+
+    for my $ignored ( 'items.available:false', 'items.homebranch:CPL' ) {
+        warning_like {
+            ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc ) =
+                C4::Search::buildQuery( [], ['salud'], [], [$ignored], [], 0, 'en' );
+        }
+        qr/Ignoring limit '\Q$ignored\E': Zebra cannot search on the nested items/,
+            "$ignored is ignored with a warning";
+        unlike( $limit, qr/items\.|not-onloan-count/, "$ignored does not reach the CCL query" );
+        like( $limit_desc, qr/\Q$ignored\E \(ignored\)/, "$ignored is described as ignored" );
+    }
+    like( $limit_cgi, qr/&limit=items\.homebranch%3ACPL/, 'an ignored limit is kept in limit_cgi' );
 };
 
 subtest 'FindDuplicate' => sub {
