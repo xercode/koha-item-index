@@ -74,41 +74,43 @@
                     <!-- /#available_for_patron_facet -->
                 [% END # /IF Elasticsearch %]
 
-                [%# Bug XXXXX: three-way item on-request filter (all / not on request / on request). %]
-                [% SET onrequest_base = "/cgi-bin/koha/catalogue/search.pl?" _ query_cgi _ limit_cgi_not_onrequest %]
-                <li id="onrequest_facet">
-                    On request
-                    <ul>
-                        [% IF onrequest_filter == 'notonrequest' || onrequest_filter == 'onrequest' %]
-                            <li>
-                                <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]">All</a>
-                            </li>
-                        [% ELSE %]
-                            <li>
-                                <strong>All</strong>
-                            </li>
-                        [% END %]
-                        [% IF onrequest_filter == 'notonrequest' %]
-                            <li>
-                                <strong>Not on request</strong>
-                            </li>
-                        [% ELSE %]
-                            <li>
-                                <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.onrequest:false">Not on request</a>
-                            </li>
-                        [% END %]
-                        [% IF onrequest_filter == 'onrequest' %]
-                            <li>
-                                <strong>On request</strong>
-                            </li>
-                        [% ELSE %]
-                            <li>
-                                <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.onrequest:true">On request</a>
-                            </li>
-                        [% END %]
-                    </ul>
-                </li>
-                <!-- /#onrequest_facet -->
+                [%# Bug XXXXX: three-way item on-request filter (all / not on request / on request). Only Elasticsearch indexes it. %]
+                [% IF Koha.Preference('SearchEngine') == 'Elasticsearch' %]
+                    [% SET onrequest_base = "/cgi-bin/koha/catalogue/search.pl?" _ query_cgi _ limit_cgi_not_onrequest %]
+                    <li id="onrequest_facet">
+                        On request
+                        <ul>
+                            [% IF onrequest_filter == 'notonrequest' || onrequest_filter == 'onrequest' %]
+                                <li>
+                                    <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]">All</a>
+                                </li>
+                            [% ELSE %]
+                                <li>
+                                    <strong>All</strong>
+                                </li>
+                            [% END %]
+                            [% IF onrequest_filter == 'notonrequest' %]
+                                <li>
+                                    <strong>Not on request</strong>
+                                </li>
+                            [% ELSE %]
+                                <li>
+                                    <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.onrequest:false">Not on request</a>
+                                </li>
+                            [% END %]
+                            [% IF onrequest_filter == 'onrequest' %]
+                                <li>
+                                    <strong>On request</strong>
+                                </li>
+                            [% ELSE %]
+                                <li>
+                                    <a href="[% onrequest_base | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by | uri %][% END %]&amp;limit=items.onrequest:true">On request</a>
+                                </li>
+                            [% END %]
+                        </ul>
+                    </li>
+                    <!-- /#onrequest_facet -->
+                [% END # /IF Elasticsearch %]
 
                 [% FOREACH facets_loo IN facets_loop %]
                     [% IF facets_loo.facets.size > 0 %]

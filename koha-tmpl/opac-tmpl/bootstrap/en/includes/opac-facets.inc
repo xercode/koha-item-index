@@ -60,20 +60,26 @@
                 </div>
             </li>
 
-            [%# Bug XXXXX: exclude items that are requested in a hold (items.onrequest). %]
-            <li id="onrequest_facet">
-                <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#onrequest_collapse" id="filter_onrequest">Requests</a>
-                <div class="facet-collapse collapse show" id="onrequest_collapse">
-                    <ul>
-                        [% IF ( exclude_onrequest ) %]
-                            <li><strong>Excluding records whose items are all requested</strong></li
-                            ><li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_onrequest | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
-                        [% ELSE %]
-                            <li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.onrequest:false">Exclude requested items</a></li>
-                        [% END %]
-                    </ul>
-                </div>
-            </li>
+            [%# Bug XXXXX: exclude items that are requested in a hold (items.onrequest). Only Elasticsearch indexes it. %]
+            [% IF Koha.Preference('SearchEngine') == 'Elasticsearch' %]
+                <li id="onrequest_facet">
+                    <a class="facet-toggle" aria-expanded="true" data-bs-toggle="collapse" data-bs-target="#onrequest_collapse" id="filter_onrequest">Requests</a>
+                    <div class="facet-collapse collapse show" id="onrequest_collapse">
+                        <ul>
+                            [% IF ( exclude_onrequest ) %]
+                                <li><strong>Excluding records whose items are all requested</strong></li
+                                ><li><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi_not_onrequest | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]">Show all records</a> </li>
+                            [% ELSE %]
+                                <li
+                                    ><a href="/cgi-bin/koha/opac-search.pl?[% query_cgi | $raw %][% limit_cgi | $raw %][% IF ( sort_by ) %]&amp;sort_by=[% sort_by |uri %][% END %]&amp;limit=items.onrequest:false"
+                                        >Exclude requested items</a
+                                    ></li
+                                >
+                            [% END %]
+                        </ul>
+                    </div>
+                </li>
+            [% END # /IF Elasticsearch %]
 
             [% FOREACH facets_loo IN facets_loop %]
                 [% IF facets_loo.facets.size > 0 %]

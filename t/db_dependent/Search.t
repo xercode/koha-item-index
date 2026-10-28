@@ -1422,7 +1422,7 @@ subtest 'buildQuery() limit on an unknown or empty library group' => sub {
 };
 
 subtest 'buildQuery() limits on the nested items (Bug XXXXX)' => sub {
-    plan tests => 11;
+    plan tests => 14;
 
     require C4::Search;
 
@@ -1443,7 +1443,7 @@ subtest 'buildQuery() limits on the nested items (Bug XXXXX)' => sub {
     my @availability = $limit =~ /not-onloan-count/g;
     is( scalar @availability, 1, 'the availability is applied once with both availability limits' );
 
-    for my $ignored ( 'items.available:false', 'items.homebranch:CPL' ) {
+    for my $ignored ( 'items.available:false', 'items.onrequest:false', 'items.homebranch:CPL' ) {
         warning_like {
             ( undef, undef, undef, undef, undef, $limit, $limit_cgi, $limit_desc ) =
                 C4::Search::buildQuery( [], ['salud'], [], [$ignored], [], 0, 'en' );
